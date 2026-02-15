@@ -1,0 +1,91 @@
+{
+    // ============================================================================
+    // devbox configuration — ~/.config/devbox/default.json
+    // ============================================================================
+    //
+    // This file configures the devbox CLI. Copy it to ~/.config/devbox/default.json
+    // and edit the values below to match your setup. All fields are optional —
+    // any field you omit will use the default value shown here.
+    //
+    // NOTE: JSON does not officially support comments. devbox uses Go's standard
+    // json package which does NOT tolerate comments. Before using this file,
+    // strip all lines starting with "//". A quick way:
+    //
+    //   grep -v '^\s*//' default.json > ~/.config/devbox/default.json
+    //
+    // Or just copy the clean version at the bottom of this file.
+    // ============================================================================
+
+    // --- DNS ---
+    // The A record that devbox manages. Commands like `devbox dns`, `devbox resize`,
+    // and the boot script installed by `devbox setup-dns` will point this record
+    // at the instance's public IP.
+    "dns_name": "dev.frob.io",
+
+    // The Route 53 hosted zone that contains dns_name. Must end with a trailing dot.
+    // devbox looks this up via ListHostedZonesByName to find the zone ID.
+    "dns_zone": "frob.io.",
+
+    // --- SSH ---
+    // The EC2 key pair name used when launching new instances with `devbox spawn`.
+    // This must match a key pair already registered in your AWS account.
+    "ssh_key_name": "dev-boxes",
+
+    // Local path to the private key file for SSH connections.
+    // Used by `devbox ssh` and `devbox setup-dns`. Supports ~ for home directory.
+    "ssh_key_path": "~/.ssh/dev-boxes.pem",
+
+    // The username to SSH as. NixOS defaults to "root" but many setups create
+    // a custom user via user_data.
+    "ssh_user": "emaland",
+
+    // --- AWS infrastructure ---
+    // The EC2 security group name applied to spawned instances. Must already exist.
+    "security_group": "dev-instance",
+
+    // The IAM instance profile name attached to spawned instances. This controls
+    // what AWS API calls the instance itself can make (e.g. Route 53 DNS updates).
+    "iam_profile": "dev-workstation-profile",
+
+    // --- Spawn defaults ---
+    // Default availability zone for `devbox spawn`.
+    "default_az": "us-east-2a",
+
+    // Default instance type for `devbox spawn`.
+    "default_type": "m6i.4xlarge",
+
+    // Default spot max price ($/hr) for `devbox spawn`.
+    "default_max_price": "2.00",
+
+    // Default Name tag for instances created by `devbox spawn`.
+    "spawn_name": "dev-workstation-tmp",
+
+    // --- AMI lookup ---
+    // The AWS account ID that owns the AMIs to search. The NixOS community
+    // publishes official AMIs from this account.
+    "nixos_ami_owner": "427812963091",
+
+    // Glob pattern matched against AMI names. devbox picks the latest match
+    // (sorted lexicographically, which works because NixOS names include dates).
+    "nixos_ami_pattern": "nixos/24.11*"
+}
+
+// ============================================================================
+// Clean version (copy everything between the braces):
+// ============================================================================
+//
+// {
+//     "dns_name": "dev.frob.io",
+//     "dns_zone": "frob.io.",
+//     "ssh_key_name": "dev-boxes",
+//     "ssh_key_path": "~/.ssh/dev-boxes.pem",
+//     "ssh_user": "emaland",
+//     "security_group": "dev-instance",
+//     "iam_profile": "dev-workstation-profile",
+//     "default_az": "us-east-2a",
+//     "default_type": "m6i.4xlarge",
+//     "default_max_price": "2.00",
+//     "spawn_name": "dev-workstation-tmp",
+//     "nixos_ami_owner": "427812963091",
+//     "nixos_ami_pattern": "nixos/24.11*"
+// }

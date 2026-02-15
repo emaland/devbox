@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -23,9 +24,78 @@ import (
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 )
 
+type devboxConfig struct {
+	DNSName          string `json:"dns_name"`
+	DNSZone          string `json:"dns_zone"`
+	SSHKeyName       string `json:"ssh_key_name"`
+	SSHKeyPath       string `json:"ssh_key_path"`
+	SSHUser          string `json:"ssh_user"`
+	SecurityGroup    string `json:"security_group"`
+	IAMProfile       string `json:"iam_profile"`
+	DefaultAZ        string `json:"default_az"`
+	DefaultType      string `json:"default_type"`
+	DefaultMaxPrice  string `json:"default_max_price"`
+	SpawnName        string `json:"spawn_name"`
+	NixOSAMIOwner   string `json:"nixos_ami_owner"`
+	NixOSAMIPattern string `json:"nixos_ami_pattern"`
+}
+
+func loadConfig() (devboxConfig, error) {
+	cfg := devboxConfig{
+		DNSName:          "dev.frob.io",
+		DNSZone:          "frob.io.",
+		SSHKeyName:       "dev-boxes",
+		SSHKeyPath:       "~/.ssh/dev-boxes.pem",
+		SSHUser:          "emaland",
+		SecurityGroup:    "dev-instance",
+		IAMProfile:       "dev-workstation-profile",
+		DefaultAZ:        "us-east-2a",
+		DefaultType:      "m6i.4xlarge",
+		DefaultMaxPrice:  "2.00",
+		SpawnName:        "dev-workstation-tmp",
+		NixOSAMIOwner:   "427812963091",
+		NixOSAMIPattern: "nixos/24.11*",
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return cfg, nil
+	}
+
+	path := filepath.Join(home, ".config", "devbox", "default.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, fmt.Errorf("reading config %s: %w", path, err)
+	}
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+func (c devboxConfig) resolveSSHKeyPath() string {
+	if strings.HasPrefix(c.SSHKeyPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, c.SSHKeyPath[2:])
+		}
+	}
+	return c.SSHKeyPath
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
+		os.Exit(1)
+	}
+
+	dcfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading devbox config: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -76,7 +146,7 @@ func main() {
 			os.Exit(1)
 		}
 		r53client := route53.NewFromConfig(cfg)
-		if err := updateDNS(ctx, client, r53client, os.Args[2]); err != nil {
+		if err := updateDNS(ctx, dcfg, client, r53client, os.Args[2]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -105,7 +175,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: devbox ssh <instance-id>")
 			os.Exit(1)
 		}
-		if err := sshToInstance(ctx, client, os.Args[2]); err != nil {
+		if err := sshToInstance(ctx, dcfg, client, os.Args[2]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -114,7 +184,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: devbox setup-dns <instance-id>")
 			os.Exit(1)
 		}
-		if err := setupDNSOnBoot(ctx, client, os.Args[2]); err != nil {
+		if err := setupDNSOnBoot(ctx, dcfg, client, os.Args[2]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -124,7 +194,7 @@ func main() {
 			os.Exit(1)
 		}
 		r53client := route53.NewFromConfig(cfg)
-		if err := resizeInstance(ctx, client, r53client, os.Args[2], os.Args[3]); err != nil {
+		if err := resizeInstance(ctx, dcfg, client, r53client, os.Args[2], os.Args[3]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -134,7 +204,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "spawn":
-		if err := spawnInstance(ctx, client, os.Args[2:]); err != nil {
+		if err := spawnInstance(ctx, dcfg, client, os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -266,9 +336,7 @@ func terminateInstances(ctx context.Context, client *ec2.Client, ids []string) e
 	return nil
 }
 
-const dnsName = "dev.frob.io"
-
-func updateDNS(ctx context.Context, ec2client *ec2.Client, r53client *route53.Client, instanceID string) error {
+func updateDNS(ctx context.Context, dcfg devboxConfig, ec2client *ec2.Client, r53client *route53.Client, instanceID string) error {
 	// Look up the instance's public IP
 	desc, err := ec2client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
@@ -285,8 +353,7 @@ func updateDNS(ctx context.Context, ec2client *ec2.Client, r53client *route53.Cl
 	}
 	ip := *inst.PublicIpAddress
 
-	// Find the hosted zone for frob.io
-	zoneID, err := findHostedZone(ctx, r53client, "frob.io.")
+	zoneID, err := findHostedZone(ctx, r53client, dcfg.DNSZone)
 	if err != nil {
 		return err
 	}
@@ -295,12 +362,12 @@ func updateDNS(ctx context.Context, ec2client *ec2.Client, r53client *route53.Cl
 	_, err = r53client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
 		HostedZoneId: aws.String(zoneID),
 		ChangeBatch: &r53types.ChangeBatch{
-			Comment: aws.String(fmt.Sprintf("devbox: point %s at %s (%s)", dnsName, instanceID, ip)),
+			Comment: aws.String(fmt.Sprintf("devbox: point %s at %s (%s)", dcfg.DNSName, instanceID, ip)),
 			Changes: []r53types.Change{
 				{
 					Action: r53types.ChangeActionUpsert,
 					ResourceRecordSet: &r53types.ResourceRecordSet{
-						Name: aws.String(dnsName),
+						Name: aws.String(dcfg.DNSName),
 						Type: r53types.RRTypeA,
 						TTL:  aws.Int64(60),
 						ResourceRecords: []r53types.ResourceRecord{
@@ -315,7 +382,7 @@ func updateDNS(ctx context.Context, ec2client *ec2.Client, r53client *route53.Cl
 		return fmt.Errorf("updating DNS record: %w", err)
 	}
 
-	fmt.Printf("%s -> %s (%s)\n", dnsName, ip, instanceID)
+	fmt.Printf("%s -> %s (%s)\n", dcfg.DNSName, ip, instanceID)
 	return nil
 }
 
@@ -564,7 +631,7 @@ func toLaunchSpec(from *types.LaunchSpecification) *types.RequestSpotLaunchSpeci
 	return spec
 }
 
-func setupDNSOnBoot(ctx context.Context, ec2client *ec2.Client, instanceID string) error {
+func setupDNSOnBoot(ctx context.Context, dcfg devboxConfig, ec2client *ec2.Client, instanceID string) error {
 	desc, err := ec2client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
@@ -581,21 +648,17 @@ func setupDNSOnBoot(ctx context.Context, ec2client *ec2.Client, instanceID strin
 	ip := *inst.PublicIpAddress
 
 	// Find the hosted zone ID so we can bake it into the script
-	cfg, err := config.LoadDefaultConfig(ctx)
+	awsCfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("loading AWS config: %w", err)
 	}
-	r53client := route53.NewFromConfig(cfg)
-	zoneID, err := findHostedZone(ctx, r53client, "frob.io.")
+	r53client := route53.NewFromConfig(awsCfg)
+	zoneID, err := findHostedZone(ctx, r53client, dcfg.DNSZone)
 	if err != nil {
 		return err
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("getting home dir: %w", err)
-	}
-	keyPath := filepath.Join(home, ".ssh", "dev-boxes.pem")
+	keyPath := dcfg.resolveSSHKeyPath()
 
 	// The script that runs on boot to update Route 53
 	bootScript := fmt.Sprintf(`#!/bin/bash
@@ -631,10 +694,10 @@ aws route53 change-resource-record-sets \
   }'
 
 echo "Updated %s -> $PUBLIC_IP"
-`, zoneID, dnsName, dnsName)
+`, zoneID, dcfg.DNSName, dcfg.DNSName)
 
-	serviceUnit := `[Unit]
-Description=Update dev.frob.io DNS on boot
+	serviceUnit := fmt.Sprintf(`[Unit]
+Description=Update %s DNS on boot
 After=network-online.target
 Wants=network-online.target
 
@@ -644,7 +707,7 @@ ExecStart=/opt/update-dns.sh
 
 [Install]
 WantedBy=multi-user.target
-`
+`, dcfg.DNSName)
 
 	// Commands to install the script and service on the remote box
 	installCmd := fmt.Sprintf(
@@ -668,7 +731,7 @@ echo "DNS boot script installed and enabled"`,
 	cmd := exec.CommandContext(ctx, "ssh",
 		"-i", keyPath,
 		"-o", "StrictHostKeyChecking=no",
-		"emaland@"+ip,
+		dcfg.SSHUser+"@"+ip,
 		installCmd,
 	)
 	cmd.Stdout = os.Stdout
@@ -677,11 +740,11 @@ echo "DNS boot script installed and enabled"`,
 		return fmt.Errorf("ssh command failed: %w", err)
 	}
 
-	fmt.Printf("Done. %s will update %s on every boot.\n", instanceID, dnsName)
+	fmt.Printf("Done. %s will update %s on every boot.\n", instanceID, dcfg.DNSName)
 	return nil
 }
 
-func sshToInstance(ctx context.Context, client *ec2.Client, instanceID string) error {
+func sshToInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, instanceID string) error {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
@@ -697,11 +760,7 @@ func sshToInstance(ctx context.Context, client *ec2.Client, instanceID string) e
 	}
 	ip := *inst.PublicIpAddress
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("getting home dir: %w", err)
-	}
-	keyPath := filepath.Join(home, ".ssh", "dev-boxes.pem")
+	keyPath := dcfg.resolveSSHKeyPath()
 
 	sshBin, err := exec.LookPath("ssh")
 	if err != nil {
@@ -709,7 +768,7 @@ func sshToInstance(ctx context.Context, client *ec2.Client, instanceID string) e
 	}
 
 	fmt.Printf("Connecting to %s (%s)...\n", instanceID, ip)
-	return syscall.Exec(sshBin, []string{"ssh", "-i", keyPath, "emaland@" + ip}, os.Environ())
+	return syscall.Exec(sshBin, []string{"ssh", "-i", keyPath, dcfg.SSHUser + "@" + ip}, os.Environ())
 }
 
 func nameTag(tags []types.Tag) string {
@@ -723,7 +782,7 @@ func nameTag(tags []types.Tag) string {
 
 // --- resize command ---
 
-func resizeInstance(ctx context.Context, client *ec2.Client, r53client *route53.Client, instanceID, newType string) error {
+func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, r53client *route53.Client, instanceID, newType string) error {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
@@ -793,7 +852,7 @@ func resizeInstance(ctx context.Context, client *ec2.Client, r53client *route53.
 	fmt.Println("Instance running.")
 
 	// Update DNS (non-fatal)
-	if err := updateDNS(ctx, client, r53client, instanceID); err != nil {
+	if err := updateDNS(ctx, dcfg, client, r53client, instanceID); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
 		fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")
 	}
@@ -1050,12 +1109,12 @@ func fetchSpotPrices(ctx context.Context, client *ec2.Client, instanceTypes []in
 
 // --- spawn command ---
 
-func spawnInstance(ctx context.Context, client *ec2.Client, args []string) error {
+func spawnInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
-	instanceType := fs.String("type", "m6i.4xlarge", "Instance type")
-	az := fs.String("az", "us-east-2a", "Availability zone")
-	name := fs.String("name", "dev-workstation-tmp", "Name tag for the instance")
-	maxPrice := fs.String("max-price", "2.00", "Spot max price $/hr")
+	instanceType := fs.String("type", dcfg.DefaultType, "Instance type")
+	az := fs.String("az", dcfg.DefaultAZ, "Availability zone")
+	name := fs.String("name", dcfg.SpawnName, "Name tag for the instance")
+	maxPrice := fs.String("max-price", dcfg.DefaultMaxPrice, "Spot max price $/hr")
 	from := fs.String("from", "", "Instance ID to clone user_data from")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1064,13 +1123,13 @@ func spawnInstance(ctx context.Context, client *ec2.Client, args []string) error
 	// Discover infrastructure
 	fmt.Println("Looking up infrastructure...")
 
-	amiID, err := lookupAMI(ctx, client)
+	amiID, err := lookupAMI(ctx, dcfg, client)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("  AMI: %s\n", amiID)
 
-	sgID, err := lookupSecurityGroup(ctx, client)
+	sgID, err := lookupSecurityGroup(ctx, dcfg, client)
 	if err != nil {
 		return err
 	}
@@ -1105,11 +1164,11 @@ func spawnInstance(ctx context.Context, client *ec2.Client, args []string) error
 		InstanceType: types.InstanceType(*instanceType),
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
-		KeyName:      aws.String("dev-boxes"),
+		KeyName:      aws.String(dcfg.SSHKeyName),
 		SubnetId:     aws.String(subnetID),
 		SecurityGroupIds: []string{sgID},
 		IamInstanceProfile: &types.IamInstanceProfileSpecification{
-			Name: aws.String("dev-workstation-profile"),
+			Name: aws.String(dcfg.IAMProfile),
 		},
 		UserData: aws.String(userData),
 		InstanceMarketOptions: &types.InstanceMarketOptionsRequest{
@@ -1174,16 +1233,16 @@ func spawnInstance(ctx context.Context, client *ec2.Client, args []string) error
 	fmt.Printf("  AZ:        %s\n", *az)
 	fmt.Printf("  Public IP: %s\n", publicIP)
 	if publicIP != "-" {
-		fmt.Printf("  SSH:       ssh -i ~/.ssh/dev-boxes.pem emaland@%s\n", publicIP)
+		fmt.Printf("  SSH:       ssh -i %s %s@%s\n", dcfg.SSHKeyPath, dcfg.SSHUser, publicIP)
 	}
 	return nil
 }
 
-func lookupAMI(ctx context.Context, client *ec2.Client) (string, error) {
+func lookupAMI(ctx context.Context, dcfg devboxConfig, client *ec2.Client) (string, error) {
 	result, err := client.DescribeImages(ctx, &ec2.DescribeImagesInput{
-		Owners: []string{"427812963091"},
+		Owners: []string{dcfg.NixOSAMIOwner},
 		Filters: []types.Filter{
-			{Name: aws.String("name"), Values: []string{"nixos/24.11*"}},
+			{Name: aws.String("name"), Values: []string{dcfg.NixOSAMIPattern}},
 			{Name: aws.String("architecture"), Values: []string{"x86_64"}},
 			{Name: aws.String("state"), Values: []string{"available"}},
 		},
@@ -1201,15 +1260,15 @@ func lookupAMI(ctx context.Context, client *ec2.Client) (string, error) {
 	return *result.Images[0].ImageId, nil
 }
 
-func lookupSecurityGroup(ctx context.Context, client *ec2.Client) (string, error) {
+func lookupSecurityGroup(ctx context.Context, dcfg devboxConfig, client *ec2.Client) (string, error) {
 	result, err := client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
-		GroupNames: []string{"dev-instance"},
+		GroupNames: []string{dcfg.SecurityGroup},
 	})
 	if err != nil {
 		return "", fmt.Errorf("looking up security group: %w", err)
 	}
 	if len(result.SecurityGroups) == 0 {
-		return "", fmt.Errorf("security group 'dev-instance' not found")
+		return "", fmt.Errorf("security group %q not found", dcfg.SecurityGroup)
 	}
 	return *result.SecurityGroups[0].GroupId, nil
 }
