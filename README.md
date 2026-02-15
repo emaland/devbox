@@ -8,7 +8,13 @@ Running a dev workstation as a persistent EC2 spot instance is cheap, but managi
 
 ## Install
 
-Requires Go 1.21+ and valid AWS credentials (via `~/.aws/credentials`, environment variables, or SSO).
+```bash
+go install github.com/emaland/devbox@latest
+```
+
+This puts the `devbox` binary in your `$GOPATH/bin` (or `$GOBIN`). Make sure that's on your `PATH`.
+
+## Building from source
 
 ```bash
 git clone git@github.com:emaland/devbox.git
@@ -19,19 +25,35 @@ go build -o devbox .
 mv devbox ~/bin/        # or /usr/local/bin, etc.
 ```
 
+Requires Go 1.21+. The binary is fully static with no runtime dependencies beyond AWS credentials.
+
 ## Configuration
 
-devbox reads its config from `~/.config/devbox/default.json`. If the file doesn't exist, built-in defaults are used.
-
-To get started, copy the example config from this repo and edit it:
+devbox reads its config from `~/.config/devbox/default.json`. If the file doesn't exist, built-in defaults are used. Every field is optional — omit any field to keep the default.
 
 ```bash
 mkdir -p ~/.config/devbox
-# Strip the comments (Go's JSON parser doesn't support them)
-grep -v '^\s*//' default.json > ~/.config/devbox/default.json
 ```
 
-Then edit `~/.config/devbox/default.json` to match your setup. Every field is optional — omit any field to keep the default. See `default.json` in this repo for a fully-commented reference.
+Example config:
+
+```json
+{
+  "dns_name": "dev.frob.io",
+  "dns_zone": "frob.io.",
+  "ssh_key_name": "dev-boxes",
+  "ssh_key_path": "~/.ssh/dev-boxes.pem",
+  "ssh_user": "emaland",
+  "security_group": "dev-instance",
+  "iam_profile": "dev-workstation-profile",
+  "default_az": "us-east-2a",
+  "default_type": "m6i.4xlarge",
+  "default_max_price": "2.00",
+  "spawn_name": "dev-workstation-tmp",
+  "nixos_ami_owner": "427812963091",
+  "nixos_ami_pattern": "nixos/24.11*"
+}
+```
 
 ### Config fields
 
@@ -86,12 +108,19 @@ devbox ssh i-abc123
 ### DNS
 
 ```bash
-# Point your DNS record at an instance's public IP
+# Point dns_name from config at an instance's public IP
 devbox dns i-abc123
+
+# Point a specific DNS name at an instance instead
+devbox dns i-abc123 staging.frob.io
 
 # Install a systemd service that updates DNS on every boot
 devbox setup-dns i-abc123
 ```
+
+The `dns` command updates a Route 53 A record (TTL 60s) in the hosted zone specified by `dns_zone`. When called without a DNS name argument, it uses `dns_name` from your config. When called with a second argument, it uses that name instead — useful for pointing multiple records at different instances.
+
+The `setup-dns` command SSHes into the instance and installs a oneshot systemd service that runs on every boot, queries the instance metadata for its current public IP, and updates the Route 53 record. This is a safety net so DNS stays correct after spot interruption/restart cycles without manual intervention.
 
 ### Spot management
 

@@ -142,11 +142,15 @@ func main() {
 		}
 	case "dns":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: devbox dns <instance-id>")
+			fmt.Fprintln(os.Stderr, "Usage: devbox dns <instance-id> [dns-name]")
 			os.Exit(1)
 		}
+		dnsName := dcfg.DNSName
+		if len(os.Args) >= 4 {
+			dnsName = os.Args[3]
+		}
 		r53client := route53.NewFromConfig(cfg)
-		if err := updateDNS(ctx, dcfg, client, r53client, os.Args[2]); err != nil {
+		if err := updateDNS(ctx, dcfg, client, r53client, os.Args[2], dnsName); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -223,7 +227,7 @@ Commands:
   start    <instance-id> [...]      Start stopped spot instances
   stop     <instance-id> [...]      Stop running spot instances
   terminate <instance-id> [...]     Terminate spot instances
-  dns      <instance-id>            Point dev.frob.io at the instance's public IP
+  dns      <instance-id> [dns-name]  Point a DNS name at the instance's public IP
   bids                              Show current spot request bids (max price)
   prices                            Show current spot market prices for our instance types
   rebid    <spot-req-id> <price>    Cancel and re-create a spot request with a new max price
@@ -336,7 +340,7 @@ func terminateInstances(ctx context.Context, client *ec2.Client, ids []string) e
 	return nil
 }
 
-func updateDNS(ctx context.Context, dcfg devboxConfig, ec2client *ec2.Client, r53client *route53.Client, instanceID string) error {
+func updateDNS(ctx context.Context, dcfg devboxConfig, ec2client *ec2.Client, r53client *route53.Client, instanceID string, dnsName string) error {
 	// Look up the instance's public IP
 	desc, err := ec2client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
@@ -362,12 +366,12 @@ func updateDNS(ctx context.Context, dcfg devboxConfig, ec2client *ec2.Client, r5
 	_, err = r53client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
 		HostedZoneId: aws.String(zoneID),
 		ChangeBatch: &r53types.ChangeBatch{
-			Comment: aws.String(fmt.Sprintf("devbox: point %s at %s (%s)", dcfg.DNSName, instanceID, ip)),
+			Comment: aws.String(fmt.Sprintf("devbox: point %s at %s (%s)", dnsName, instanceID, ip)),
 			Changes: []r53types.Change{
 				{
 					Action: r53types.ChangeActionUpsert,
 					ResourceRecordSet: &r53types.ResourceRecordSet{
-						Name: aws.String(dcfg.DNSName),
+						Name: aws.String(dnsName),
 						Type: r53types.RRTypeA,
 						TTL:  aws.Int64(60),
 						ResourceRecords: []r53types.ResourceRecord{
@@ -382,7 +386,7 @@ func updateDNS(ctx context.Context, dcfg devboxConfig, ec2client *ec2.Client, r5
 		return fmt.Errorf("updating DNS record: %w", err)
 	}
 
-	fmt.Printf("%s -> %s (%s)\n", dcfg.DNSName, ip, instanceID)
+	fmt.Printf("%s -> %s (%s)\n", dnsName, ip, instanceID)
 	return nil
 }
 
@@ -852,7 +856,7 @@ func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, 
 	fmt.Println("Instance running.")
 
 	// Update DNS (non-fatal)
-	if err := updateDNS(ctx, dcfg, client, r53client, instanceID); err != nil {
+	if err := updateDNS(ctx, dcfg, client, r53client, instanceID, dcfg.DNSName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
 		fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")
 	}
