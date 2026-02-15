@@ -1,0 +1,6 @@
+# These are the only variables not read from ~/.config/devbox/default.json.
+# Everything else (key name, security group, IAM profile, AZ, etc.)
+# comes from the shared devbox config.
+
+dns_zone_id    = "ZXXXXXXXXXXXXXXXXXX"
+ssh_public_key = "ssh-ed25519 AAAA... you@host"

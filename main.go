@@ -212,6 +212,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "volume":
+		if err := volumeCommand(ctx, dcfg, client, cfg, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -235,7 +240,8 @@ Commands:
   setup-dns <instance-id>           Install a boot script that updates dev.frob.io on startup
   search   [flags]                  Browse spot prices by hardware specs
   resize   <instance-id> <type>     Stop instance, change type, restart, update DNS
-  spawn    [flags]                  Spin up a new spot instance cloned from the primary`)
+  spawn    [flags]                  Spin up a new spot instance cloned from the primary
+  volume   <subcommand>             Manage EBS volumes (ls, create, attach, detach, snapshot, snapshots, destroy, move)`)
 }
 
 func listInstances(ctx context.Context, client *ec2.Client) error {
@@ -1337,4 +1343,507 @@ func fetchUserData(ctx context.Context, client *ec2.Client, instanceID string) (
 	}
 	// Re-encode since RunInstances expects base64
 	return base64.StdEncoding.EncodeToString(decoded), nil
+}
+
+// --- volume commands ---
+
+func volumeCommand(ctx context.Context, dcfg devboxConfig, client *ec2.Client, awsCfg aws.Config, args []string) error {
+	if len(args) == 0 {
+		printVolumeUsage()
+		return nil
+	}
+	switch args[0] {
+	case "ls", "list":
+		return volumeLS(ctx, client)
+	case "create":
+		return volumeCreate(ctx, dcfg, client, args[1:])
+	case "attach":
+		return volumeAttach(ctx, client, args[1:])
+	case "detach":
+		return volumeDetach(ctx, client, args[1:])
+	case "snapshot":
+		return volumeSnapshot(ctx, client, args[1:])
+	case "snapshots":
+		return volumeSnapshots(ctx, client)
+	case "destroy":
+		return volumeDestroy(ctx, client, args[1:])
+	case "move":
+		return volumeMove(ctx, client, awsCfg, args[1:])
+	default:
+		printVolumeUsage()
+		return fmt.Errorf("unknown volume subcommand: %s", args[0])
+	}
+}
+
+func printVolumeUsage() {
+	fmt.Fprintln(os.Stderr, `Usage: devbox volume <subcommand> [args]
+
+Subcommands:
+  ls                                 List EBS volumes
+  create   [flags]                   Create a new EBS volume
+  attach   <volume> <instance-id>    Attach a volume to an instance
+  detach   <volume>                  Detach a volume
+  snapshot <volume>                  Create a snapshot of a volume
+  snapshots                          List snapshots
+  destroy  <volume>                  Delete a volume (must be detached)
+  move     <volume> <target-region>  Move a volume to another region
+
+Volumes can be specified by ID (vol-xxx) or by Name tag.`)
+}
+
+func resolveVolume(ctx context.Context, client *ec2.Client, nameOrID string) (string, error) {
+	if strings.HasPrefix(nameOrID, "vol-") {
+		return nameOrID, nil
+	}
+	result, err := client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{
+		Filters: []types.Filter{
+			{Name: aws.String("tag:Name"), Values: []string{nameOrID}},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("looking up volume by name %q: %w", nameOrID, err)
+	}
+	if len(result.Volumes) == 0 {
+		return "", fmt.Errorf("no volume found with name %q", nameOrID)
+	}
+	if len(result.Volumes) > 1 {
+		var ids []string
+		for _, v := range result.Volumes {
+			ids = append(ids, *v.VolumeId)
+		}
+		return "", fmt.Errorf("multiple volumes found with name %q: %s — use the volume ID instead", nameOrID, strings.Join(ids, ", "))
+	}
+	return *result.Volumes[0].VolumeId, nil
+}
+
+func volumeLS(ctx context.Context, client *ec2.Client) error {
+	result, err := client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{})
+	if err != nil {
+		return fmt.Errorf("describing volumes: %w", err)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "VOLUME ID\tNAME\tSIZE\tTYPE\tIOPS\tSTATE\tAZ\tATTACHED TO")
+	for _, v := range result.Volumes {
+		name := nameTag(v.Tags)
+		attached := "-"
+		if len(v.Attachments) > 0 {
+			attached = *v.Attachments[0].InstanceId
+		}
+		iops := "-"
+		if v.Iops != nil {
+			iops = fmt.Sprintf("%d", *v.Iops)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d GiB\t%s\t%s\t%s\t%s\t%s\n",
+			*v.VolumeId,
+			name,
+			*v.Size,
+			string(v.VolumeType),
+			iops,
+			string(v.State),
+			*v.AvailabilityZone,
+			attached,
+		)
+	}
+	w.Flush()
+	return nil
+}
+
+func volumeCreate(ctx context.Context, dcfg devboxConfig, client *ec2.Client, args []string) error {
+	fs := flag.NewFlagSet("volume create", flag.ExitOnError)
+	size := fs.Int("size", 512, "Volume size in GiB")
+	volType := fs.String("type", "gp3", "Volume type")
+	iops := fs.Int("iops", 3000, "IOPS")
+	throughput := fs.Int("throughput", 250, "Throughput MB/s")
+	az := fs.String("az", dcfg.DefaultAZ, "Availability zone")
+	name := fs.String("name", "dev-data-volume", "Name tag")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	input := &ec2.CreateVolumeInput{
+		AvailabilityZone: az,
+		Size:             aws.Int32(int32(*size)),
+		VolumeType:       types.VolumeType(*volType),
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeVolume,
+				Tags: []types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(*name)},
+				},
+			},
+		},
+	}
+	if *volType == "gp3" || *volType == "io1" || *volType == "io2" {
+		input.Iops = aws.Int32(int32(*iops))
+	}
+	if *volType == "gp3" {
+		input.Throughput = aws.Int32(int32(*throughput))
+	}
+
+	result, err := client.CreateVolume(ctx, input)
+	if err != nil {
+		return fmt.Errorf("creating volume: %w", err)
+	}
+	volID := *result.VolumeId
+	fmt.Printf("Created volume %s, waiting for available state...\n", volID)
+
+	if err := pollVolumeState(ctx, client, volID, "available", 5*time.Second, 2*time.Minute); err != nil {
+		return err
+	}
+	fmt.Printf("Volume %s is available.\n", volID)
+	return nil
+}
+
+func volumeAttach(ctx context.Context, client *ec2.Client, args []string) error {
+	fs := flag.NewFlagSet("volume attach", flag.ExitOnError)
+	device := fs.String("device", "/dev/xvdf", "Device name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 {
+		return fmt.Errorf("usage: devbox volume attach [--device DEV] <volume> <instance-id>")
+	}
+
+	volID, err := resolveVolume(ctx, client, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	_, err = client.AttachVolume(ctx, &ec2.AttachVolumeInput{
+		VolumeId:   aws.String(volID),
+		InstanceId: aws.String(fs.Arg(1)),
+		Device:     device,
+	})
+	if err != nil {
+		return fmt.Errorf("attaching volume: %w", err)
+	}
+	fmt.Printf("Attaching %s to %s as %s, waiting...\n", volID, fs.Arg(1), *device)
+
+	if err := pollVolumeState(ctx, client, volID, "in-use", 5*time.Second, 2*time.Minute); err != nil {
+		return err
+	}
+	fmt.Println("Volume attached.")
+	return nil
+}
+
+func volumeDetach(ctx context.Context, client *ec2.Client, args []string) error {
+	fs := flag.NewFlagSet("volume detach", flag.ExitOnError)
+	force := fs.Bool("force", false, "Force detach")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: devbox volume detach [--force] <volume>")
+	}
+
+	volID, err := resolveVolume(ctx, client, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	_, err = client.DetachVolume(ctx, &ec2.DetachVolumeInput{
+		VolumeId: aws.String(volID),
+		Force:    force,
+	})
+	if err != nil {
+		return fmt.Errorf("detaching volume: %w", err)
+	}
+	fmt.Printf("Detaching %s, waiting...\n", volID)
+
+	if err := pollVolumeState(ctx, client, volID, "available", 5*time.Second, 2*time.Minute); err != nil {
+		return err
+	}
+	fmt.Println("Volume detached.")
+	return nil
+}
+
+func volumeSnapshot(ctx context.Context, client *ec2.Client, args []string) error {
+	fs := flag.NewFlagSet("volume snapshot", flag.ExitOnError)
+	name := fs.String("name", "", "Description/tag for the snapshot")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: devbox volume snapshot [--name DESC] <volume>")
+	}
+
+	volID, err := resolveVolume(ctx, client, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	input := &ec2.CreateSnapshotInput{
+		VolumeId: aws.String(volID),
+	}
+	if *name != "" {
+		input.Description = name
+		input.TagSpecifications = []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeSnapshot,
+				Tags: []types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(*name)},
+				},
+			},
+		}
+	}
+
+	result, err := client.CreateSnapshot(ctx, input)
+	if err != nil {
+		return fmt.Errorf("creating snapshot: %w", err)
+	}
+	fmt.Printf("Snapshot %s started for volume %s.\n", *result.SnapshotId, volID)
+	fmt.Println("Snapshots can take a while. Check progress with: devbox volume snapshots")
+	return nil
+}
+
+func volumeSnapshots(ctx context.Context, client *ec2.Client) error {
+	result, err := client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
+		OwnerIds: []string{"self"},
+	})
+	if err != nil {
+		return fmt.Errorf("describing snapshots: %w", err)
+	}
+
+	if len(result.Snapshots) == 0 {
+		fmt.Println("No snapshots found.")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "SNAPSHOT ID\tVOLUME ID\tSIZE\tSTATE\tPROGRESS\tDESCRIPTION\tCREATED")
+	for _, s := range result.Snapshots {
+		desc := "-"
+		if s.Description != nil && *s.Description != "" {
+			desc = *s.Description
+		}
+		created := "-"
+		if s.StartTime != nil {
+			created = s.StartTime.Format("2006-01-02 15:04")
+		}
+		progress := "-"
+		if s.Progress != nil {
+			progress = *s.Progress
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d GiB\t%s\t%s\t%s\t%s\n",
+			*s.SnapshotId,
+			*s.VolumeId,
+			*s.VolumeSize,
+			string(s.State),
+			progress,
+			desc,
+			created,
+		)
+	}
+	w.Flush()
+	return nil
+}
+
+func volumeDestroy(ctx context.Context, client *ec2.Client, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: devbox volume destroy <volume>")
+	}
+
+	volID, err := resolveVolume(ctx, client, args[0])
+	if err != nil {
+		return err
+	}
+
+	_, err = client.DeleteVolume(ctx, &ec2.DeleteVolumeInput{
+		VolumeId: aws.String(volID),
+	})
+	if err != nil {
+		return fmt.Errorf("deleting volume: %w", err)
+	}
+	fmt.Printf("Volume %s deleted.\n", volID)
+	return nil
+}
+
+func volumeMove(ctx context.Context, client *ec2.Client, awsCfg aws.Config, args []string) error {
+	fs := flag.NewFlagSet("volume move", flag.ExitOnError)
+	targetAZ := fs.String("az", "", "Target AZ (default: <region>a)")
+	cleanup := fs.Bool("cleanup", false, "Delete intermediate snapshots after move")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 {
+		return fmt.Errorf("usage: devbox volume move [--az AZ] [--cleanup] <volume> <target-region>")
+	}
+
+	volID, err := resolveVolume(ctx, client, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	targetRegion := fs.Arg(1)
+
+	if *targetAZ == "" {
+		*targetAZ = targetRegion + "a"
+	}
+
+	// Describe the source volume to preserve its attributes
+	descVol, err := client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{
+		VolumeIds: []string{volID},
+	})
+	if err != nil {
+		return fmt.Errorf("describing source volume: %w", err)
+	}
+	if len(descVol.Volumes) == 0 {
+		return fmt.Errorf("volume %s not found", volID)
+	}
+	srcVol := descVol.Volumes[0]
+	sourceRegion := awsCfg.Region
+
+	// Step 1: Create snapshot in source region
+	fmt.Printf("Creating snapshot of %s in %s...\n", volID, sourceRegion)
+	snap, err := client.CreateSnapshot(ctx, &ec2.CreateSnapshotInput{
+		VolumeId:    aws.String(volID),
+		Description: aws.String(fmt.Sprintf("devbox move: %s -> %s", volID, targetRegion)),
+	})
+	if err != nil {
+		return fmt.Errorf("creating source snapshot: %w", err)
+	}
+	srcSnapID := *snap.SnapshotId
+	fmt.Printf("Source snapshot: %s\n", srcSnapID)
+
+	fmt.Println("Waiting for source snapshot to complete...")
+	if err := pollSnapshotState(ctx, client, srcSnapID, "completed", 15*time.Second, 30*time.Minute); err != nil {
+		return fmt.Errorf("waiting for source snapshot: %w", err)
+	}
+	fmt.Println("Source snapshot completed.")
+
+	// Step 2: Create client for target region
+	targetCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(targetRegion))
+	if err != nil {
+		return fmt.Errorf("loading config for region %s: %w", targetRegion, err)
+	}
+	targetClient := ec2.NewFromConfig(targetCfg)
+
+	// Step 3: Copy snapshot to target region
+	fmt.Printf("Copying snapshot to %s...\n", targetRegion)
+	copyResult, err := targetClient.CopySnapshot(ctx, &ec2.CopySnapshotInput{
+		SourceRegion:     aws.String(sourceRegion),
+		SourceSnapshotId: aws.String(srcSnapID),
+		Description:      aws.String(fmt.Sprintf("devbox move: %s from %s", volID, sourceRegion)),
+	})
+	if err != nil {
+		return fmt.Errorf("copying snapshot to %s: %w", targetRegion, err)
+	}
+	dstSnapID := *copyResult.SnapshotId
+	fmt.Printf("Target snapshot: %s\n", dstSnapID)
+
+	fmt.Println("Waiting for target snapshot to complete...")
+	if err := pollSnapshotState(ctx, targetClient, dstSnapID, "completed", 15*time.Second, 30*time.Minute); err != nil {
+		return fmt.Errorf("waiting for target snapshot: %w", err)
+	}
+	fmt.Println("Target snapshot completed.")
+
+	// Step 4: Create volume from copied snapshot
+	createInput := &ec2.CreateVolumeInput{
+		AvailabilityZone: targetAZ,
+		SnapshotId:       aws.String(dstSnapID),
+		Size:             srcVol.Size,
+		VolumeType:       srcVol.VolumeType,
+	}
+	if srcVol.Iops != nil {
+		createInput.Iops = srcVol.Iops
+	}
+	if srcVol.Throughput != nil {
+		createInput.Throughput = srcVol.Throughput
+	}
+	// Copy tags from source volume
+	if len(srcVol.Tags) > 0 {
+		createInput.TagSpecifications = []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeVolume,
+				Tags:         srcVol.Tags,
+			},
+		}
+	}
+
+	fmt.Printf("Creating volume in %s...\n", *targetAZ)
+	newVol, err := targetClient.CreateVolume(ctx, createInput)
+	if err != nil {
+		return fmt.Errorf("creating volume in target region: %w", err)
+	}
+	newVolID := *newVol.VolumeId
+
+	if err := pollVolumeState(ctx, targetClient, newVolID, "available", 5*time.Second, 2*time.Minute); err != nil {
+		return fmt.Errorf("waiting for new volume: %w", err)
+	}
+
+	fmt.Printf("\nVolume moved successfully!\n")
+	fmt.Printf("  New volume: %s in %s\n", newVolID, *targetAZ)
+
+	// Step 5: Cleanup intermediate snapshots if requested
+	if *cleanup {
+		fmt.Println("Cleaning up intermediate snapshots...")
+		if _, err := client.DeleteSnapshot(ctx, &ec2.DeleteSnapshotInput{
+			SnapshotId: aws.String(srcSnapID),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete source snapshot %s: %v\n", srcSnapID, err)
+		} else {
+			fmt.Printf("  Deleted source snapshot %s\n", srcSnapID)
+		}
+		if _, err := targetClient.DeleteSnapshot(ctx, &ec2.DeleteSnapshotInput{
+			SnapshotId: aws.String(dstSnapID),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete target snapshot %s: %v\n", dstSnapID, err)
+		} else {
+			fmt.Printf("  Deleted target snapshot %s\n", dstSnapID)
+		}
+	}
+
+	return nil
+}
+
+func pollVolumeState(ctx context.Context, client *ec2.Client, volumeID, desiredState string, interval, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for volume %s to reach state %q", volumeID, desiredState)
+		}
+		result, err := client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{
+			VolumeIds: []string{volumeID},
+		})
+		if err != nil {
+			return fmt.Errorf("polling volume state: %w", err)
+		}
+		if len(result.Volumes) > 0 && string(result.Volumes[0].State) == desiredState {
+			return nil
+		}
+		time.Sleep(interval)
+	}
+}
+
+func pollSnapshotState(ctx context.Context, client *ec2.Client, snapshotID, desiredState string, interval, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for snapshot %s to reach state %q", snapshotID, desiredState)
+		}
+		result, err := client.DescribeSnapshots(ctx, &ec2.DescribeSnapshotsInput{
+			SnapshotIds: []string{snapshotID},
+		})
+		if err != nil {
+			return fmt.Errorf("polling snapshot state: %w", err)
+		}
+		if len(result.Snapshots) > 0 {
+			snap := result.Snapshots[0]
+			state := string(snap.State)
+			if state == desiredState {
+				return nil
+			}
+			if snap.Progress != nil {
+				fmt.Printf("  %s: %s (%s)\n", snapshotID, state, *snap.Progress)
+			}
+			if state == "error" {
+				msg := ""
+				if snap.StateMessage != nil {
+					msg = ": " + *snap.StateMessage
+				}
+				return fmt.Errorf("snapshot %s failed%s", snapshotID, msg)
+			}
+		}
+		time.Sleep(interval)
+	}
 }
