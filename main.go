@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -115,6 +118,26 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "resize":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: devbox resize <instance-id> <new-type>")
+			os.Exit(1)
+		}
+		r53client := route53.NewFromConfig(cfg)
+		if err := resizeInstance(ctx, client, r53client, os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "search":
+		if err := searchSpotPrices(ctx, client, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "spawn":
+		if err := spawnInstance(ctx, client, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -135,7 +158,10 @@ Commands:
   prices                            Show current spot market prices for our instance types
   rebid    <spot-req-id> <price>    Cancel and re-create a spot request with a new max price
   ssh      <instance-id>            SSH into an instance
-  setup-dns <instance-id>           Install a boot script that updates dev.frob.io on startup`)
+  setup-dns <instance-id>           Install a boot script that updates dev.frob.io on startup
+  search   [flags]                  Browse spot prices by hardware specs
+  resize   <instance-id> <type>     Stop instance, change type, restart, update DNS
+  spawn    [flags]                  Spin up a new spot instance cloned from the primary`)
 }
 
 func listInstances(ctx context.Context, client *ec2.Client) error {
@@ -693,4 +719,524 @@ func nameTag(tags []types.Tag) string {
 		}
 	}
 	return "-"
+}
+
+// --- resize command ---
+
+func resizeInstance(ctx context.Context, client *ec2.Client, r53client *route53.Client, instanceID, newType string) error {
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return fmt.Errorf("describing instance: %w", err)
+	}
+	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
+		return fmt.Errorf("instance %s not found", instanceID)
+	}
+	inst := desc.Reservations[0].Instances[0]
+	currentType := string(inst.InstanceType)
+	state := inst.State.Name
+
+	fmt.Printf("Instance %s: type=%s state=%s\n", instanceID, currentType, state)
+
+	if currentType == newType {
+		fmt.Println("Already the requested type, nothing to do.")
+		return nil
+	}
+
+	// Stop if running
+	if state == types.InstanceStateNameRunning || state == types.InstanceStateNamePending {
+		fmt.Printf("Stopping instance %s...\n", instanceID)
+		_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
+			InstanceIds: []string{instanceID},
+		})
+		if err != nil {
+			return fmt.Errorf("stopping instance: %w", err)
+		}
+		waiter := ec2.NewInstanceStoppedWaiter(client)
+		if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: []string{instanceID},
+		}, 5*time.Minute); err != nil {
+			return fmt.Errorf("waiting for instance to stop: %w", err)
+		}
+		fmt.Println("Instance stopped.")
+	} else if state != types.InstanceStateNameStopped {
+		return fmt.Errorf("instance is in state %s, cannot resize", state)
+	}
+
+	// Modify instance type
+	fmt.Printf("Changing instance type from %s to %s...\n", currentType, newType)
+	_, err = client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+		InstanceId: aws.String(instanceID),
+		InstanceType: &types.AttributeValue{
+			Value: aws.String(newType),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("modifying instance type: %w", err)
+	}
+
+	// Start instance
+	fmt.Printf("Starting instance %s...\n", instanceID)
+	_, err = client.StartInstances(ctx, &ec2.StartInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return fmt.Errorf("starting instance: %w", err)
+	}
+	waiter := ec2.NewInstanceRunningWaiter(client)
+	if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for instance to start: %w", err)
+	}
+	fmt.Println("Instance running.")
+
+	// Update DNS (non-fatal)
+	if err := updateDNS(ctx, client, r53client, instanceID); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")
+	}
+
+	// Warn about persistent spot request
+	if inst.SpotInstanceRequestId != nil {
+		fmt.Printf("\nNote: The persistent spot request %s still references type %s.\n", *inst.SpotInstanceRequestId, currentType)
+		fmt.Println("Run 'devbox rebid' if you want to update the spot request too.")
+	}
+
+	return nil
+}
+
+// --- search command ---
+
+type spotSearchResult struct {
+	InstanceType string
+	VCPUs        int32
+	MemoryMiB    int64
+	AZ           string
+	Price        float64
+	GPU          bool
+}
+
+func searchSpotPrices(ctx context.Context, client *ec2.Client, args []string) error {
+	fs := flag.NewFlagSet("search", flag.ExitOnError)
+	minVCPU := fs.Int("min-vcpu", 8, "Minimum vCPUs")
+	minMem := fs.Float64("min-mem", 16, "Minimum memory (GiB)")
+	maxPrice := fs.Float64("max-price", 0, "Max spot price $/hr (0 = no limit)")
+	arch := fs.String("arch", "x86_64", "Architecture (x86_64 or arm64)")
+	gpu := fs.Bool("gpu", false, "Require GPU")
+	az := fs.String("az", "", "Filter by availability zone")
+	sortBy := fs.String("sort", "price", "Sort by: price, vcpu, mem")
+	limit := fs.Int("limit", 20, "Max rows to display")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// 1. Fetch instance types matching filters
+	fmt.Println("Fetching instance types...")
+	instanceTypes, err := fetchInstanceTypes(ctx, client, *arch, *minVCPU, *minMem, *gpu)
+	if err != nil {
+		return err
+	}
+	if len(instanceTypes) == 0 {
+		fmt.Println("No instance types match the given filters.")
+		return nil
+	}
+
+	// 2. Fetch spot prices for those types
+	fmt.Printf("Fetching spot prices for %d instance types...\n", len(instanceTypes))
+	results, err := fetchSpotPrices(ctx, client, instanceTypes, *az)
+	if err != nil {
+		return err
+	}
+
+	// 3. Apply max price filter
+	if *maxPrice > 0 {
+		var filtered []spotSearchResult
+		for _, r := range results {
+			if r.Price <= *maxPrice {
+				filtered = append(filtered, r)
+			}
+		}
+		results = filtered
+	}
+
+	if len(results) == 0 {
+		fmt.Println("No spot prices found matching filters.")
+		return nil
+	}
+
+	// 4. Sort
+	switch *sortBy {
+	case "vcpu":
+		sort.Slice(results, func(i, j int) bool { return results[i].VCPUs < results[j].VCPUs })
+	case "mem":
+		sort.Slice(results, func(i, j int) bool { return results[i].MemoryMiB < results[j].MemoryMiB })
+	default:
+		sort.Slice(results, func(i, j int) bool { return results[i].Price < results[j].Price })
+	}
+
+	// 5. Truncate
+	if *limit > 0 && len(results) > *limit {
+		results = results[:*limit]
+	}
+
+	// 6. Display
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "INSTANCE TYPE\tVCPU\tMEMORY\tAZ\tPRICE\tGPU")
+	for _, r := range results {
+		gpuStr := "-"
+		if r.GPU {
+			gpuStr = "yes"
+		}
+		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t$%.4f\t%s\n",
+			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, r.AZ, r.Price, gpuStr)
+	}
+	w.Flush()
+	return nil
+}
+
+type instanceTypeInfo struct {
+	Name      string
+	VCPUs     int32
+	MemoryMiB int64
+	HasGPU    bool
+}
+
+func fetchInstanceTypes(ctx context.Context, client *ec2.Client, arch string, minVCPU int, minMem float64, requireGPU bool) ([]instanceTypeInfo, error) {
+	var results []instanceTypeInfo
+	minMemMiB := int64(minMem * 1024)
+
+	input := &ec2.DescribeInstanceTypesInput{
+		Filters: []types.Filter{
+			{Name: aws.String("supported-usage-class"), Values: []string{"spot"}},
+			{Name: aws.String("current-generation"), Values: []string{"true"}},
+			{Name: aws.String("processor-info.supported-architecture"), Values: []string{arch}},
+		},
+	}
+
+	paginator := ec2.NewDescribeInstanceTypesPaginator(client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("describing instance types: %w", err)
+		}
+		for _, it := range page.InstanceTypes {
+			vcpus := *it.VCpuInfo.DefaultVCpus
+			memMiB := *it.MemoryInfo.SizeInMiB
+			hasGPU := it.GpuInfo != nil && len(it.GpuInfo.Gpus) > 0
+
+			if int(vcpus) < minVCPU {
+				continue
+			}
+			if memMiB < minMemMiB {
+				continue
+			}
+			if requireGPU && !hasGPU {
+				continue
+			}
+
+			results = append(results, instanceTypeInfo{
+				Name:      string(it.InstanceType),
+				VCPUs:     vcpus,
+				MemoryMiB: memMiB,
+				HasGPU:    hasGPU,
+			})
+		}
+	}
+	return results, nil
+}
+
+func fetchSpotPrices(ctx context.Context, client *ec2.Client, instanceTypes []instanceTypeInfo, azFilter string) ([]spotSearchResult, error) {
+	// Build lookup map
+	infoMap := map[string]instanceTypeInfo{}
+	var typeNames []types.InstanceType
+	for _, it := range instanceTypes {
+		infoMap[it.Name] = it
+		typeNames = append(typeNames, types.InstanceType(it.Name))
+	}
+
+	// Paginate spot price history in batches (API allows ~100 instance types per call)
+	type priceKey struct {
+		itype string
+		az    string
+	}
+	latest := map[priceKey]types.SpotPrice{}
+	startTime := time.Now().Add(-1 * time.Hour)
+
+	batchSize := 100
+	for i := 0; i < len(typeNames); i += batchSize {
+		end := i + batchSize
+		if end > len(typeNames) {
+			end = len(typeNames)
+		}
+		batch := typeNames[i:end]
+
+		input := &ec2.DescribeSpotPriceHistoryInput{
+			InstanceTypes:       batch,
+			StartTime:           &startTime,
+			ProductDescriptions: []string{"Linux/UNIX"},
+		}
+
+		paginator := ec2.NewDescribeSpotPriceHistoryPaginator(client, input)
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("describing spot price history: %w", err)
+			}
+			for _, sp := range page.SpotPriceHistory {
+				if azFilter != "" && *sp.AvailabilityZone != azFilter {
+					continue
+				}
+				k := priceKey{string(sp.InstanceType), *sp.AvailabilityZone}
+				existing, ok := latest[k]
+				if !ok || sp.Timestamp.After(*existing.Timestamp) {
+					latest[k] = sp
+				}
+			}
+		}
+	}
+
+	var results []spotSearchResult
+	for k, sp := range latest {
+		info := infoMap[k.itype]
+		price, _ := strconv.ParseFloat(*sp.SpotPrice, 64)
+		results = append(results, spotSearchResult{
+			InstanceType: k.itype,
+			VCPUs:        info.VCPUs,
+			MemoryMiB:    info.MemoryMiB,
+			AZ:           k.az,
+			Price:        price,
+			GPU:          info.HasGPU,
+		})
+	}
+	return results, nil
+}
+
+// --- spawn command ---
+
+func spawnInstance(ctx context.Context, client *ec2.Client, args []string) error {
+	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
+	instanceType := fs.String("type", "m6i.4xlarge", "Instance type")
+	az := fs.String("az", "us-east-2a", "Availability zone")
+	name := fs.String("name", "dev-workstation-tmp", "Name tag for the instance")
+	maxPrice := fs.String("max-price", "2.00", "Spot max price $/hr")
+	from := fs.String("from", "", "Instance ID to clone user_data from")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Discover infrastructure
+	fmt.Println("Looking up infrastructure...")
+
+	amiID, err := lookupAMI(ctx, client)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  AMI: %s\n", amiID)
+
+	sgID, err := lookupSecurityGroup(ctx, client)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  Security Group: %s\n", sgID)
+
+	subnetID, err := lookupSubnet(ctx, client, *az)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  Subnet: %s\n", subnetID)
+
+	// Get user_data from source instance
+	sourceID := *from
+	if sourceID == "" {
+		sourceID, err = autoDetectSourceInstance(ctx, client)
+		if err != nil {
+			return err
+		}
+	}
+	fmt.Printf("  Cloning user_data from: %s\n", sourceID)
+
+	userData, err := fetchUserData(ctx, client, sourceID)
+	if err != nil {
+		return err
+	}
+
+	// Launch the instance
+	fmt.Printf("Launching %s spot instance in %s...\n", *instanceType, *az)
+
+	runInput := &ec2.RunInstancesInput{
+		ImageId:      aws.String(amiID),
+		InstanceType: types.InstanceType(*instanceType),
+		MinCount:     aws.Int32(1),
+		MaxCount:     aws.Int32(1),
+		KeyName:      aws.String("dev-boxes"),
+		SubnetId:     aws.String(subnetID),
+		SecurityGroupIds: []string{sgID},
+		IamInstanceProfile: &types.IamInstanceProfileSpecification{
+			Name: aws.String("dev-workstation-profile"),
+		},
+		UserData: aws.String(userData),
+		InstanceMarketOptions: &types.InstanceMarketOptionsRequest{
+			MarketType: types.MarketTypeSpot,
+			SpotOptions: &types.SpotMarketOptions{
+				SpotInstanceType:             types.SpotInstanceTypePersistent,
+				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
+				MaxPrice:                     maxPrice,
+			},
+		},
+		BlockDeviceMappings: []types.BlockDeviceMapping{
+			{
+				DeviceName: aws.String("/dev/xvda"),
+				Ebs: &types.EbsBlockDevice{
+					VolumeSize: aws.Int32(75),
+					VolumeType: types.VolumeTypeGp3,
+				},
+			},
+		},
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeInstance,
+				Tags: []types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(*name)},
+					{Key: aws.String("devbox-managed"), Value: aws.String("true")},
+				},
+			},
+		},
+	}
+
+	result, err := client.RunInstances(ctx, runInput)
+	if err != nil {
+		return fmt.Errorf("launching instance: %w", err)
+	}
+
+	newID := *result.Instances[0].InstanceId
+	fmt.Printf("Instance %s launched, waiting for running state...\n", newID)
+
+	waiter := ec2.NewInstanceRunningWaiter(client)
+	if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{newID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for instance to start: %w", err)
+	}
+
+	// Re-describe to get public IP
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{newID},
+	})
+	if err != nil {
+		return fmt.Errorf("describing new instance: %w", err)
+	}
+	newInst := desc.Reservations[0].Instances[0]
+	publicIP := "-"
+	if newInst.PublicIpAddress != nil {
+		publicIP = *newInst.PublicIpAddress
+	}
+
+	fmt.Printf("\nInstance ready:\n")
+	fmt.Printf("  ID:        %s\n", newID)
+	fmt.Printf("  Type:      %s\n", *instanceType)
+	fmt.Printf("  AZ:        %s\n", *az)
+	fmt.Printf("  Public IP: %s\n", publicIP)
+	if publicIP != "-" {
+		fmt.Printf("  SSH:       ssh -i ~/.ssh/dev-boxes.pem emaland@%s\n", publicIP)
+	}
+	return nil
+}
+
+func lookupAMI(ctx context.Context, client *ec2.Client) (string, error) {
+	result, err := client.DescribeImages(ctx, &ec2.DescribeImagesInput{
+		Owners: []string{"427812963091"},
+		Filters: []types.Filter{
+			{Name: aws.String("name"), Values: []string{"nixos/24.11*"}},
+			{Name: aws.String("architecture"), Values: []string{"x86_64"}},
+			{Name: aws.String("state"), Values: []string{"available"}},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("looking up AMI: %w", err)
+	}
+	if len(result.Images) == 0 {
+		return "", fmt.Errorf("no NixOS 24.11 AMI found")
+	}
+	// Pick the latest by sorting on name (NixOS AMI names include dates)
+	sort.Slice(result.Images, func(i, j int) bool {
+		return *result.Images[i].Name > *result.Images[j].Name
+	})
+	return *result.Images[0].ImageId, nil
+}
+
+func lookupSecurityGroup(ctx context.Context, client *ec2.Client) (string, error) {
+	result, err := client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
+		GroupNames: []string{"dev-instance"},
+	})
+	if err != nil {
+		return "", fmt.Errorf("looking up security group: %w", err)
+	}
+	if len(result.SecurityGroups) == 0 {
+		return "", fmt.Errorf("security group 'dev-instance' not found")
+	}
+	return *result.SecurityGroups[0].GroupId, nil
+}
+
+func lookupSubnet(ctx context.Context, client *ec2.Client, az string) (string, error) {
+	result, err := client.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
+		Filters: []types.Filter{
+			{Name: aws.String("availability-zone"), Values: []string{az}},
+			{Name: aws.String("default-for-az"), Values: []string{"true"}},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("looking up subnet: %w", err)
+	}
+	if len(result.Subnets) == 0 {
+		return "", fmt.Errorf("no default subnet found for AZ %s", az)
+	}
+	return *result.Subnets[0].SubnetId, nil
+}
+
+func autoDetectSourceInstance(ctx context.Context, client *ec2.Client) (string, error) {
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{Name: aws.String("instance-lifecycle"), Values: []string{"spot"}},
+			{Name: aws.String("instance-state-name"), Values: []string{"running", "stopped"}},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("auto-detecting source instance: %w", err)
+	}
+	var ids []string
+	for _, res := range desc.Reservations {
+		for _, inst := range res.Instances {
+			ids = append(ids, *inst.InstanceId)
+		}
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("no running/stopped spot instances found to clone user_data from; use --from to specify")
+	}
+	if len(ids) > 1 {
+		return "", fmt.Errorf("multiple spot instances found (%s); use --from to specify which one", strings.Join(ids, ", "))
+	}
+	return ids[0], nil
+}
+
+func fetchUserData(ctx context.Context, client *ec2.Client, instanceID string) (string, error) {
+	result, err := client.DescribeInstanceAttribute(ctx, &ec2.DescribeInstanceAttributeInput{
+		InstanceId: aws.String(instanceID),
+		Attribute:  types.InstanceAttributeNameUserData,
+	})
+	if err != nil {
+		return "", fmt.Errorf("fetching user_data from %s: %w", instanceID, err)
+	}
+	if result.UserData == nil || result.UserData.Value == nil {
+		return "", fmt.Errorf("instance %s has no user_data", instanceID)
+	}
+	// The API returns base64-encoded data. RunInstances also expects base64,
+	// but let's verify it decodes properly.
+	decoded, err := base64.StdEncoding.DecodeString(*result.UserData.Value)
+	if err != nil {
+		return "", fmt.Errorf("user_data is not valid base64: %w", err)
+	}
+	// Re-encode since RunInstances expects base64
+	return base64.StdEncoding.EncodeToString(decoded), nil
 }
