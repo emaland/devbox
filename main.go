@@ -832,11 +832,26 @@ func searchSpotPrices(ctx context.Context, client *ec2.Client, args []string) er
 		return err
 	}
 
-	// 1. Fetch instance types matching filters
-	fmt.Println("Fetching instance types...")
-	instanceTypes, err := fetchInstanceTypes(ctx, client, *arch, *minVCPU, *minMem, *gpu)
-	if err != nil {
-		return err
+	// If specific instance types were passed as positional args, look those up directly
+	var instanceTypes []instanceTypeInfo
+	var err error
+	if fs.NArg() > 0 {
+		fmt.Println("Looking up instance types...")
+		var typeNames []types.InstanceType
+		for _, arg := range fs.Args() {
+			typeNames = append(typeNames, types.InstanceType(arg))
+		}
+		instanceTypes, err = describeSpecificTypes(ctx, client, typeNames)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Broad search by hardware specs
+		fmt.Println("Fetching instance types...")
+		instanceTypes, err = fetchInstanceTypes(ctx, client, *arch, *minVCPU, *minMem, *gpu)
+		if err != nil {
+			return err
+		}
 	}
 	if len(instanceTypes) == 0 {
 		fmt.Println("No instance types match the given filters.")
@@ -945,6 +960,26 @@ func fetchInstanceTypes(ctx context.Context, client *ec2.Client, arch string, mi
 		}
 	}
 	return results, nil
+}
+
+func describeSpecificTypes(ctx context.Context, client *ec2.Client, typeNames []types.InstanceType) ([]instanceTypeInfo, error) {
+	result, err := client.DescribeInstanceTypes(ctx, &ec2.DescribeInstanceTypesInput{
+		InstanceTypes: typeNames,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("describing instance types: %w", err)
+	}
+	var infos []instanceTypeInfo
+	for _, it := range result.InstanceTypes {
+		hasGPU := it.GpuInfo != nil && len(it.GpuInfo.Gpus) > 0
+		infos = append(infos, instanceTypeInfo{
+			Name:      string(it.InstanceType),
+			VCPUs:     *it.VCpuInfo.DefaultVCpus,
+			MemoryMiB: *it.MemoryInfo.SizeInMiB,
+			HasGPU:    hasGPU,
+		})
+	}
+	return infos, nil
 }
 
 func fetchSpotPrices(ctx context.Context, client *ec2.Client, instanceTypes []instanceTypeInfo, azFilter string) ([]spotSearchResult, error) {
