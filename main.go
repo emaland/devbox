@@ -106,6 +106,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "setup-dns":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: devbox setup-dns <instance-id>")
+			os.Exit(1)
+		}
+		if err := setupDNSOnBoot(ctx, client, os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -125,7 +134,8 @@ Commands:
   bids                              Show current spot request bids (max price)
   prices                            Show current spot market prices for our instance types
   rebid    <spot-req-id> <price>    Cancel and re-create a spot request with a new max price
-  ssh      <instance-id>            SSH into an instance`)
+  ssh      <instance-id>            SSH into an instance
+  setup-dns <instance-id>           Install a boot script that updates dev.frob.io on startup`)
 }
 
 func listInstances(ctx context.Context, client *ec2.Client) error {
@@ -526,6 +536,123 @@ func toLaunchSpec(from *types.LaunchSpecification) *types.RequestSpotLaunchSpeci
 		spec.EbsOptimized = from.EbsOptimized
 	}
 	return spec
+}
+
+func setupDNSOnBoot(ctx context.Context, ec2client *ec2.Client, instanceID string) error {
+	desc, err := ec2client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return fmt.Errorf("describing instance: %w", err)
+	}
+	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
+		return fmt.Errorf("instance %s not found", instanceID)
+	}
+	inst := desc.Reservations[0].Instances[0]
+	if inst.PublicIpAddress == nil {
+		return fmt.Errorf("instance %s has no public IP (is it running?)", instanceID)
+	}
+	ip := *inst.PublicIpAddress
+
+	// Find the hosted zone ID so we can bake it into the script
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("loading AWS config: %w", err)
+	}
+	r53client := route53.NewFromConfig(cfg)
+	zoneID, err := findHostedZone(ctx, r53client, "frob.io.")
+	if err != nil {
+		return err
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("getting home dir: %w", err)
+	}
+	keyPath := filepath.Join(home, ".ssh", "dev-boxes.pem")
+
+	// The script that runs on boot to update Route 53
+	bootScript := fmt.Sprintf(`#!/bin/bash
+set -e
+
+# Wait for network and metadata
+sleep 5
+
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+
+PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/public-ipv4)
+
+if [ -z "$PUBLIC_IP" ]; then
+  echo "No public IP found, skipping DNS update"
+  exit 0
+fi
+
+aws route53 change-resource-record-sets \
+  --hosted-zone-id %q \
+  --change-batch '{
+    "Comment": "devbox boot DNS update",
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "%s",
+        "Type": "A",
+        "TTL": 60,
+        "ResourceRecords": [{"Value": "'$PUBLIC_IP'"}]
+      }
+    }]
+  }'
+
+echo "Updated %s -> $PUBLIC_IP"
+`, zoneID, dnsName, dnsName)
+
+	serviceUnit := `[Unit]
+Description=Update dev.frob.io DNS on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/update-dns.sh
+
+[Install]
+WantedBy=multi-user.target
+`
+
+	// Commands to install the script and service on the remote box
+	installCmd := fmt.Sprintf(
+		`cat > /tmp/update-dns.sh << 'SCRIPT'
+%s
+SCRIPT
+sudo mv /tmp/update-dns.sh /opt/update-dns.sh
+sudo chmod +x /opt/update-dns.sh
+
+cat > /tmp/update-dns.service << 'UNIT'
+%s
+UNIT
+sudo mv /tmp/update-dns.service /etc/systemd/system/update-dns.service
+sudo systemctl daemon-reload
+sudo systemctl enable update-dns.service
+echo "DNS boot script installed and enabled"`,
+		bootScript, serviceUnit)
+
+	fmt.Printf("Installing DNS boot script on %s (%s)...\n", instanceID, ip)
+
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-i", keyPath,
+		"-o", "StrictHostKeyChecking=no",
+		"emaland@"+ip,
+		installCmd,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ssh command failed: %w", err)
+	}
+
+	fmt.Printf("Done. %s will update %s on every boot.\n", instanceID, dnsName)
+	return nil
 }
 
 func sshToInstance(ctx context.Context, client *ec2.Client, instanceID string) error {
