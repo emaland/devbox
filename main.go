@@ -24,6 +24,16 @@ import (
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 )
 
+// Poll intervals for volume/snapshot state transitions (overridden in tests).
+var (
+	volumePollInterval   = 5 * time.Second
+	snapshotPollInterval = 15 * time.Second
+)
+
+// baseEndpointOverride, when non-empty, is applied to the target-region client
+// created by volumeMove. Used by tests to point at LocalStack.
+var baseEndpointOverride string
+
 type devboxConfig struct {
 	DNSName          string `json:"dns_name"`
 	DNSZone          string `json:"dns_zone"`
@@ -1488,7 +1498,7 @@ func volumeCreate(ctx context.Context, dcfg devboxConfig, client *ec2.Client, ar
 	volID := *result.VolumeId
 	fmt.Printf("Created volume %s, waiting for available state...\n", volID)
 
-	if err := pollVolumeState(ctx, client, volID, "available", 5*time.Second, 2*time.Minute); err != nil {
+	if err := pollVolumeState(ctx, client, volID, "available", volumePollInterval, 2*time.Minute); err != nil {
 		return err
 	}
 	fmt.Printf("Volume %s is available.\n", volID)
@@ -1520,7 +1530,7 @@ func volumeAttach(ctx context.Context, client *ec2.Client, args []string) error 
 	}
 	fmt.Printf("Attaching %s to %s as %s, waiting...\n", volID, fs.Arg(1), *device)
 
-	if err := pollVolumeState(ctx, client, volID, "in-use", 5*time.Second, 2*time.Minute); err != nil {
+	if err := pollVolumeState(ctx, client, volID, "in-use", volumePollInterval, 2*time.Minute); err != nil {
 		return err
 	}
 	fmt.Println("Volume attached.")
@@ -1551,7 +1561,7 @@ func volumeDetach(ctx context.Context, client *ec2.Client, args []string) error 
 	}
 	fmt.Printf("Detaching %s, waiting...\n", volID)
 
-	if err := pollVolumeState(ctx, client, volID, "available", 5*time.Second, 2*time.Minute); err != nil {
+	if err := pollVolumeState(ctx, client, volID, "available", volumePollInterval, 2*time.Minute); err != nil {
 		return err
 	}
 	fmt.Println("Volume detached.")
@@ -1706,13 +1716,17 @@ func volumeMove(ctx context.Context, client *ec2.Client, awsCfg aws.Config, args
 	fmt.Printf("Source snapshot: %s\n", srcSnapID)
 
 	fmt.Println("Waiting for source snapshot to complete...")
-	if err := pollSnapshotState(ctx, client, srcSnapID, "completed", 15*time.Second, 30*time.Minute); err != nil {
+	if err := pollSnapshotState(ctx, client, srcSnapID, "completed", snapshotPollInterval, 30*time.Minute); err != nil {
 		return fmt.Errorf("waiting for source snapshot: %w", err)
 	}
 	fmt.Println("Source snapshot completed.")
 
 	// Step 2: Create client for target region
-	targetCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(targetRegion))
+	loadOpts := []func(*config.LoadOptions) error{config.WithRegion(targetRegion)}
+	if baseEndpointOverride != "" {
+		loadOpts = append(loadOpts, config.WithBaseEndpoint(baseEndpointOverride))
+	}
+	targetCfg, err := config.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return fmt.Errorf("loading config for region %s: %w", targetRegion, err)
 	}
@@ -1732,7 +1746,7 @@ func volumeMove(ctx context.Context, client *ec2.Client, awsCfg aws.Config, args
 	fmt.Printf("Target snapshot: %s\n", dstSnapID)
 
 	fmt.Println("Waiting for target snapshot to complete...")
-	if err := pollSnapshotState(ctx, targetClient, dstSnapID, "completed", 15*time.Second, 30*time.Minute); err != nil {
+	if err := pollSnapshotState(ctx, targetClient, dstSnapID, "completed", snapshotPollInterval, 30*time.Minute); err != nil {
 		return fmt.Errorf("waiting for target snapshot: %w", err)
 	}
 	fmt.Println("Target snapshot completed.")
@@ -1767,7 +1781,7 @@ func volumeMove(ctx context.Context, client *ec2.Client, awsCfg aws.Config, args
 	}
 	newVolID := *newVol.VolumeId
 
-	if err := pollVolumeState(ctx, targetClient, newVolID, "available", 5*time.Second, 2*time.Minute); err != nil {
+	if err := pollVolumeState(ctx, targetClient, newVolID, "available", volumePollInterval, 2*time.Minute); err != nil {
 		return fmt.Errorf("waiting for new volume: %w", err)
 	}
 

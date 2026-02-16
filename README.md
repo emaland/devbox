@@ -83,6 +83,50 @@ devbox expects these resources to already exist in your AWS account:
 - A Route 53 hosted zone matching `dns_zone`
 - Your AWS credentials must have permissions for EC2, Route 53, and IAM pass-role
 
+The included Terraform configuration (`terraform/`) can create all of these for you — see [Terraform setup](#terraform-setup) below.
+
+## Terraform setup
+
+The `terraform/` directory contains a Terraform configuration that provisions the AWS infrastructure devbox depends on. It reads from the same `~/.config/devbox/default.json` config file as the CLI, so resource names (key pairs, security groups, IAM profiles) stay in sync automatically.
+
+### What it creates
+
+| Resource | Description |
+|----------|-------------|
+| **EC2 key pair** | SSH key pair (name from `ssh_key_name` config) |
+| **Security group** | Allows inbound SSH (22/tcp) and Tailscale (41641/udp), all outbound. Attached to the default VPC |
+| **IAM role + instance profile** | Grants instances permission to update Route 53 records so DNS stays correct after spot interruptions |
+| **EBS volume** | 512 GiB gp3 persistent data volume (3000 IOPS, 250 MB/s). Has `prevent_destroy` enabled so it can't be accidentally deleted |
+
+It also includes a `configuration.nix` that defines the NixOS system configuration for launched instances: SSH with pubkey auth, Tailscale VPN, Docker, a boot-time DNS updater service, and a dev toolchain (git, tmux, emacs, python3, awscli, home-manager, etc.).
+
+### Variables
+
+You need to provide two variables. Copy the example file and fill in your values:
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+```
+
+| Variable | Description |
+|----------|-------------|
+| `dns_zone_id` | Your Route 53 hosted zone ID (e.g. `ZXXXXXXXXXXXXXXXXXX`) |
+| `ssh_public_key` | Your SSH public key (e.g. `ssh-ed25519 AAAA... you@host`) |
+
+Everything else is pulled from `~/.config/devbox/default.json`.
+
+### Usage
+
+```bash
+cd terraform
+terraform init
+terraform plan
+terraform apply
+```
+
+After `apply` completes, the CLI's prerequisites are in place and you can start using `devbox spawn`, `devbox list`, etc.
+
 ## Usage
 
 ```
