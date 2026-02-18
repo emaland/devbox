@@ -141,6 +141,24 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "reboot":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: devbox reboot <instance-id> [instance-id...]")
+			os.Exit(1)
+		}
+		if err := rebootInstances(ctx, client, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "restart":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: devbox restart <instance-id> [instance-id...]")
+			os.Exit(1)
+		}
+		if err := restartInstances(ctx, client, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "terminate":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: devbox terminate <instance-id> [instance-id...]")
@@ -247,6 +265,8 @@ Commands:
   list, ls                          List spot instances and their state
   start    <instance-id> [...]      Start stopped spot instances
   stop     <instance-id> [...]      Stop running spot instances
+  reboot   <instance-id> [...]      Reboot instances (in-place, same host)
+  restart  <instance-id> [...]      Stop then start instances (new host)
   terminate <instance-id> [...]     Terminate spot instances
   dns      <instance-id> [dns-name]  Point a DNS name at the instance's public IP
   bids                              Show current spot request bids (max price)
@@ -341,6 +361,52 @@ func startInstances(ctx context.Context, client *ec2.Client, ids []string) error
 			change.PreviousState.Name,
 			change.CurrentState.Name,
 		)
+	}
+	return nil
+}
+
+func rebootInstances(ctx context.Context, client *ec2.Client, ids []string) error {
+	_, err := client.RebootInstances(ctx, &ec2.RebootInstancesInput{
+		InstanceIds: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("rebooting instances: %w", err)
+	}
+	for _, id := range ids {
+		fmt.Printf("%s: rebooting\n", id)
+	}
+	return nil
+}
+
+func restartInstances(ctx context.Context, client *ec2.Client, ids []string) error {
+	fmt.Printf("Stopping %d instance(s)...\n", len(ids))
+	_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
+		InstanceIds: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("stopping instances: %w", err)
+	}
+	waiter := ec2.NewInstanceStoppedWaiter(client)
+	if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: ids,
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for instances to stop: %w", err)
+	}
+	fmt.Println("Stopped. Starting...")
+	result, err := client.StartInstances(ctx, &ec2.StartInstancesInput{
+		InstanceIds: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("starting instances: %w", err)
+	}
+	runWaiter := ec2.NewInstanceRunningWaiter(client)
+	if err := runWaiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: ids,
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for instances to start: %w", err)
+	}
+	for _, change := range result.StartingInstances {
+		fmt.Printf("%s: running\n", *change.InstanceId)
 	}
 	return nil
 }
@@ -830,7 +896,13 @@ func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, 
 		return nil
 	}
 
-	// Stop if running
+	// Spot instances don't support ModifyInstanceAttribute for type changes.
+	// We need to terminate and recreate with the new type.
+	if inst.SpotInstanceRequestId != nil {
+		return resizeSpotInstance(ctx, dcfg, client, r53client, inst, newType)
+	}
+
+	// On-demand path: stop → modify → start
 	if state == types.InstanceStateNameRunning || state == types.InstanceStateNamePending {
 		fmt.Printf("Stopping instance %s...\n", instanceID)
 		_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
@@ -850,7 +922,6 @@ func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, 
 		return fmt.Errorf("instance is in state %s, cannot resize", state)
 	}
 
-	// Modify instance type
 	fmt.Printf("Changing instance type from %s to %s...\n", currentType, newType)
 	_, err = client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
 		InstanceId: aws.String(instanceID),
@@ -862,7 +933,6 @@ func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, 
 		return fmt.Errorf("modifying instance type: %w", err)
 	}
 
-	// Start instance
 	fmt.Printf("Starting instance %s...\n", instanceID)
 	_, err = client.StartInstances(ctx, &ec2.StartInstancesInput{
 		InstanceIds: []string{instanceID},
@@ -878,18 +948,281 @@ func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, 
 	}
 	fmt.Println("Instance running.")
 
-	// Update DNS (non-fatal)
 	if err := updateDNS(ctx, dcfg, client, r53client, instanceID, dcfg.DNSName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
 		fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")
 	}
 
-	// Warn about persistent spot request
-	if inst.SpotInstanceRequestId != nil {
-		fmt.Printf("\nNote: The persistent spot request %s still references type %s.\n", *inst.SpotInstanceRequestId, currentType)
-		fmt.Println("Run 'devbox rebid' if you want to update the spot request too.")
+	return nil
+}
+
+// resizeSpotInstance replaces a spot instance with a new one of a different type.
+// Spot instances don't support ModifyInstanceAttribute for type changes, so we
+// terminate the old instance and launch a new one, preserving non-root EBS volumes.
+func resizeSpotInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, r53client *route53.Client, inst types.Instance, newType string) error {
+	instanceID := *inst.InstanceId
+	state := inst.State.Name
+	az := *inst.Placement.AvailabilityZone
+
+	fmt.Println("Spot instance detected — will replace instance with new type.")
+
+	// 1. Stop if running
+	if state == types.InstanceStateNameRunning || state == types.InstanceStateNamePending {
+		fmt.Printf("Stopping instance %s...\n", instanceID)
+		_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
+			InstanceIds: []string{instanceID},
+		})
+		if err != nil {
+			return fmt.Errorf("stopping instance: %w", err)
+		}
+		waiter := ec2.NewInstanceStoppedWaiter(client)
+		if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: []string{instanceID},
+		}, 5*time.Minute); err != nil {
+			return fmt.Errorf("waiting for instance to stop: %w", err)
+		}
+		fmt.Println("Instance stopped.")
+	} else if state != types.InstanceStateNameStopped {
+		return fmt.Errorf("instance is in state %s, cannot resize", state)
 	}
 
+	// 2. Gather instance config for recreation
+	imageID := ""
+	if inst.ImageId != nil {
+		imageID = *inst.ImageId
+	}
+	keyName := ""
+	if inst.KeyName != nil {
+		keyName = *inst.KeyName
+	}
+	subnetID := ""
+	if inst.SubnetId != nil {
+		subnetID = *inst.SubnetId
+	}
+	var sgIDs []string
+	for _, sg := range inst.SecurityGroups {
+		if sg.GroupId != nil {
+			sgIDs = append(sgIDs, *sg.GroupId)
+		}
+	}
+	var iamProfile *types.IamInstanceProfileSpecification
+	if inst.IamInstanceProfile != nil && inst.IamInstanceProfile.Arn != nil {
+		iamProfile = &types.IamInstanceProfileSpecification{
+			Arn: inst.IamInstanceProfile.Arn,
+		}
+	}
+
+	// Get user_data
+	userData, err := fetchUserData(ctx, client, instanceID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch user_data: %v\n", err)
+		userData = ""
+	}
+
+	// Get spot max price from the spot request
+	maxPrice := dcfg.DefaultMaxPrice
+	if inst.SpotInstanceRequestId != nil {
+		spotDesc, err := client.DescribeSpotInstanceRequests(ctx, &ec2.DescribeSpotInstanceRequestsInput{
+			SpotInstanceRequestIds: []string{*inst.SpotInstanceRequestId},
+		})
+		if err == nil && len(spotDesc.SpotInstanceRequests) > 0 {
+			if spotDesc.SpotInstanceRequests[0].SpotPrice != nil {
+				maxPrice = *spotDesc.SpotInstanceRequests[0].SpotPrice
+			}
+		}
+	}
+
+	// Collect tags (excluding aws: prefix)
+	var instanceTags []types.Tag
+	for _, t := range inst.Tags {
+		if t.Key != nil && !strings.HasPrefix(*t.Key, "aws:") {
+			instanceTags = append(instanceTags, t)
+		}
+	}
+
+	// 3. Identify non-root EBS volumes to reattach later
+	type volumeAttachment struct {
+		VolumeID string
+		Device   string
+	}
+	rootDevice := ""
+	if inst.RootDeviceName != nil {
+		rootDevice = *inst.RootDeviceName
+	}
+	var extraVolumes []volumeAttachment
+	for _, bdm := range inst.BlockDeviceMappings {
+		if bdm.DeviceName == nil || bdm.Ebs == nil || bdm.Ebs.VolumeId == nil {
+			continue
+		}
+		if *bdm.DeviceName == rootDevice {
+			continue
+		}
+		extraVolumes = append(extraVolumes, volumeAttachment{
+			VolumeID: *bdm.Ebs.VolumeId,
+			Device:   *bdm.DeviceName,
+		})
+	}
+
+	// 4. Launch new spot instance with new type.
+	//    We launch BEFORE touching the old instance so that if this fails
+	//    (e.g. InsufficientInstanceCapacity), the old instance, its spot
+	//    request, and its volumes are all still intact.
+	fmt.Printf("Launching new %s spot instance in %s...\n", newType, az)
+
+	runInput := &ec2.RunInstancesInput{
+		ImageId:          aws.String(imageID),
+		InstanceType:     types.InstanceType(newType),
+		MinCount:         aws.Int32(1),
+		MaxCount:         aws.Int32(1),
+		SecurityGroupIds: sgIDs,
+		InstanceMarketOptions: &types.InstanceMarketOptionsRequest{
+			MarketType: types.MarketTypeSpot,
+			SpotOptions: &types.SpotMarketOptions{
+				SpotInstanceType:             types.SpotInstanceTypePersistent,
+				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
+				MaxPrice:                     aws.String(maxPrice),
+			},
+		},
+	}
+	if keyName != "" {
+		runInput.KeyName = aws.String(keyName)
+	}
+	if subnetID != "" {
+		runInput.SubnetId = aws.String(subnetID)
+	}
+	if iamProfile != nil {
+		runInput.IamInstanceProfile = iamProfile
+	}
+	if userData != "" {
+		runInput.UserData = aws.String(userData)
+	}
+	if len(instanceTags) > 0 {
+		runInput.TagSpecifications = []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeInstance,
+				Tags:         instanceTags,
+			},
+		}
+	}
+
+	result, err := client.RunInstances(ctx, runInput)
+	if err != nil {
+		return fmt.Errorf("launching new instance (old instance %s is still intact): %w", instanceID, err)
+	}
+
+	newID := *result.Instances[0].InstanceId
+	fmt.Printf("New instance %s launched, waiting for running state...\n", newID)
+
+	runWaiter := ec2.NewInstanceRunningWaiter(client)
+	if err := runWaiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{newID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for new instance to start (old instance %s still intact): %w", instanceID, err)
+	}
+	fmt.Println("New instance running — spot capacity confirmed.")
+
+	// 5. Stop the new instance so we can attach volumes before it boots for real.
+	//    NixOS expects the data volume present at boot (mounts, home dirs, SSH keys).
+	fmt.Printf("Stopping new instance %s for volume swap...\n", newID)
+	_, err = client.StopInstances(ctx, &ec2.StopInstancesInput{
+		InstanceIds: []string{newID},
+	})
+	if err != nil {
+		return fmt.Errorf("stopping new instance: %w", err)
+	}
+	stopWaiter := ec2.NewInstanceStoppedWaiter(client)
+	if err := stopWaiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{newID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for new instance to stop: %w", err)
+	}
+
+	// 6. Cancel the old spot request now that replacement is confirmed.
+	if inst.SpotInstanceRequestId != nil {
+		fmt.Printf("Canceling old spot request %s...\n", *inst.SpotInstanceRequestId)
+		_, err := client.CancelSpotInstanceRequests(ctx, &ec2.CancelSpotInstanceRequestsInput{
+			SpotInstanceRequestIds: []string{*inst.SpotInstanceRequestId},
+		})
+		if err != nil {
+			return fmt.Errorf("canceling spot request: %w", err)
+		}
+	}
+
+	// 7. Detach volumes from old instance
+	for _, vol := range extraVolumes {
+		fmt.Printf("Detaching volume %s (%s) from old instance...\n", vol.VolumeID, vol.Device)
+		_, err := client.DetachVolume(ctx, &ec2.DetachVolumeInput{
+			VolumeId:   aws.String(vol.VolumeID),
+			InstanceId: aws.String(instanceID),
+		})
+		if err != nil {
+			return fmt.Errorf("detaching volume %s: %w", vol.VolumeID, err)
+		}
+	}
+	for _, vol := range extraVolumes {
+		if err := pollVolumeState(ctx, client, vol.VolumeID, "available", volumePollInterval, 2*time.Minute); err != nil {
+			return fmt.Errorf("waiting for volume %s to detach: %w", vol.VolumeID, err)
+		}
+	}
+
+	// 8. Terminate old instance
+	fmt.Printf("Terminating old instance %s...\n", instanceID)
+	_, err = client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return fmt.Errorf("terminating old instance: %w", err)
+	}
+	termWaiter := ec2.NewInstanceTerminatedWaiter(client)
+	if err := termWaiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for old instance to terminate: %w", err)
+	}
+
+	// 9. Attach volumes to new (stopped) instance, then start it.
+	//    This way NixOS boots with the data volume present from the start.
+	for _, vol := range extraVolumes {
+		fmt.Printf("Attaching volume %s as %s to new instance...\n", vol.VolumeID, vol.Device)
+		_, err := client.AttachVolume(ctx, &ec2.AttachVolumeInput{
+			VolumeId:   aws.String(vol.VolumeID),
+			InstanceId: aws.String(newID),
+			Device:     aws.String(vol.Device),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to attach volume %s: %v\n", vol.VolumeID, err)
+			continue
+		}
+	}
+	for _, vol := range extraVolumes {
+		if err := pollVolumeState(ctx, client, vol.VolumeID, "in-use", volumePollInterval, 2*time.Minute); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: timeout waiting for volume %s to attach: %v\n", vol.VolumeID, err)
+		}
+	}
+
+	// 10. Start new instance with volumes attached
+	fmt.Printf("Starting instance %s...\n", newID)
+	_, err = client.StartInstances(ctx, &ec2.StartInstancesInput{
+		InstanceIds: []string{newID},
+	})
+	if err != nil {
+		return fmt.Errorf("starting new instance: %w", err)
+	}
+	startWaiter := ec2.NewInstanceRunningWaiter(client)
+	if err := startWaiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{newID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for new instance to start: %w", err)
+	}
+	fmt.Println("Instance running.")
+
+	// 11. Update DNS
+	if err := updateDNS(ctx, dcfg, client, r53client, newID, dcfg.DNSName); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")
+	}
+
+	fmt.Printf("\nDone. Old instance %s terminated, new instance %s (%s) is running.\n", instanceID, newID, newType)
 	return nil
 }
 
@@ -956,8 +1289,16 @@ func recoverInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client,
 	if len(typeInfo.ProcessorInfo.SupportedArchitectures) > 0 {
 		arch = string(typeInfo.ProcessorInfo.SupportedArchitectures[0])
 	}
+	currentNetPerf := ""
+	if typeInfo.NetworkInfo != nil && typeInfo.NetworkInfo.NetworkPerformance != nil {
+		currentNetPerf = *typeInfo.NetworkInfo.NetworkPerformance
+	}
 
-	fmt.Printf("  Current specs: %d vCPU, %.0f GiB, %s\n", vcpus, float64(memMiB)/1024.0, arch)
+	netStr := ""
+	if currentNetPerf != "" {
+		netStr = ", " + currentNetPerf
+	}
+	fmt.Printf("  Current specs: %d vCPU, %.0f GiB, %s%s\n", vcpus, float64(memMiB)/1024.0, arch, netStr)
 
 	// 3. Determine search criteria
 	minVCPU := int(vcpus) / 2
@@ -1014,13 +1355,25 @@ func recoverInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client,
 	// 7. Sort by price ascending
 	sort.Slice(results, func(i, j int) bool { return results[i].Price < results[j].Price })
 
-	// 8. Display
-	fmt.Printf("Found %d instance types with spot capacity:\n\n", len(results))
+	// 8. Display (top 10 by default)
+	display := results
+	if len(display) > 10 {
+		display = display[:10]
+	}
+	fmt.Printf("Found %d instance types with spot capacity (showing top %d):\n\n", len(results), len(display))
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "TYPE\tVCPU\tMEMORY\tPRICE")
-	for _, r := range results {
-		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t$%.4f\n",
-			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, r.Price)
+	fmt.Fprintln(w, "TYPE\tVCPU\tMEMORY\tNETWORK\tPRICE\tGPU")
+	for _, r := range display {
+		netPerf := r.NetworkPerformance
+		if netPerf == "" {
+			netPerf = "-"
+		}
+		gpuStr := "-"
+		if r.GPU {
+			gpuStr = "yes"
+		}
+		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t$%.4f\t%s\n",
+			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, netPerf, r.Price, gpuStr)
 	}
 	w.Flush()
 
@@ -1038,12 +1391,13 @@ func recoverInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client,
 // --- search command ---
 
 type spotSearchResult struct {
-	InstanceType string
-	VCPUs        int32
-	MemoryMiB    int64
-	AZ           string
-	Price        float64
-	GPU          bool
+	InstanceType       string
+	VCPUs              int32
+	MemoryMiB          int64
+	AZ                 string
+	Price              float64
+	GPU                bool
+	NetworkPerformance string
 }
 
 func searchSpotPrices(ctx context.Context, client *ec2.Client, args []string) error {
@@ -1126,24 +1480,29 @@ func searchSpotPrices(ctx context.Context, client *ec2.Client, args []string) er
 
 	// 6. Display
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "INSTANCE TYPE\tVCPU\tMEMORY\tAZ\tPRICE\tGPU")
+	fmt.Fprintln(w, "INSTANCE TYPE\tVCPU\tMEMORY\tNETWORK\tAZ\tPRICE\tGPU")
 	for _, r := range results {
 		gpuStr := "-"
 		if r.GPU {
 			gpuStr = "yes"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t$%.4f\t%s\n",
-			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, r.AZ, r.Price, gpuStr)
+		netPerf := r.NetworkPerformance
+		if netPerf == "" {
+			netPerf = "-"
+		}
+		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t%s\t$%.4f\t%s\n",
+			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, netPerf, r.AZ, r.Price, gpuStr)
 	}
 	w.Flush()
 	return nil
 }
 
 type instanceTypeInfo struct {
-	Name      string
-	VCPUs     int32
-	MemoryMiB int64
-	HasGPU    bool
+	Name               string
+	VCPUs              int32
+	MemoryMiB          int64
+	HasGPU             bool
+	NetworkPerformance string
 }
 
 func fetchInstanceTypes(ctx context.Context, client *ec2.Client, arch string, minVCPU int, minMem float64, requireGPU bool) ([]instanceTypeInfo, error) {
@@ -1179,11 +1538,16 @@ func fetchInstanceTypes(ctx context.Context, client *ec2.Client, arch string, mi
 				continue
 			}
 
+			netPerf := ""
+			if it.NetworkInfo != nil && it.NetworkInfo.NetworkPerformance != nil {
+				netPerf = *it.NetworkInfo.NetworkPerformance
+			}
 			results = append(results, instanceTypeInfo{
-				Name:      string(it.InstanceType),
-				VCPUs:     vcpus,
-				MemoryMiB: memMiB,
-				HasGPU:    hasGPU,
+				Name:               string(it.InstanceType),
+				VCPUs:              vcpus,
+				MemoryMiB:          memMiB,
+				HasGPU:             hasGPU,
+				NetworkPerformance: netPerf,
 			})
 		}
 	}
@@ -1200,11 +1564,16 @@ func describeSpecificTypes(ctx context.Context, client *ec2.Client, typeNames []
 	var infos []instanceTypeInfo
 	for _, it := range result.InstanceTypes {
 		hasGPU := it.GpuInfo != nil && len(it.GpuInfo.Gpus) > 0
+		netPerf := ""
+		if it.NetworkInfo != nil && it.NetworkInfo.NetworkPerformance != nil {
+			netPerf = *it.NetworkInfo.NetworkPerformance
+		}
 		infos = append(infos, instanceTypeInfo{
-			Name:      string(it.InstanceType),
-			VCPUs:     *it.VCpuInfo.DefaultVCpus,
-			MemoryMiB: *it.MemoryInfo.SizeInMiB,
-			HasGPU:    hasGPU,
+			Name:               string(it.InstanceType),
+			VCPUs:              *it.VCpuInfo.DefaultVCpus,
+			MemoryMiB:          *it.MemoryInfo.SizeInMiB,
+			HasGPU:             hasGPU,
+			NetworkPerformance: netPerf,
 		})
 	}
 	return infos, nil
@@ -1265,12 +1634,13 @@ func fetchSpotPrices(ctx context.Context, client *ec2.Client, instanceTypes []in
 		info := infoMap[k.itype]
 		price, _ := strconv.ParseFloat(*sp.SpotPrice, 64)
 		results = append(results, spotSearchResult{
-			InstanceType: k.itype,
-			VCPUs:        info.VCPUs,
-			MemoryMiB:    info.MemoryMiB,
-			AZ:           k.az,
-			Price:        price,
-			GPU:          info.HasGPU,
+			InstanceType:       k.itype,
+			VCPUs:              info.VCPUs,
+			MemoryMiB:          info.MemoryMiB,
+			AZ:                 k.az,
+			Price:              price,
+			GPU:                info.HasGPU,
+			NetworkPerformance: info.NetworkPerformance,
 		})
 	}
 	return results, nil
