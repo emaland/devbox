@@ -348,11 +348,22 @@ func stopInstances(ctx context.Context, client *ec2.Client, ids []string) error 
 }
 
 func startInstances(ctx context.Context, client *ec2.Client, ids []string) error {
-	input := &ec2.StartInstancesInput{
-		InstanceIds: ids,
-	}
-	result, err := client.StartInstances(ctx, input)
-	if err != nil {
+	// Persistent spot requests can lag behind instance state after a stop.
+	// Retry if the spot request isn't ready yet.
+	var result *ec2.StartInstancesOutput
+	var err error
+	for attempts := 0; attempts < 6; attempts++ {
+		result, err = client.StartInstances(ctx, &ec2.StartInstancesInput{
+			InstanceIds: ids,
+		})
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "IncorrectSpotRequestState") && attempts < 5 {
+			fmt.Println("Spot request not ready yet, waiting...")
+			time.Sleep(10 * time.Second)
+			continue
+		}
 		return fmt.Errorf("starting instances: %w", err)
 	}
 	for _, change := range result.StartingInstances {
@@ -393,10 +404,20 @@ func restartInstances(ctx context.Context, client *ec2.Client, ids []string) err
 		return fmt.Errorf("waiting for instances to stop: %w", err)
 	}
 	fmt.Println("Stopped. Starting...")
-	result, err := client.StartInstances(ctx, &ec2.StartInstancesInput{
-		InstanceIds: ids,
-	})
-	if err != nil {
+	// Persistent spot requests lag behind instance state — retry if not ready.
+	var result *ec2.StartInstancesOutput
+	for attempts := 0; attempts < 6; attempts++ {
+		result, err = client.StartInstances(ctx, &ec2.StartInstancesInput{
+			InstanceIds: ids,
+		})
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "IncorrectSpotRequestState") && attempts < 5 {
+			fmt.Println("Spot request not ready yet, waiting...")
+			time.Sleep(10 * time.Second)
+			continue
+		}
 		return fmt.Errorf("starting instances: %w", err)
 	}
 	runWaiter := ec2.NewInstanceRunningWaiter(client)
@@ -1012,11 +1033,15 @@ func resizeSpotInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Clie
 		}
 	}
 
-	// Get user_data
+	// Get user_data and patch it to ensure the amazon-image.nix import is present.
+	// Stale user_data may be missing it, which prevents nixos-rebuild on first boot.
 	userData, err := fetchUserData(ctx, client, instanceID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not fetch user_data: %v\n", err)
 		userData = ""
+	}
+	if userData != "" {
+		userData = patchNixOSUserData(userData, nameTag(inst.Tags))
 	}
 
 	// Get spot max price from the spot request
@@ -1083,6 +1108,15 @@ func resizeSpotInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Clie
 				MaxPrice:                     aws.String(maxPrice),
 			},
 		},
+		BlockDeviceMappings: []types.BlockDeviceMapping{
+			{
+				DeviceName: aws.String("/dev/xvda"),
+				Ebs: &types.EbsBlockDevice{
+					VolumeSize: aws.Int32(75),
+					VolumeType: types.VolumeTypeGp3,
+				},
+			},
+		},
 	}
 	if keyName != "" {
 		runInput.KeyName = aws.String(keyName)
@@ -1135,6 +1169,25 @@ func resizeSpotInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Clie
 		InstanceIds: []string{newID},
 	}, 5*time.Minute); err != nil {
 		return fmt.Errorf("waiting for new instance to stop: %w", err)
+	}
+
+	// 5b. Update the instance's user_data so amazon-init applies the
+	//     patched config (with imports, hostname, etc.) on every future boot.
+	//     userData is base64-encoded; BlobAttributeValue.Value wants raw bytes
+	//     (the SDK handles base64 encoding), so we decode first.
+	if userData != "" {
+		rawUserData, decErr := base64.StdEncoding.DecodeString(userData)
+		if decErr == nil {
+			_, err := client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+				InstanceId: aws.String(newID),
+				UserData: &types.BlobAttributeValue{
+					Value: rawUserData,
+				},
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not update user_data on new instance: %v\n", err)
+			}
+		}
 	}
 
 	// 6. Cancel the old spot request now that replacement is confirmed.
@@ -1224,6 +1277,54 @@ func resizeSpotInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Clie
 
 	fmt.Printf("\nDone. Old instance %s terminated, new instance %s (%s) is running.\n", instanceID, newID, newType)
 	return nil
+}
+
+// patchNixOSUserData decodes base64 user_data, ensures the NixOS configuration
+// has the amazon-image.nix import, modulesPath arg, and hostname, then re-encodes.
+// This fixes stale user_data that would cause nixos-rebuild to fail on first boot.
+func patchNixOSUserData(b64data, spawnName string) string {
+	decoded, err := base64.StdEncoding.DecodeString(b64data)
+	if err != nil {
+		return b64data
+	}
+	content := string(decoded)
+
+	// Only patch if it looks like a NixOS config
+	if !strings.Contains(content, "config, pkgs") {
+		return b64data
+	}
+
+	// Ensure modulesPath is in the function args
+	if !strings.Contains(content, "modulesPath") {
+		content = strings.Replace(content,
+			"{ config, pkgs, lib, ... }:",
+			"{ config, pkgs, lib, modulesPath, ... }:", 1)
+	}
+
+	// Ensure amazon-image.nix import exists
+	if !strings.Contains(content, "amazon-image.nix") {
+		content = strings.Replace(content,
+			"\n{\n",
+			"\n{\n  imports = [ \"${modulesPath}/virtualisation/amazon-image.nix\" ];\n", 1)
+	}
+
+	// Ensure networking.hostName is set
+	if !strings.Contains(content, "networking.hostName") {
+		hostname := "dev-workstation"
+		if spawnName != "" {
+			hostname = spawnName
+		}
+		// Insert after the imports line, or after the opening brace
+		if idx := strings.Index(content, "imports = ["); idx != -1 {
+			// Find end of imports line
+			if nl := strings.Index(content[idx:], "\n"); nl != -1 {
+				pos := idx + nl + 1
+				content = content[:pos] + fmt.Sprintf("  networking.hostName = %q;\n", hostname) + content[pos:]
+			}
+		}
+	}
+
+	return base64.StdEncoding.EncodeToString([]byte(content))
 }
 
 // --- recover command ---
