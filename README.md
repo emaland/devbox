@@ -145,6 +145,12 @@ devbox start i-abc123
 devbox stop i-abc123
 devbox terminate i-abc123
 
+# Reboot in-place (same host, no IP change)
+devbox reboot i-abc123
+
+# Full restart — stop then start (may get a new host/IP)
+devbox restart i-abc123
+
 # SSH into an instance
 devbox ssh i-abc123
 ```
@@ -224,7 +230,7 @@ Change an instance's type without leaving the terminal. devbox stops the instanc
 devbox resize i-abc123 m6i.8xlarge
 ```
 
-If the instance is already stopped, it skips the stop step. After restarting, it updates DNS and warns you if the persistent spot request still references the old type.
+For on-demand instances, this does a simple stop → modify type → start. For spot instances (which don't support in-place type changes), it launches a new instance with the new type first, confirms it's running, then stops it, moves non-root EBS volumes from the old instance, terminates the old instance, and starts the new one with volumes attached. The new instance is only created after confirming spot capacity — if the launch fails, the old instance and its volumes remain untouched.
 
 ### Recover a stuck instance
 
@@ -340,11 +346,11 @@ Volumes can be specified by ID (`vol-xxx`) or by Name tag.
 
 devbox talks directly to the AWS API using the Go SDK v2. There's no local state — it discovers everything from AWS on each run:
 
-- **Instance management** uses the EC2 `DescribeInstances`, `StartInstances`, `StopInstances`, and `TerminateInstances` APIs.
+- **Instance management** uses the EC2 `DescribeInstances`, `StartInstances`, `StopInstances`, `RebootInstances`, and `TerminateInstances` APIs. `restart` chains stop + wait + start for a full host migration.
 - **DNS** uses Route 53 `ChangeResourceRecordSets` to upsert an A record.
 - **Search** paginates `DescribeInstanceTypes` (filtered to spot-capable, current-gen) then fetches `DescribeSpotPriceHistory` and joins the results.
 - **Spawn** discovers the AMI, security group, and subnet from AWS, fetches `user_data` from the source instance, and calls `RunInstances` with persistent spot + stop-on-interruption.
-- **Resize** uses `ModifyInstanceAttribute` between a stop/start cycle.
+- **Resize** for on-demand instances uses `ModifyInstanceAttribute` between a stop/start cycle. For spot instances, it launches a replacement instance with the new type, confirms capacity, then swaps non-root EBS volumes and terminates the old instance.
 - **Recover** combines `DescribeInstanceTypes` (for current specs/architecture), `fetchInstanceTypes` (for candidates), and `DescribeSpotPriceHistory` (filtered to the instance's AZ) to find alternatives with capacity, then optionally calls resize.
 - **Volume** commands wrap the EC2 volume and snapshot APIs. `volume move` chains `CreateSnapshot` → `CopySnapshot` (cross-region) → `CreateVolume` to relocate a volume while preserving its type, IOPS, throughput, and tags.
 
