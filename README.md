@@ -226,6 +226,35 @@ devbox resize i-abc123 m6i.8xlarge
 
 If the instance is already stopped, it skips the stop step. After restarting, it updates DNS and warns you if the persistent spot request still references the old type.
 
+### Recover a stuck instance
+
+When a spot instance can't start due to `InsufficientInstanceCapacity`, the `recover` command finds alternative instance types with available spot capacity in the same AZ (since EBS volumes are AZ-locked):
+
+```bash
+# Show alternative instance types with spot capacity
+devbox recover i-abc123
+
+# Auto-pick the cheapest alternative and resize
+devbox recover --yes i-abc123
+
+# Override minimum specs
+devbox recover --min-vcpu 16 --min-mem 64 i-abc123
+
+# Set a price cap
+devbox recover --max-price 0.50 i-abc123
+```
+
+The command describes the instance, determines its specs and architecture, searches for compatible types (>=50% of current vCPUs and memory, same architecture), fetches spot prices filtered to the instance's AZ, and displays candidates sorted by price. With `--yes`, it automatically resizes to the cheapest option.
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--min-vcpu` | 50% of current | Minimum vCPUs |
+| `--min-mem` | 50% of current | Minimum memory (GiB) |
+| `--max-price` | from config | Max spot price $/hr (0 = no limit) |
+| `--yes` | false | Auto-pick cheapest candidate and resize |
+
 ### Spawn a clone
 
 Spin up a new spot instance with the same NixOS config as your primary box. The new instance gets its own root volume but does NOT attach the primary's data EBS volume:
@@ -256,6 +285,57 @@ devbox spawn --name my-test-box --max-price 0.50
 
 When `--from` is omitted, devbox auto-detects the source: if exactly one running/stopped spot instance exists, it uses that. If there are multiple, it asks you to specify.
 
+### Volume management
+
+Manage EBS volumes — list, create, attach/detach, snapshot, and move across regions:
+
+```bash
+# List all EBS volumes
+devbox volume ls
+
+# Create a new volume
+devbox volume create
+devbox volume create --size 1024 --type gp3 --iops 6000 --az us-east-2b --name my-data
+
+# Attach / detach
+devbox volume attach vol-abc123 i-def456
+devbox volume attach --device /dev/xvdg vol-abc123 i-def456
+devbox volume detach vol-abc123
+devbox volume detach --force vol-abc123
+
+# Snapshots
+devbox volume snapshot vol-abc123
+devbox volume snapshot --name "before-upgrade" vol-abc123
+devbox volume snapshots
+
+# Delete a volume (must be detached)
+devbox volume destroy vol-abc123
+
+# Move a volume to another region (snapshot → copy → create)
+devbox volume move vol-abc123 us-west-2
+devbox volume move --az us-west-2b --cleanup vol-abc123 us-west-2
+```
+
+Volumes can be specified by ID (`vol-xxx`) or by Name tag.
+
+**`volume create` flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--size` | 512 | Volume size in GiB |
+| `--type` | gp3 | Volume type |
+| `--iops` | 3000 | IOPS |
+| `--throughput` | 250 | Throughput MB/s |
+| `--az` | from config | Availability zone |
+| `--name` | dev-data-volume | Name tag |
+
+**`volume move` flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--az` | `<region>a` | Target AZ |
+| `--cleanup` | false | Delete intermediate snapshots after move |
+
 ## How it works
 
 devbox talks directly to the AWS API using the Go SDK v2. There's no local state — it discovers everything from AWS on each run:
@@ -265,6 +345,8 @@ devbox talks directly to the AWS API using the Go SDK v2. There's no local state
 - **Search** paginates `DescribeInstanceTypes` (filtered to spot-capable, current-gen) then fetches `DescribeSpotPriceHistory` and joins the results.
 - **Spawn** discovers the AMI, security group, and subnet from AWS, fetches `user_data` from the source instance, and calls `RunInstances` with persistent spot + stop-on-interruption.
 - **Resize** uses `ModifyInstanceAttribute` between a stop/start cycle.
+- **Recover** combines `DescribeInstanceTypes` (for current specs/architecture), `fetchInstanceTypes` (for candidates), and `DescribeSpotPriceHistory` (filtered to the instance's AZ) to find alternatives with capacity, then optionally calls resize.
+- **Volume** commands wrap the EC2 volume and snapshot APIs. `volume move` chains `CreateSnapshot` → `CopySnapshot` (cross-region) → `CreateVolume` to relocate a volume while preserving its type, IOPS, throughput, and tags.
 
 ## License
 

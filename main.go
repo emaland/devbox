@@ -222,6 +222,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "recover":
+		r53client := route53.NewFromConfig(cfg)
+		if err := recoverInstance(ctx, dcfg, client, r53client, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "volume":
 		if err := volumeCommand(ctx, dcfg, client, cfg, os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -250,6 +256,7 @@ Commands:
   setup-dns <instance-id>           Install a boot script that updates dev.frob.io on startup
   search   [flags]                  Browse spot prices by hardware specs
   resize   <instance-id> <type>     Stop instance, change type, restart, update DNS
+  recover  <instance-id> [flags]   Find alternative instance types with spot capacity in the same AZ
   spawn    [flags]                  Spin up a new spot instance cloned from the primary
   volume   <subcommand>             Manage EBS volumes (ls, create, attach, detach, snapshot, snapshots, destroy, move)`)
 }
@@ -884,6 +891,148 @@ func resizeInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, 
 	}
 
 	return nil
+}
+
+// --- recover command ---
+
+func recoverInstance(ctx context.Context, dcfg devboxConfig, client *ec2.Client, r53client *route53.Client, args []string) error {
+	fs := flag.NewFlagSet("recover", flag.ExitOnError)
+	minVCPUFlag := fs.Int("min-vcpu", 0, "Minimum vCPUs (default: 50% of current)")
+	minMemFlag := fs.Float64("min-mem", 0, "Minimum memory in GiB (default: 50% of current)")
+	maxPrice := fs.Float64("max-price", 0, "Max spot price $/hr (0 = use config default)")
+	autoYes := fs.Bool("yes", false, "Auto-pick cheapest candidate and resize")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: devbox recover [--min-vcpu N] [--min-mem N] [--max-price N] [--yes] <instance-id>")
+	}
+	instanceID := fs.Arg(0)
+
+	// 1. Describe the instance
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return fmt.Errorf("describing instance: %w", err)
+	}
+	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
+		return fmt.Errorf("instance %s not found", instanceID)
+	}
+	inst := desc.Reservations[0].Instances[0]
+	currentType := string(inst.InstanceType)
+	az := *inst.Placement.AvailabilityZone
+	state := string(inst.State.Name)
+
+	if inst.State.Name == types.InstanceStateNameTerminated {
+		return fmt.Errorf("instance %s is terminated", instanceID)
+	}
+
+	fmt.Printf("Instance %s: %s (%s) in %s\n", instanceID, currentType, state, az)
+
+	// Show attached volumes
+	for _, bdm := range inst.BlockDeviceMappings {
+		if bdm.Ebs != nil && bdm.Ebs.VolumeId != nil {
+			fmt.Printf("  Volume: %s (%s)\n", *bdm.Ebs.VolumeId, *bdm.DeviceName)
+		}
+	}
+
+	// 2. Get current instance type specs and architecture
+	typeDesc, err := client.DescribeInstanceTypes(ctx, &ec2.DescribeInstanceTypesInput{
+		InstanceTypes: []types.InstanceType{types.InstanceType(currentType)},
+	})
+	if err != nil {
+		return fmt.Errorf("describing instance type %s: %w", currentType, err)
+	}
+	if len(typeDesc.InstanceTypes) == 0 {
+		return fmt.Errorf("instance type %s not found", currentType)
+	}
+	typeInfo := typeDesc.InstanceTypes[0]
+	vcpus := *typeInfo.VCpuInfo.DefaultVCpus
+	memMiB := *typeInfo.MemoryInfo.SizeInMiB
+	hasGPU := typeInfo.GpuInfo != nil && len(typeInfo.GpuInfo.Gpus) > 0
+
+	arch := "x86_64"
+	if len(typeInfo.ProcessorInfo.SupportedArchitectures) > 0 {
+		arch = string(typeInfo.ProcessorInfo.SupportedArchitectures[0])
+	}
+
+	fmt.Printf("  Current specs: %d vCPU, %.0f GiB, %s\n", vcpus, float64(memMiB)/1024.0, arch)
+
+	// 3. Determine search criteria
+	minVCPU := int(vcpus) / 2
+	if *minVCPUFlag > 0 {
+		minVCPU = *minVCPUFlag
+	}
+	minMem := float64(memMiB) / 1024.0 / 2.0
+	if *minMemFlag > 0 {
+		minMem = *minMemFlag
+	}
+
+	defaultMaxPrice := 0.0
+	if *maxPrice > 0 {
+		defaultMaxPrice = *maxPrice
+	} else if dcfg.DefaultMaxPrice != "" {
+		defaultMaxPrice, _ = strconv.ParseFloat(dcfg.DefaultMaxPrice, 64)
+	}
+
+	fmt.Printf("\nSearching for alternatives (>=%d vCPU, >=%.0f GiB, %s) in %s...\n",
+		minVCPU, minMem, arch, az)
+
+	// 4. Find candidate instance types
+	candidates, err := fetchInstanceTypes(ctx, client, arch, minVCPU, minMem, hasGPU)
+	if err != nil {
+		return err
+	}
+	if len(candidates) == 0 {
+		fmt.Println("No instance types match the given specs.")
+		return nil
+	}
+
+	// 5. Fetch spot prices filtered to the instance's AZ
+	results, err := fetchSpotPrices(ctx, client, candidates, az)
+	if err != nil {
+		return err
+	}
+
+	// 6. Apply max price filter
+	if defaultMaxPrice > 0 {
+		var filtered []spotSearchResult
+		for _, r := range results {
+			if r.Price <= defaultMaxPrice {
+				filtered = append(filtered, r)
+			}
+		}
+		results = filtered
+	}
+
+	if len(results) == 0 {
+		fmt.Println("No spot capacity found matching filters.")
+		return nil
+	}
+
+	// 7. Sort by price ascending
+	sort.Slice(results, func(i, j int) bool { return results[i].Price < results[j].Price })
+
+	// 8. Display
+	fmt.Printf("Found %d instance types with spot capacity:\n\n", len(results))
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "TYPE\tVCPU\tMEMORY\tPRICE")
+	for _, r := range results {
+		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t$%.4f\n",
+			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, r.Price)
+	}
+	w.Flush()
+
+	if !*autoYes {
+		fmt.Printf("\nTo resize: devbox resize %s %s\n", instanceID, results[0].InstanceType)
+		return nil
+	}
+
+	// 9. Auto-resize to cheapest
+	cheapest := results[0].InstanceType
+	fmt.Printf("\nAuto-resizing to %s (cheapest at $%.4f)...\n", cheapest, results[0].Price)
+	return resizeInstance(ctx, dcfg, client, r53client, instanceID, cheapest)
 }
 
 // --- search command ---
