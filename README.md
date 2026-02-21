@@ -25,7 +25,7 @@ go build -o devbox .
 mv devbox ~/bin/        # or /usr/local/bin, etc.
 ```
 
-Requires Go 1.21+. The binary is fully static with no runtime dependencies beyond AWS credentials.
+Requires Go 1.21+. No runtime dependencies beyond AWS credentials.
 
 ## Configuration
 
@@ -127,11 +127,41 @@ terraform apply
 
 After `apply` completes, the CLI's prerequisites are in place and you can start using `devbox spawn`, `devbox list`, etc.
 
+## Project structure
+
+```
+main.go                          Entry point — calls cmd.Execute()
+cmd/
+  root.go                        Root cobra command, AWS/config init
+  list.go                        list/ls command
+  stop.go, start.go              Instance start/stop
+  reboot.go, restart.go          Reboot (in-place) and restart (stop+start)
+  terminate.go                   Terminate instances
+  dns.go                         DNS A record management
+  bids.go, prices.go             Spot request/price queries
+  rebid.go                       Cancel and re-create spot requests
+  ssh.go                         SSH into instances
+  setup_dns.go                   Install DNS-on-boot systemd service
+  search.go                      Browse spot prices by hardware specs
+  resize.go                      Stop, change type, restart, update DNS
+  recover.go                     Find alternative types with spot capacity
+  spawn.go                       Clone a new spot instance
+  volume.go                      EBS volume subcommands (ls, create, attach, etc.)
+internal/
+  config/config.go               Config loading and defaults
+  awsutil/
+    types.go                     Shared types (InstanceTypeInfo, SpotSearchResult)
+    helpers.go                   NameTag, FindHostedZone, FetchUserData, PollVolumeState
+    search.go                    FetchInstanceTypes, DescribeSpecificTypes, FetchSpotPrices
+```
+
 ## Usage
 
 ```
-devbox <command> [args]
+devbox <command> [flags]
 ```
+
+Use `devbox --help` for a full list of commands, or `devbox <command> --help` for flags on any command.
 
 ### Instance management
 

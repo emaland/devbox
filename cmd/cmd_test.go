@@ -1,18 +1,16 @@
-package main
+package cmd
 
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -21,6 +19,9 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/localstack"
+
+	"github.com/emaland/devbox/internal/awsutil"
+	"github.com/emaland/devbox/internal/config"
 )
 
 // Shared test state — initialised once by TestMain.
@@ -103,10 +104,10 @@ func runWithLocalStack(m *testing.M) int {
 	endpoint := fmt.Sprintf("http://%s:%s", host, mappedPort.Port())
 	testEndpoint = endpoint
 
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-1"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
-		config.WithBaseEndpoint(endpoint),
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "test")),
+		awsconfig.WithBaseEndpoint(endpoint),
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build AWS config: %v\n", err)
@@ -116,12 +117,16 @@ func runWithLocalStack(m *testing.M) int {
 	testEC2Client = ec2.NewFromConfig(cfg)
 	testR53Client = route53.NewFromConfig(cfg)
 
+	// Inject test clients into the package-level vars so commands use them.
+	awsCfg = cfg
+	ec2Client = testEC2Client
+
 	// Speed up polling for tests.
-	volumePollInterval = 100 * time.Millisecond
-	snapshotPollInterval = 100 * time.Millisecond
+	VolumePollInterval = 100 * time.Millisecond
+	SnapshotPollInterval = 100 * time.Millisecond
 
 	// Let volumeMove's second-region client also hit LocalStack.
-	baseEndpointOverride = endpoint
+	BaseEndpointOverride = endpoint
 
 	return m.Run()
 }
@@ -150,8 +155,8 @@ func createTestInstance(t *testing.T, ctx context.Context) string {
 	return *result.Instances[0].InstanceId
 }
 
-func testDevboxConfig() devboxConfig {
-	return devboxConfig{
+func testDevboxConfig() config.DevboxConfig {
+	return config.DevboxConfig{
 		DNSName:          "test.example.com",
 		DNSZone:          "example.com.",
 		SSHKeyName:       "test-key",
@@ -180,73 +185,7 @@ func createTestHostedZone(t *testing.T, ctx context.Context, domain string) stri
 	return *result.HostedZone.Id
 }
 
-// ==================== Utility tests (no AWS) ====================
-
-func TestLoadConfig(t *testing.T) {
-	dir := t.TempDir()
-	cfgDir := filepath.Join(dir, ".config", "devbox")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	data := `{"dns_name":"custom.example.com","default_type":"c5.xlarge"}`
-	if err := os.WriteFile(filepath.Join(cfgDir, "default.json"), []byte(data), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Override HOME so loadConfig reads our temp file.
-	t.Setenv("HOME", dir)
-
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if cfg.DNSName != "custom.example.com" {
-		t.Errorf("DNSName = %q, want %q", cfg.DNSName, "custom.example.com")
-	}
-	if cfg.DefaultType != "c5.xlarge" {
-		t.Errorf("DefaultType = %q, want %q", cfg.DefaultType, "c5.xlarge")
-	}
-	// Non-overridden fields keep defaults.
-	if cfg.SSHUser != "emaland" {
-		t.Errorf("SSHUser = %q, want default %q", cfg.SSHUser, "emaland")
-	}
-}
-
-func TestLoadConfigDefaults(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if cfg.DNSName != "dev.frob.io" {
-		t.Errorf("default DNSName = %q, want %q", cfg.DNSName, "dev.frob.io")
-	}
-}
-
-func TestResolveSSHKeyPath(t *testing.T) {
-	cfg := devboxConfig{SSHKeyPath: "~/.ssh/test.pem"}
-	got := cfg.resolveSSHKeyPath()
-	if strings.HasPrefix(got, "~") {
-		t.Errorf("resolveSSHKeyPath still starts with ~: %s", got)
-	}
-	home, _ := os.UserHomeDir()
-	want := filepath.Join(home, ".ssh", "test.pem")
-	if got != want {
-		t.Errorf("resolveSSHKeyPath = %q, want %q", got, want)
-	}
-}
-
-func TestNameTag(t *testing.T) {
-	tags := []types.Tag{
-		{Key: aws.String("Env"), Value: aws.String("prod")},
-		{Key: aws.String("Name"), Value: aws.String("my-box")},
-	}
-	if got := nameTag(tags); got != "my-box" {
-		t.Errorf("nameTag = %q, want %q", got, "my-box")
-	}
-	if got := nameTag(nil); got != "-" {
-		t.Errorf("nameTag(nil) = %q, want %q", got, "-")
-	}
-}
+// ==================== Unit tests (no AWS) ====================
 
 func TestToLaunchSpecNil(t *testing.T) {
 	if got := toLaunchSpec(nil); got != nil {
@@ -369,19 +308,19 @@ func TestFindHostedZone(t *testing.T) {
 	domain := "findzone.test."
 	expectedID := createTestHostedZone(t, ctx, domain)
 
-	gotID, err := findHostedZone(ctx, testR53Client, domain)
+	gotID, err := awsutil.FindHostedZone(ctx, testR53Client, domain)
 	if err != nil {
-		t.Fatalf("findHostedZone: %v", err)
+		t.Fatalf("FindHostedZone: %v", err)
 	}
 	if gotID != expectedID {
-		t.Errorf("findHostedZone = %q, want %q", gotID, expectedID)
+		t.Errorf("FindHostedZone = %q, want %q", gotID, expectedID)
 	}
 }
 
 func TestFindHostedZoneNotFound(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
-	_, err := findHostedZone(ctx, testR53Client, "nonexistent.zone.")
+	_, err := awsutil.FindHostedZone(ctx, testR53Client, "nonexistent.zone.")
 	if err == nil {
 		t.Fatal("expected error for nonexistent zone")
 	}
@@ -394,11 +333,11 @@ func TestUpdateDNS(t *testing.T) {
 	zoneID := createTestHostedZone(t, ctx, domain)
 	id := createTestInstance(t, ctx)
 
-	dcfg := testDevboxConfig()
-	dcfg.DNSZone = domain
-	dcfg.DNSName = "dev." + strings.TrimSuffix(domain, ".")
+	cfg := testDevboxConfig()
+	cfg.DNSZone = domain
+	cfg.DNSName = "dev." + strings.TrimSuffix(domain, ".")
 
-	if err := updateDNS(ctx, dcfg, testEC2Client, testR53Client, id, dcfg.DNSName); err != nil {
+	if err := updateDNS(ctx, cfg, testEC2Client, testR53Client, id, cfg.DNSName); err != nil {
 		t.Fatalf("updateDNS: %v", err)
 	}
 
@@ -485,17 +424,17 @@ func TestSearchSpotPrices(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
 	// LocalStack returns empty spot price history; verify the code handles it gracefully.
-	if err := searchSpotPrices(ctx, testEC2Client, []string{"t2.micro"}); err != nil {
-		t.Fatalf("searchSpotPrices: %v", err)
+	if err := runSearch(ctx, testEC2Client, []string{"t2.micro"}, 8, 16, 0, "x86_64", false, "", "price", 20); err != nil {
+		t.Fatalf("runSearch: %v", err)
 	}
 }
 
 func TestFetchInstanceTypes(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
-	results, err := fetchInstanceTypes(ctx, testEC2Client, "x86_64", 1, 0.5, false)
+	results, err := awsutil.FetchInstanceTypes(ctx, testEC2Client, "x86_64", 1, 0.5, false)
 	if err != nil {
-		t.Fatalf("fetchInstanceTypes: %v", err)
+		t.Fatalf("FetchInstanceTypes: %v", err)
 	}
 	// LocalStack may return instance types; just verify no error.
 	_ = results
@@ -504,9 +443,9 @@ func TestFetchInstanceTypes(t *testing.T) {
 func TestDescribeSpecificTypes(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
-	results, err := describeSpecificTypes(ctx, testEC2Client, []types.InstanceType{types.InstanceTypeT2Micro})
+	results, err := awsutil.DescribeSpecificTypes(ctx, testEC2Client, []types.InstanceType{types.InstanceTypeT2Micro})
 	if err != nil {
-		t.Fatalf("describeSpecificTypes: %v", err)
+		t.Fatalf("DescribeSpecificTypes: %v", err)
 	}
 	if len(results) == 0 {
 		t.Skip("LocalStack did not return instance type info for t2.micro")
@@ -538,10 +477,10 @@ func TestLookupSecurityGroup(t *testing.T) {
 		t.Fatalf("CreateSecurityGroup: %v", err)
 	}
 
-	dcfg := testDevboxConfig()
-	dcfg.SecurityGroup = sgName
+	cfg := testDevboxConfig()
+	cfg.SecurityGroup = sgName
 
-	gotID, err := lookupSecurityGroup(ctx, dcfg, testEC2Client)
+	gotID, err := lookupSecurityGroup(ctx, cfg, testEC2Client)
 	if err != nil {
 		t.Fatalf("lookupSecurityGroup: %v", err)
 	}
@@ -568,7 +507,7 @@ func TestLookupAMI(t *testing.T) {
 	ctx := context.Background()
 
 	// Register a test AMI that matches the pattern.
-	dcfg := testDevboxConfig()
+	cfg := testDevboxConfig()
 	_, err := testEC2Client.RegisterImage(ctx, &ec2.RegisterImageInput{
 		Name:               aws.String("test-ami-2024.01"),
 		Description:        aws.String("test AMI"),
@@ -589,7 +528,7 @@ func TestLookupAMI(t *testing.T) {
 		t.Fatalf("RegisterImage: %v", err)
 	}
 
-	amiID, err := lookupAMI(ctx, dcfg, testEC2Client)
+	amiID, err := lookupAMI(ctx, cfg, testEC2Client)
 	if err != nil {
 		// LocalStack may not support owner filter correctly.
 		t.Skipf("lookupAMI failed (likely LocalStack filter limitation): %v", err)
@@ -626,8 +565,8 @@ func TestSpawnInstance(t *testing.T) {
 	sourceID := *srcResult.Instances[0].InstanceId
 
 	// Register an AMI matching the test pattern.
-	dcfg := testDevboxConfig()
-	regResult, err := testEC2Client.RegisterImage(ctx, &ec2.RegisterImageInput{
+	cfg := testDevboxConfig()
+	_, err = testEC2Client.RegisterImage(ctx, &ec2.RegisterImageInput{
 		Name:               aws.String("test-ami-spawn-2024.01"),
 		Architecture:       types.ArchitectureValuesX8664,
 		RootDeviceName:     aws.String("/dev/xvda"),
@@ -645,7 +584,6 @@ func TestSpawnInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterImage: %v", err)
 	}
-	_ = regResult
 
 	// Create security group.
 	_, err = testEC2Client.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
@@ -655,9 +593,9 @@ func TestSpawnInstance(t *testing.T) {
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("CreateSecurityGroup: %v", err)
 	}
-	dcfg.SecurityGroup = "test-sg-spawn"
+	cfg.SecurityGroup = "test-sg-spawn"
 
-	err = spawnInstance(ctx, dcfg, testEC2Client, []string{"--from", sourceID})
+	err = spawnInstance(ctx, cfg, testEC2Client, "t2.micro", "us-east-1a", "test-spawn", "0.50", sourceID)
 	if err != nil {
 		// Spawn may fail at AMI lookup due to owner filter. That's a known LocalStack limitation.
 		if strings.Contains(err.Error(), "AMI") || strings.Contains(err.Error(), "user_data") {
@@ -674,13 +612,13 @@ func TestResizeInstance(t *testing.T) {
 	ctx := context.Background()
 	id := createTestInstance(t, ctx)
 
-	dcfg := testDevboxConfig()
+	cfg := testDevboxConfig()
 	domain := "resize.test."
 	createTestHostedZone(t, ctx, domain)
-	dcfg.DNSZone = domain
-	dcfg.DNSName = "dev.resize.test"
+	cfg.DNSZone = domain
+	cfg.DNSName = "dev.resize.test"
 
-	if err := resizeInstance(ctx, dcfg, testEC2Client, testR53Client, id, "t2.small"); err != nil {
+	if err := resizeInstance(ctx, cfg, testEC2Client, testR53Client, id, "t2.small"); err != nil {
 		t.Fatalf("resizeInstance: %v", err)
 	}
 
@@ -708,8 +646,8 @@ func TestVolumeLSEmpty(t *testing.T) {
 func TestVolumeCreateAndList(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
-	dcfg := testDevboxConfig()
-	if err := volumeCreate(ctx, dcfg, testEC2Client, []string{"-size", "1", "-name", "test-vol-list"}); err != nil {
+	cfg := testDevboxConfig()
+	if err := volumeCreate(ctx, cfg, testEC2Client, 1, "gp3", 3000, 250, "us-east-1a", "test-vol-list"); err != nil {
 		t.Fatalf("volumeCreate: %v", err)
 	}
 	if err := volumeLS(ctx, testEC2Client); err != nil {
@@ -737,7 +675,7 @@ func TestVolumeCreateAndDestroy(t *testing.T) {
 	}
 	volID := *result.VolumeId
 
-	if err := volumeDestroy(ctx, testEC2Client, []string{volID}); err != nil {
+	if err := volumeDestroy(ctx, testEC2Client, volID); err != nil {
 		t.Fatalf("volumeDestroy: %v", err)
 	}
 
@@ -842,7 +780,7 @@ func TestVolumeAttach(t *testing.T) {
 	}
 	volID := *vol.VolumeId
 
-	if err := volumeAttach(ctx, testEC2Client, []string{volID, instID}); err != nil {
+	if err := volumeAttach(ctx, testEC2Client, volID, instID, "/dev/xvdf"); err != nil {
 		t.Fatalf("volumeAttach: %v", err)
 	}
 	desc, err := testEC2Client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{VolumeIds: []string{volID}})
@@ -879,7 +817,7 @@ func TestVolumeDetach(t *testing.T) {
 		t.Fatalf("AttachVolume setup: %v", err)
 	}
 
-	err = volumeDetach(ctx, testEC2Client, []string{volID})
+	err = volumeDetach(ctx, testEC2Client, volID, false)
 	if err != nil {
 		// LocalStack's DetachVolume has a known bug; skip rather than fail.
 		if strings.Contains(err.Error(), "InternalError") || strings.Contains(err.Error(), "NoneType") {
@@ -909,7 +847,7 @@ func TestVolumeSnapshot(t *testing.T) {
 	}
 	volID := *vol.VolumeId
 
-	if err := volumeSnapshot(ctx, testEC2Client, []string{"-name", "test-snap", volID}); err != nil {
+	if err := volumeSnapshot(ctx, testEC2Client, volID, "test-snap"); err != nil {
 		t.Fatalf("volumeSnapshot: %v", err)
 	}
 
@@ -939,7 +877,7 @@ func TestVolumeMove(t *testing.T) {
 	}
 	volID := *vol.VolumeId
 
-	err = volumeMove(ctx, testEC2Client, testAWSCfg, []string{"--cleanup", volID, "us-west-2"})
+	err = volumeMove(ctx, testEC2Client, testAWSCfg, volID, "us-west-2", "", true)
 	if err != nil {
 		t.Fatalf("volumeMove: %v", err)
 	}
@@ -965,9 +903,9 @@ func TestFetchUserData(t *testing.T) {
 	}
 	instID := *result.Instances[0].InstanceId
 
-	got, err := fetchUserData(ctx, testEC2Client, instID)
+	got, err := awsutil.FetchUserData(ctx, testEC2Client, instID)
 	if err != nil {
-		t.Skipf("fetchUserData failed (may be LocalStack limitation): %v", err)
+		t.Skipf("FetchUserData failed (may be LocalStack limitation): %v", err)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(got)
@@ -975,41 +913,6 @@ func TestFetchUserData(t *testing.T) {
 		t.Fatalf("decode result: %v", err)
 	}
 	if string(decoded) != original {
-		t.Errorf("fetchUserData round-trip: got %q, want %q", string(decoded), original)
-	}
-}
-
-// ==================== LoadConfig with JSON test ====================
-
-func TestLoadConfigBadJSON(t *testing.T) {
-	dir := t.TempDir()
-	cfgDir := filepath.Join(dir, ".config", "devbox")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cfgDir, "default.json"), []byte("{bad json"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", dir)
-
-	_, err := loadConfig()
-	if err == nil {
-		t.Fatal("expected error for bad JSON")
-	}
-}
-
-// verify our test devbox config produces valid JSON round-trip
-func TestDevboxConfigJSON(t *testing.T) {
-	cfg := testDevboxConfig()
-	data, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed devboxConfig
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatal(err)
-	}
-	if parsed.DNSName != cfg.DNSName {
-		t.Errorf("DNSName = %q, want %q", parsed.DNSName, cfg.DNSName)
+		t.Errorf("FetchUserData round-trip: got %q, want %q", string(decoded), original)
 	}
 }
