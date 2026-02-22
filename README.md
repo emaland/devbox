@@ -73,21 +73,35 @@ Example config:
 | `nixos_ami_owner` | `427812963091` | AWS account ID that owns the NixOS AMIs |
 | `nixos_ami_pattern` | `nixos/24.11*` | Glob pattern for AMI name lookup |
 
-### AWS prerequisites
+## Infrastructure setup
 
-devbox expects these resources to already exist in your AWS account:
+The `devbox infra` command provisions all the AWS resources devbox depends on. It wraps Terraform so you don't have to touch `.tfvars` files or run terraform commands manually.
 
-- An EC2 key pair matching `ssh_key_name`
-- A security group matching `security_group`
-- An IAM instance profile matching `iam_profile`
-- A Route 53 hosted zone matching `dns_zone`
-- Your AWS credentials must have permissions for EC2, Route 53, and IAM pass-role
+### Quick start
 
-The included Terraform configuration (`terraform/`) can create all of these for you — see [Terraform setup](#terraform-setup) below.
+```bash
+# Make sure your config is set up, then:
+devbox infra
+```
 
-## Terraform setup
+That's it. The command will:
 
-The `terraform/` directory contains a Terraform configuration that provisions the AWS infrastructure devbox depends on. It reads from the same `~/.config/devbox/default.json` config file as the CLI, so resource names (key pairs, security groups, IAM profiles) stay in sync automatically.
+1. Auto-detect your Route 53 hosted zone ID from the `dns_zone` in your config
+2. Auto-detect your SSH public key (looks for `.pub` file next to your configured private key, then `~/.ssh/id_ed25519.pub`, then `~/.ssh/id_rsa.pub`)
+3. Write `terraform.tfvars` with the detected values
+4. Run `terraform init` (first time only), `validate`, and `plan`
+5. Show you the plan and ask for confirmation
+6. Run `terraform apply`
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dns-zone-id` | auto-detected | Override the Route 53 zone ID |
+| `--ssh-public-key` | auto-detected | Provide SSH public key directly |
+| `--ssh-public-key-file` | — | Read SSH public key from a file |
+| `--dir` | `./terraform` | Path to the terraform directory |
+| `--auto-approve` | false | Skip the y/N confirmation prompt |
 
 ### What it creates
 
@@ -98,61 +112,32 @@ The `terraform/` directory contains a Terraform configuration that provisions th
 | **IAM role + instance profile** | Grants instances permission to update Route 53 records so DNS stays correct after spot interruptions |
 | **EBS volume** | 512 GiB gp3 persistent data volume (3000 IOPS, 250 MB/s). Has `prevent_destroy` enabled so it can't be accidentally deleted |
 
-It also includes a `configuration.nix` that defines the NixOS system configuration for launched instances: SSH with pubkey auth, Tailscale VPN, Docker, a boot-time DNS updater service, and a dev toolchain (git, tmux, emacs, python3, awscli, home-manager, etc.).
+### NixOS system configuration
 
-### Variables
+The Terraform directory also includes `configuration.nix`, which defines what runs on the instances:
 
-You need to provide two variables. Copy the example file and fill in your values:
+- SSH with pubkey auth only (root login prohibited)
+- Tailscale VPN with auto-connect on boot
+- Docker enabled
+- `/home` mounted from a persistent EBS volume (by label, so it works across instance types)
+- Boot-time DNS update via Route 53
+- Boot history logger — every boot appends instance metadata to `/var/log/boot-history`
+- Auto-stop timer — instance self-stops after 8h by default, configurable via `devbox stop --after`
+- home-manager switch on boot — applies latest home-manager config (supports remote flakes or local config)
+- MOTD showing last 20 boot events on login
+- System packages: git, curl, wget, htop, tmux, vim, jq, python3, emacs, gcc, make, awscli, home-manager
+
+### Manual terraform (if you prefer)
+
+If you'd rather run terraform yourself:
 
 ```bash
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
-```
-
-| Variable | Description |
-|----------|-------------|
-| `dns_zone_id` | Your Route 53 hosted zone ID (e.g. `ZXXXXXXXXXXXXXXXXXX`) |
-| `ssh_public_key` | Your SSH public key (e.g. `ssh-ed25519 AAAA... you@host`) |
-
-Everything else is pulled from `~/.config/devbox/default.json`.
-
-### Usage
-
-```bash
-cd terraform
+# Edit terraform.tfvars with your dns_zone_id and ssh_public_key
 terraform init
 terraform plan
 terraform apply
-```
-
-After `apply` completes, the CLI's prerequisites are in place and you can start using `devbox spawn`, `devbox list`, etc.
-
-## Project structure
-
-```
-main.go                          Entry point — calls cmd.Execute()
-cmd/
-  root.go                        Root cobra command, AWS/config init
-  list.go                        list/ls command
-  stop.go, start.go              Instance start/stop
-  reboot.go, restart.go          Reboot (in-place) and restart (stop+start)
-  terminate.go                   Terminate instances
-  dns.go                         DNS A record management
-  bids.go, prices.go             Spot request/price queries
-  rebid.go                       Cancel and re-create spot requests
-  ssh.go                         SSH into instances
-  setup_dns.go                   Install DNS-on-boot systemd service
-  search.go                      Browse spot prices by hardware specs
-  resize.go                      Stop, change type, restart, update DNS
-  recover.go                     Find alternative types with spot capacity
-  spawn.go                       Clone a new spot instance
-  volume.go                      EBS volume subcommands (ls, create, attach, etc.)
-internal/
-  config/config.go               Config loading and defaults
-  awsutil/
-    types.go                     Shared types (InstanceTypeInfo, SpotSearchResult)
-    helpers.go                   NameTag, FindHostedZone, FetchUserData, PollVolumeState
-    search.go                    FetchInstanceTypes, DescribeSpecificTypes, FetchSpotPrices
 ```
 
 ## Usage
@@ -181,9 +166,28 @@ devbox reboot i-abc123
 # Full restart — stop then start (may get a new host/IP)
 devbox restart i-abc123
 
-# SSH into an instance
+# SSH into an instance (auto-detects if only one is running)
+devbox ssh
 devbox ssh i-abc123
 ```
+
+### Auto-stop timer
+
+Instances auto-stop after 8 hours by default. You can change the timer on a running instance:
+
+```bash
+# Set auto-stop to 4 hours
+devbox stop --after 4h
+devbox stop --after 4h i-abc123
+
+# Disable auto-stop
+devbox stop --after off
+
+# Immediate stop (unchanged)
+devbox stop i-abc123
+```
+
+When `--after` is used without an instance ID, devbox auto-detects the single running instance. The timer resets automatically on every boot.
 
 ### DNS
 
