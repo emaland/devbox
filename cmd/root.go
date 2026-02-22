@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
 
 	devboxconfig "github.com/emaland/devbox/internal/config"
@@ -22,6 +24,16 @@ var (
 	SnapshotPollInterval = 15 * time.Second
 	BaseEndpointOverride string
 )
+
+const awsCredentialGuidance = `AWS credentials not found. Configure them using one of:
+
+  aws sso login                        If you use AWS IAM Identity Center (SSO)
+  aws configure                        Interactive setup for ~/.aws/credentials
+  export AWS_ACCESS_KEY_ID=...         Set credentials via environment variables
+  export AWS_SECRET_ACCESS_KEY=...
+  export AWS_PROFILE=my-profile        Use a named profile from ~/.aws/config
+
+Docs: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html`
 
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -38,6 +50,14 @@ func NewRootCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			// Verify credentials are valid before any command runs.
+			stsClient := sts.NewFromConfig(awsCfg)
+			if _, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{}); err != nil {
+				fmt.Fprintln(os.Stderr, awsCredentialGuidance)
+				return err
+			}
+
 			ec2Client = ec2.NewFromConfig(awsCfg)
 			return nil
 		},
@@ -61,6 +81,7 @@ func NewRootCmd() *cobra.Command {
 		newRecoverCmd(),
 		newSpawnCmd(),
 		newVolumeCmd(),
+		newInfraCmd(),
 	)
 	return root
 }
