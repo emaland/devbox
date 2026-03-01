@@ -268,6 +268,37 @@
     };
   };
 
+  # ── Claude Code autostart ────────────────────────────────────────
+  # Starts a tmux session running Claude Code on boot.
+  # Attach with: tmux attach -t claude
+  systemd.services.devbox-claude = {
+    description = "Start Claude Code in tmux";
+    after       = [ "home.mount" "network-online.target" "devbox-home-manager.service" ];
+    wants       = [ "network-online.target" ];
+    wantedBy    = [ "multi-user.target" ];
+    serviceConfig = {
+      Type      = "oneshot";
+      User      = "emaland";
+      ExecStart = toString (pkgs.writeShellScript "devbox-claude" ''
+        export HOME=/home/emaland
+        PROJECT_DIR="$HOME/scratch/git/ions"
+
+        if [ ! -d "$PROJECT_DIR" ]; then
+          echo "Project directory $PROJECT_DIR does not exist, skipping"
+          exit 0
+        fi
+
+        # Kill any leftover session from before the reboot
+        ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
+
+        ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
+          "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue 'continue from where you left off'"
+
+        echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
+      '');
+    };
+  };
+
   # ── SSM Agent ─────────────────────────────────────────────────────
   services.amazon-ssm-agent.enable = true;
 
