@@ -292,7 +292,7 @@
         ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
 
         ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
-          "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue 'continue from where you left off'"
+          "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue --append-system-prompt 'Never ask the user questions. Always proceed with your best judgment.' 'continue from where you left off'"
 
         echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
       '');
