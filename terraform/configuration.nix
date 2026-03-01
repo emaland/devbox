@@ -4,6 +4,7 @@
   imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
 
   networking.hostName = "dev-workstation";
+  networking.nameservers = [ "100.100.100.100" "8.8.8.8" ];
   networking.dhcpcd.extraConfig = "nohook hostname";
 
   # ── Filesystem ────────────────────────────────────────────────────
@@ -326,6 +327,7 @@
     gnumake
     awscli2
     home-manager
+    ripgrep
   ];
 
   system.stateVersion = "24.11";

@@ -82,6 +82,7 @@ func NewRootCmd() *cobra.Command {
 		newSpawnCmd(),
 		newVolumeCmd(),
 		newInfraCmd(),
+		newNixUpdateCmd(),
 	)
 	return root
 }
