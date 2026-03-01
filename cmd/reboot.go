@@ -10,10 +10,17 @@ import (
 
 func newRebootCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "reboot <instance-id> [instance-id...]",
+		Use:   "reboot [instance-id...]",
 		Short: "Reboot instances (in-place, same host)",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
+				if err != nil {
+					return err
+				}
+				args = []string{id}
+			}
 			return rebootInstances(cmd.Context(), ec2Client, args)
 		},
 	}

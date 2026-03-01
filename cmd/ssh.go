@@ -38,14 +38,18 @@ func newSSHCmd() *cobra.Command {
 }
 
 func autoDetectRunningInstance(ctx context.Context, client *ec2.Client) (string, error) {
+	return autoDetectInstance(ctx, client, "running")
+}
+
+func autoDetectInstance(ctx context.Context, client *ec2.Client, state string) (string, error) {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
 			{Name: aws.String("instance-lifecycle"), Values: []string{"spot"}},
-			{Name: aws.String("instance-state-name"), Values: []string{"running"}},
+			{Name: aws.String("instance-state-name"), Values: []string{state}},
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("auto-detecting running instance: %w", err)
+		return "", fmt.Errorf("auto-detecting %s instance: %w", state, err)
 	}
 	var ids []string
 	for _, res := range desc.Reservations {
@@ -54,10 +58,10 @@ func autoDetectRunningInstance(ctx context.Context, client *ec2.Client) (string,
 		}
 	}
 	if len(ids) == 0 {
-		return "", fmt.Errorf("no running spot instances found")
+		return "", fmt.Errorf("no %s spot instances found", state)
 	}
 	if len(ids) > 1 {
-		return "", fmt.Errorf("multiple running instances found (%s) — specify one: devbox ssh <instance-id>", strings.Join(ids, ", "))
+		return "", fmt.Errorf("multiple %s instances found (%s) — specify one explicitly", state, strings.Join(ids, ", "))
 	}
 	return ids[0], nil
 }

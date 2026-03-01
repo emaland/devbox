@@ -29,7 +29,11 @@ func newStopCmd() *cobra.Command {
 				return scheduleStop(cmd.Context(), dcfg, ec2Client, after, args)
 			}
 			if len(args) == 0 {
-				return fmt.Errorf("requires at least 1 arg(s), only received 0 (use --after for scheduled stop)")
+				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
+				if err != nil {
+					return err
+				}
+				args = []string{id}
 			}
 			return stopInstances(cmd.Context(), ec2Client, args)
 		},

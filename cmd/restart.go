@@ -12,10 +12,17 @@ import (
 
 func newRestartCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "restart <instance-id> [instance-id...]",
+		Use:   "restart [instance-id...]",
 		Short: "Stop then start instances (new host)",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
+				if err != nil {
+					return err
+				}
+				args = []string{id}
+			}
 			return restartInstances(cmd.Context(), ec2Client, args)
 		},
 	}

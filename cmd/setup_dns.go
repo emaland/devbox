@@ -17,11 +17,21 @@ import (
 
 func newSetupDNSCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "setup-dns <instance-id>",
+		Use:   "setup-dns [instance-id]",
 		Short: "Install a boot script that updates dev.frob.io on startup",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return setupDNSOnBoot(cmd.Context(), dcfg, ec2Client, args[0])
+			instanceID := ""
+			if len(args) == 1 {
+				instanceID = args[0]
+			} else {
+				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
+				if err != nil {
+					return err
+				}
+				instanceID = id
+			}
+			return setupDNSOnBoot(cmd.Context(), dcfg, ec2Client, instanceID)
 		},
 	}
 }

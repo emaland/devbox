@@ -16,16 +16,26 @@ import (
 
 func newDNSCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "dns <instance-id> [dns-name]",
+		Use:   "dns [instance-id] [dns-name]",
 		Short: "Point a DNS name at an instance's public IP",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  cobra.RangeArgs(0, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r53client := route53.NewFromConfig(awsCfg)
+			instanceID := ""
 			dnsName := dcfg.DNSName
-			if len(args) > 1 {
+			if len(args) >= 1 {
+				instanceID = args[0]
+			} else {
+				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
+				if err != nil {
+					return err
+				}
+				instanceID = id
+			}
+			if len(args) >= 2 {
 				dnsName = args[1]
 			}
-			return updateDNS(cmd.Context(), dcfg, ec2Client, r53client, args[0], dnsName)
+			return updateDNS(cmd.Context(), dcfg, ec2Client, r53client, instanceID, dnsName)
 		},
 	}
 }

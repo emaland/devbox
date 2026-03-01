@@ -12,10 +12,17 @@ import (
 
 func newStartCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "start <instance-id> [instance-id...]",
+		Use:   "start [instance-id...]",
 		Short: "Start stopped spot instances",
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				id, err := autoDetectInstance(cmd.Context(), ec2Client, "stopped")
+				if err != nil {
+					return err
+				}
+				args = []string{id}
+			}
 			return startInstances(cmd.Context(), ec2Client, args)
 		},
 	}

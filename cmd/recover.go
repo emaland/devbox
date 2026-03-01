@@ -26,12 +26,22 @@ func newRecoverCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "recover <instance-id>",
+		Use:   "recover [instance-id]",
 		Short: "Find alternative instance types with spot capacity in the same AZ",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			instanceID := ""
+			if len(args) == 1 {
+				instanceID = args[0]
+			} else {
+				id, err := autoDetectInstance(cmd.Context(), ec2Client, "stopped")
+				if err != nil {
+					return err
+				}
+				instanceID = id
+			}
 			r53client := route53.NewFromConfig(awsCfg)
-			return recoverInstance(cmd.Context(), dcfg, ec2Client, r53client, args[0], minVCPUFlag, minMemFlag, maxPrice, autoYes)
+			return recoverInstance(cmd.Context(), dcfg, ec2Client, r53client, instanceID, minVCPUFlag, minMemFlag, maxPrice, autoYes)
 		},
 	}
 
