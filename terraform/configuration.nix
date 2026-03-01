@@ -115,7 +115,7 @@
 
         # Update your Route53 zone — set the zone ID and record name
         # to match your terraform/main.tf dns_zone_id and dns_name.
-        ZONE_ID="REPLACE_WITH_YOUR_ZONE_ID"
+        ZONE_ID="Z09070421BNE0435R08B2"
         RECORD_NAME="dev.frob.io"
 
         ${pkgs.awscli2}/bin/aws route53 change-resource-record-sets \
@@ -292,7 +292,7 @@
         ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
 
         ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
-          "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue --append-system-prompt 'Never ask the user questions. Always proceed with your best judgment.' 'continue from where you left off'"
+          "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue 'continue from where you left off'"
 
         echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
       '');
