@@ -4,8 +4,14 @@
   imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
 
   networking.hostName = "dev-workstation";
-  networking.nameservers = [ "100.100.100.100" "8.8.8.8" ];
   networking.dhcpcd.extraConfig = "nohook hostname";
+
+  # Ensure IMDS is reachable via the primary interface. Docker/Tailscale
+  # veth interfaces can steal the 169.254.0.0/16 link-local route,
+  # breaking instance metadata access (credentials, identity, etc.).
+  networking.localCommands = ''
+    ip route add 169.254.169.254 dev ens5 2>/dev/null || true
+  '';
 
   # ── Filesystem ────────────────────────────────────────────────────
   # Mount the persistent EBS volume by label so it works across
@@ -178,6 +184,14 @@
         tail -n 20 /var/log/boot-history
         echo ""
       fi
+    '';
+    mode = "0644";
+  };
+
+  environment.etc."profile.d/devbox-env.sh" = {
+    text = ''
+      export LETTA_BASE_URL="http://localhost:8283"
+      export LETTA_API_KEY="dummy"
     '';
     mode = "0644";
   };
