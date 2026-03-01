@@ -20,12 +20,43 @@
     isNormalUser = true;
     uid          = 1001;
     extraGroups  = [ "wheel" "docker" ];
-    openssh.authorizedKeys.keys = [
-      # Add your SSH public key here
-    ];
   };
 
   security.sudo.wheelNeedsPassword = false;
+
+  # ── Fetch EC2 SSH key for emaland ──────────────────────────────
+  # Pulls the EC2 key pair's public key from instance metadata on
+  # every boot and installs it as emaland's authorized_keys.
+  systemd.services.devbox-fetch-ssh-key = {
+    description = "Fetch EC2 SSH key for emaland user";
+    after       = [ "home.mount" "network-online.target" ];
+    wants       = [ "network-online.target" ];
+    wantedBy    = [ "multi-user.target" ];
+    serviceConfig = {
+      Type      = "oneshot";
+      ExecStart = toString (pkgs.writeShellScript "devbox-fetch-ssh-key" ''
+        TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
+          "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+        PUBKEY=$(${pkgs.curl}/bin/curl -s \
+          -H "X-aws-ec2-metadata-token: $TOKEN" \
+          http://169.254.169.254/latest/meta-data/public-keys/0/openssh-key)
+
+        if [ -z "$PUBKEY" ]; then
+          echo "No EC2 public key found in metadata, skipping"
+          exit 0
+        fi
+
+        SSH_DIR=/home/emaland/.ssh
+        mkdir -p "$SSH_DIR"
+        echo "$PUBKEY" > "$SSH_DIR/authorized_keys"
+        chmod 700 "$SSH_DIR"
+        chmod 600 "$SSH_DIR/authorized_keys"
+        chown -R emaland:users "$SSH_DIR"
+        echo "Installed EC2 public key for emaland"
+      '');
+    };
+  };
 
   # ── SSH ───────────────────────────────────────────────────────────
   services.openssh = {
@@ -236,6 +267,9 @@
       '');
     };
   };
+
+  # ── SSM Agent ─────────────────────────────────────────────────────
+  services.amazon-ssm-agent.enable = true;
 
   # ── Docker ────────────────────────────────────────────────────────
   virtualisation.docker.enable = true;
