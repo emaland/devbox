@@ -113,6 +113,21 @@
     serviceConfig = {
       Type      = "oneshot";
       ExecStart = toString (pkgs.writeShellScript "update-route53" ''
+        # Wait for IMDS credentials to become available (IAM role
+        # propagation can lag behind network-online.target).
+        for i in $(seq 1 12); do
+          TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
+            "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+          if ${pkgs.curl}/bin/curl -sf \
+            -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/iam/security-credentials/ >/dev/null 2>&1; then
+            break
+          fi
+          echo "Waiting for IMDS credentials (attempt $i/12)..."
+          sleep 5
+        done
+
         TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
           "http://169.254.169.254/latest/api/token" \
           -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
@@ -120,8 +135,6 @@
           -H "X-aws-ec2-metadata-token: $TOKEN" \
           http://169.254.169.254/latest/meta-data/public-ipv4)
 
-        # Update your Route53 zone — set the zone ID and record name
-        # to match your terraform/main.tf dns_zone_id and dns_name.
         ZONE_ID="Z09070421BNE0435R08B2"
         RECORD_NAME="dev.frob.io"
 
