@@ -6,11 +6,15 @@
   networking.hostName = "dev-workstation";
   networking.dhcpcd.extraConfig = "nohook hostname";
 
-  # Ensure IMDS is reachable via the primary interface. Docker/Tailscale
-  # veth interfaces can steal the 169.254.0.0/16 link-local route,
-  # breaking instance metadata access (credentials, identity, etc.).
+  # Ensure IMDS is always reachable via the primary interface.
+  # Docker/Tailscale veth interfaces can steal the 169.254.0.0/16
+  # link-local route from the main table. A policy routing rule with
+  # high priority (low number) forces IMDS traffic to a dedicated
+  # routing table that only has the ens5 route — immune to other
+  # interfaces adding/removing routes in the main table.
   networking.localCommands = ''
-    ip route add 169.254.169.254 dev ens5 2>/dev/null || true
+    ip rule add to 169.254.169.254 lookup 100 priority 100 2>/dev/null || true
+    ip route replace 169.254.169.254 dev ens5 table 100
   '';
 
   # ── Filesystem ────────────────────────────────────────────────────
