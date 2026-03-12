@@ -290,13 +290,15 @@
   systemd.services.devbox-claude = {
     description = "Start Claude Code in tmux";
     after       = [ "home.mount" "network-online.target" "devbox-home-manager.service" ];
-    wants       = [ "network-online.target" ];
+    wants       = [ "network-online.target" "devbox-home-manager.service" ];
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
-      Type      = "oneshot";
-      User      = "emaland";
+      Type            = "oneshot";
+      RemainAfterExit = true;
+      User            = "emaland";
       ExecStart = toString (pkgs.writeShellScript "devbox-claude" ''
         export HOME=/home/emaland
+        export PATH=${lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.curl pkgs.openssh pkgs.nodejs ]}:/etc/profiles/per-user/emaland/bin:$PATH
         PROJECT_DIR="$HOME/scratch/git/ions"
 
         if [ ! -d "$PROJECT_DIR" ]; then
