@@ -190,8 +190,9 @@
 
   environment.etc."profile.d/devbox-env.sh" = {
     text = ''
-      export LETTA_BASE_URL="http://localhost:8283"
-      export LETTA_API_KEY="dummy"
+      export LETTA_BASE_URL=http://localhost:8283
+      export LETTA_SERVER_TOKEN=foo
+      export LETTA_API_KEY=foo
     '';
     mode = "0644";
   };
