@@ -329,6 +329,13 @@
     trusted-users         = [ "root" "emaland" ];
   };
 
+  # ── Nix garbage collection ─────────────────────────────────────
+  nix.gc = {
+    automatic = true;
+    dates     = "daily";
+    options   = "--delete-older-than 7d";
+  };
+
   # ── System packages ──────────────────────────────────────────────
   environment.systemPackages = with pkgs; [
     git
