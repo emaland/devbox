@@ -79,11 +79,14 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 		return fmt.Errorf("scp failed: %w", err)
 	}
 
-	// Move into place and rebuild. nixos-rebuild switch exits non-zero
-	// if any service fails during activation, even when the config itself
-	// applied successfully. We treat that as a warning, not an error.
+	// Move into place, save a copy to the persistent /home volume so it
+	// survives instance replacements, and rebuild.  nixos-rebuild switch
+	// exits non-zero if any service fails during activation, even when
+	// the config itself applied successfully — we treat that as a warning.
 	fmt.Println("Running nixos-rebuild switch...")
-	remoteCmd := `sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && sudo nixos-rebuild switch`
+	remoteCmd := `sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
+		`mkdir -p ~/.config/devbox && cp /tmp/configuration.nix ~/.config/devbox/configuration.nix && ` +
+		`sudo nixos-rebuild switch`
 	sshArgs := append([]string{}, sshOpts...)
 	sshArgs = append(sshArgs, sshTarget, remoteCmd)
 	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)

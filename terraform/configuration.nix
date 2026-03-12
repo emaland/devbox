@@ -35,6 +35,38 @@
 
   security.sudo.wheelNeedsPassword = false;
 
+  # ── Restore configuration.nix from persistent /home volume ─────
+  # On instance replacement (resize, spawn), the root volume is new
+  # but /home survives. This copies the saved config back to
+  # /etc/nixos and rebuilds so the new instance matches the old one.
+  systemd.services.devbox-restore-nixos-config = {
+    description = "Restore configuration.nix from persistent volume";
+    after       = [ "home.mount" ];
+    before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" "devbox-claude.service" ];
+    wantedBy    = [ "multi-user.target" ];
+    serviceConfig = {
+      Type      = "oneshot";
+      ExecStart = toString (pkgs.writeShellScript "devbox-restore-nixos-config" ''
+        SAVED="/home/emaland/.config/devbox/configuration.nix"
+        TARGET="/etc/nixos/configuration.nix"
+
+        if [ ! -f "$SAVED" ]; then
+          echo "No saved configuration.nix on persistent volume, skipping"
+          exit 0
+        fi
+
+        if cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
+          echo "configuration.nix already matches, skipping rebuild"
+          exit 0
+        fi
+
+        echo "Restoring configuration.nix from persistent volume"
+        cp "$SAVED" "$TARGET"
+        nixos-rebuild switch --no-build-nix
+      '');
+    };
+  };
+
   # ── Fetch EC2 SSH key for emaland ──────────────────────────────
   # Pulls the EC2 key pair's public key from instance metadata on
   # every boot and installs it as emaland's authorized_keys.
