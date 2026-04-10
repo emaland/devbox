@@ -425,6 +425,15 @@ func resizeSpotInstance(ctx context.Context, dcfg config.DevboxConfig, client *e
 		fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")
 	}
 
+	// 12. Push current configuration.nix and rebuild.
+	//     The new instance boots with stale user_data config, so we push the
+	//     real one. Uses root SSH since the emaland user may not have SSH keys
+	//     until the config is applied.
+	if err := pushNixConfig(ctx, dcfg, client, newID); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to push NixOS config: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Run 'devbox nix-update' manually once the instance is ready.")
+	}
+
 	fmt.Printf("\nDone. Old instance %s terminated, new instance %s (%s) is running.\n", instanceID, newID, newType)
 	return nil
 }

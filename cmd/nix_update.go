@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/spf13/cobra"
@@ -45,23 +46,68 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 		return fmt.Errorf("reading %s: %w", nixFile, err)
 	}
 
+	ip, err := instancePublicIP(ctx, client, instanceID)
+	if err != nil {
+		return err
+	}
+
+	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, dcfg.SSHUser)
+}
+
+// pushNixConfig looks up a running instance's IP and pushes configuration.nix
+// via root SSH (for fresh instances where emaland keys aren't set up yet).
+func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID string) error {
+	nixFile := "terraform/configuration.nix"
+	if _, err := os.Stat(nixFile); err != nil {
+		return fmt.Errorf("reading %s: %w", nixFile, err)
+	}
+
+	ip, err := instancePublicIP(ctx, client, instanceID)
+	if err != nil {
+		return err
+	}
+
+	// Wait for SSH to become available on fresh instance
+	fmt.Println("Waiting for SSH to become available...")
+	keyPath := dcfg.ResolveSSHKeyPath()
+	for i := 0; i < 12; i++ {
+		testCmd := exec.CommandContext(ctx, "ssh",
+			"-i", keyPath,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "ConnectTimeout=5",
+			"root@"+ip, "true",
+		)
+		if testCmd.Run() == nil {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root")
+}
+
+func instancePublicIP(ctx context.Context, client *ec2.Client, instanceID string) (string, error) {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
 	if err != nil {
-		return fmt.Errorf("describing instance: %w", err)
+		return "", fmt.Errorf("describing instance: %w", err)
 	}
 	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
-		return fmt.Errorf("instance %s not found", instanceID)
+		return "", fmt.Errorf("instance %s not found", instanceID)
 	}
 	inst := desc.Reservations[0].Instances[0]
 	if inst.PublicIpAddress == nil {
-		return fmt.Errorf("instance %s has no public IP (is it running?)", instanceID)
+		return "", fmt.Errorf("instance %s has no public IP (is it running?)", instanceID)
 	}
-	ip := *inst.PublicIpAddress
+	return *inst.PublicIpAddress, nil
+}
+
+func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, instanceID, nixFile, sshUser string) error {
 	keyPath := dcfg.ResolveSSHKeyPath()
 
-	sshTarget := dcfg.SSHUser + "@" + ip
+	sshTarget := sshUser + "@" + ip
 	sshOpts := []string{
 		"-i", keyPath,
 		"-o", "StrictHostKeyChecking=no",
@@ -85,7 +131,9 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 	// the config itself applied successfully — we treat that as a warning.
 	fmt.Println("Running nixos-rebuild switch...")
 	remoteCmd := `sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
-		`mkdir -p ~/.config/devbox && cp /tmp/configuration.nix ~/.config/devbox/configuration.nix && ` +
+		`sudo mkdir -p /home/emaland/.config/devbox && ` +
+		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix && ` +
+		`sudo chown -R emaland:users /home/emaland/.config/devbox && ` +
 		`sudo nixos-rebuild switch`
 	sshArgs := append([]string{}, sshOpts...)
 	sshArgs = append(sshArgs, sshTarget, remoteCmd)

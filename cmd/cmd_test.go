@@ -287,8 +287,8 @@ func TestTerminateInstances(t *testing.T) {
 	ctx := context.Background()
 	id := createTestInstance(t, ctx)
 
-	if err := terminateInstances(ctx, testEC2Client, []string{id}); err != nil {
-		t.Fatalf("terminateInstances: %v", err)
+	if err := terminateInstance(ctx, testEC2Client, id); err != nil {
+		t.Fatalf("terminateInstance: %v", err)
 	}
 	desc, err := testEC2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
 	if err != nil {

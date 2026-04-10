@@ -38,7 +38,7 @@ func LoadConfig() (DevboxConfig, error) {
 		DefaultMaxPrice:  "2.00",
 		SpawnName:        "dev-workstation-tmp",
 		NixOSAMIOwner:   "427812963091",
-		NixOSAMIPattern: "nixos/25.11*",
+		NixOSAMIPattern: "nixos/*",
 	}
 
 	home, err := os.UserHomeDir()
