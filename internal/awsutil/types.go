@@ -16,4 +16,7 @@ type SpotSearchResult struct {
 	Price              float64
 	GPU                bool
 	NetworkPerformance string
+	PricePerVCPU       float64
+	PricePerGiB        float64
+	EfficiencyScore    float64 // lower is better: weighted $/vCPU + $/GiB
 }

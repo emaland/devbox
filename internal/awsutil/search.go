@@ -139,6 +139,15 @@ func FetchSpotPrices(ctx context.Context, client *ec2.Client, instanceTypes []In
 	for k, sp := range latest {
 		info := infoMap[k.itype]
 		price, _ := strconv.ParseFloat(*sp.SpotPrice, 64)
+		pricePerVCPU := 0.0
+		pricePerGiB := 0.0
+		if info.VCPUs > 0 {
+			pricePerVCPU = price / float64(info.VCPUs)
+		}
+		memGiB := float64(info.MemoryMiB) / 1024.0
+		if memGiB > 0 {
+			pricePerGiB = price / memGiB
+		}
 		results = append(results, SpotSearchResult{
 			InstanceType:       k.itype,
 			VCPUs:              info.VCPUs,
@@ -147,6 +156,9 @@ func FetchSpotPrices(ctx context.Context, client *ec2.Client, instanceTypes []In
 			Price:              price,
 			GPU:                info.HasGPU,
 			NetworkPerformance: info.NetworkPerformance,
+			PricePerVCPU:       pricePerVCPU,
+			PricePerGiB:        pricePerGiB,
+			EfficiencyScore:    pricePerVCPU + pricePerGiB,
 		})
 	}
 	return results, nil

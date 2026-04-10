@@ -141,10 +141,26 @@ func resizeSpotInstance(ctx context.Context, dcfg config.DevboxConfig, client *e
 		return fmt.Errorf("instance is in state %s, cannot resize", state)
 	}
 
-	// 2. Gather instance config for recreation
+	// 2. Gather instance config for recreation.
+	//    Verify the AMI still exists — it may have been deregistered since
+	//    the instance was launched. Fall back to the latest NixOS AMI.
 	imageID := ""
 	if inst.ImageId != nil {
 		imageID = *inst.ImageId
+	}
+	if imageID != "" {
+		_, err := client.DescribeImages(ctx, &ec2.DescribeImagesInput{
+			ImageIds: []string{imageID},
+		})
+		if err != nil {
+			fmt.Printf("Original AMI %s no longer exists, looking up current NixOS AMI...\n", imageID)
+			newAMI, lookupErr := lookupAMI(ctx, dcfg, client)
+			if lookupErr != nil {
+				return fmt.Errorf("original AMI gone and failed to find replacement: %w", lookupErr)
+			}
+			imageID = newAMI
+			fmt.Printf("Using AMI: %s\n", imageID)
+		}
 	}
 	keyName := ""
 	if inst.KeyName != nil {

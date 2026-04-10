@@ -40,7 +40,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().StringVar(&arch, "arch", "x86_64", "Architecture (x86_64 or arm64)")
 	cmd.Flags().BoolVar(&gpu, "gpu", false, "Require GPU")
 	cmd.Flags().StringVar(&az, "az", "", "Filter by availability zone")
-	cmd.Flags().StringVar(&sortBy, "sort", "price", "Sort by: price, vcpu, mem")
+	cmd.Flags().StringVar(&sortBy, "sort", "price", "Sort by: price, vcpu, mem, efficiency")
 	cmd.Flags().IntVar(&limit, "limit", 20, "Max rows to display")
 
 	return cmd
@@ -102,6 +102,8 @@ func runSearch(ctx context.Context, client *ec2.Client, args []string, minVCPU i
 		sort.Slice(results, func(i, j int) bool { return results[i].VCPUs < results[j].VCPUs })
 	case "mem":
 		sort.Slice(results, func(i, j int) bool { return results[i].MemoryMiB < results[j].MemoryMiB })
+	case "efficiency":
+		sort.Slice(results, func(i, j int) bool { return results[i].EfficiencyScore < results[j].EfficiencyScore })
 	default:
 		sort.Slice(results, func(i, j int) bool { return results[i].Price < results[j].Price })
 	}
@@ -113,7 +115,7 @@ func runSearch(ctx context.Context, client *ec2.Client, args []string, minVCPU i
 
 	// 6. Display
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "INSTANCE TYPE\tVCPU\tMEMORY\tNETWORK\tAZ\tPRICE\tGPU")
+	fmt.Fprintln(w, "INSTANCE TYPE\tVCPU\tMEMORY\tAZ\t$/DAY\t$/vCPU\t$/GiB\tNETWORK\tGPU")
 	for _, r := range results {
 		gpuStr := "-"
 		if r.GPU {
@@ -123,8 +125,9 @@ func runSearch(ctx context.Context, client *ec2.Client, args []string, minVCPU i
 		if netPerf == "" {
 			netPerf = "-"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t%s\t$%.4f\t%s\n",
-			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, netPerf, r.AZ, r.Price, gpuStr)
+		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t$%.2f\t$%.4f\t$%.4f\t%s\t%s\n",
+			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, r.AZ, r.Price*24,
+			r.PricePerVCPU, r.PricePerGiB, netPerf, gpuStr)
 	}
 	w.Flush()
 	return nil

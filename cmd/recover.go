@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -20,9 +22,11 @@ import (
 func newRecoverCmd() *cobra.Command {
 	var (
 		minVCPUFlag int
+		maxVCPUFlag int
 		minMemFlag  float64
 		maxPrice    float64
 		autoYes     bool
+		sortBy      string
 	)
 
 	cmd := &cobra.Command{
@@ -41,19 +45,21 @@ func newRecoverCmd() *cobra.Command {
 				instanceID = id
 			}
 			r53client := route53.NewFromConfig(awsCfg)
-			return recoverInstance(cmd.Context(), dcfg, ec2Client, r53client, instanceID, minVCPUFlag, minMemFlag, maxPrice, autoYes)
+			return recoverInstance(cmd.Context(), dcfg, ec2Client, r53client, instanceID, minVCPUFlag, maxVCPUFlag, minMemFlag, maxPrice, autoYes, sortBy)
 		},
 	}
 
 	cmd.Flags().IntVar(&minVCPUFlag, "min-vcpu", 0, "Minimum vCPUs (default: 50% of current)")
+	cmd.Flags().IntVar(&maxVCPUFlag, "max-vcpu", 0, "Maximum vCPUs (default: 4x current)")
 	cmd.Flags().Float64Var(&minMemFlag, "min-mem", 0, "Minimum memory in GiB (default: 50% of current)")
 	cmd.Flags().Float64Var(&maxPrice, "max-price", 0, "Max spot price $/hr (0 = use config default)")
-	cmd.Flags().BoolVar(&autoYes, "yes", false, "Auto-pick cheapest candidate and resize")
+	cmd.Flags().BoolVar(&autoYes, "yes", false, "Auto-pick best candidate and resize")
+	cmd.Flags().StringVar(&sortBy, "sort", "efficiency", "Sort by: efficiency, price, vcpu, mem")
 
 	return cmd
 }
 
-func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, instanceID string, minVCPUFlag int, minMemFlag, maxPriceFlag float64, autoYes bool) error {
+func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, instanceID string, minVCPUFlag, maxVCPUFlag int, minMemFlag, maxPriceFlag float64, autoYes bool, sortBy string) error {
 	// 1. Describe the instance
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
@@ -129,8 +135,13 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 		defaultMaxPrice, _ = strconv.ParseFloat(dcfg.DefaultMaxPrice, 64)
 	}
 
-	fmt.Printf("\nSearching for alternatives (>=%d vCPU, >=%.0f GiB, %s) in %s...\n",
-		minVCPU, minMem, arch, az)
+	maxVCPU := int(vcpus) * 4
+	if maxVCPUFlag > 0 {
+		maxVCPU = maxVCPUFlag
+	}
+
+	fmt.Printf("\nSearching for alternatives (%d-%d vCPU, >=%.0f GiB, %s) in %s...\n",
+		minVCPU, maxVCPU, minMem, arch, az)
 
 	// 4. Find candidate instance types
 	candidates, err := awsutil.FetchInstanceTypes(ctx, client, arch, minVCPU, minMem, hasGPU)
@@ -148,13 +159,21 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 		return err
 	}
 
-	// 6. Apply max price filter
-	if defaultMaxPrice > 0 {
+	// 6. Filter: max price, max vCPU, and exclude accelerator families
+	//    (inf, trn, dl, p, g, f, vt) unless the current instance has a GPU.
+	{
 		var filtered []awsutil.SpotSearchResult
 		for _, r := range results {
-			if r.Price <= defaultMaxPrice {
-				filtered = append(filtered, r)
+			if defaultMaxPrice > 0 && r.Price > defaultMaxPrice {
+				continue
 			}
+			if int(r.VCPUs) > maxVCPU {
+				continue
+			}
+			if !hasGPU && isAcceleratorFamily(r.InstanceType) {
+				continue
+			}
+			filtered = append(filtered, r)
 		}
 		results = filtered
 	}
@@ -164,18 +183,27 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 		return nil
 	}
 
-	// 7. Sort by price ascending
-	sort.Slice(results, func(i, j int) bool { return results[i].Price < results[j].Price })
-
-	// 8. Display (top 10 by default)
-	display := results
-	if len(display) > 10 {
-		display = display[:10]
+	// 7. Sort
+	switch sortBy {
+	case "price":
+		sort.Slice(results, func(i, j int) bool { return results[i].Price < results[j].Price })
+	case "vcpu":
+		sort.Slice(results, func(i, j int) bool { return results[i].VCPUs > results[j].VCPUs })
+	case "mem":
+		sort.Slice(results, func(i, j int) bool { return results[i].MemoryMiB > results[j].MemoryMiB })
+	default: // efficiency
+		sort.Slice(results, func(i, j int) bool { return results[i].EfficiencyScore < results[j].EfficiencyScore })
 	}
-	fmt.Printf("Found %d instance types with spot capacity (showing top %d):\n\n", len(results), len(display))
+
+	// 8. Display
+	display := results
+	if len(display) > 15 {
+		display = display[:15]
+	}
+	fmt.Printf("Found %d candidates (showing top %d, sorted by %s):\n\n", len(results), len(display), sortBy)
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "TYPE\tVCPU\tMEMORY\tNETWORK\tPRICE\tGPU")
-	for _, r := range display {
+	fmt.Fprintln(w, "#\tTYPE\tVCPU\tMEMORY\t$/DAY\t$/vCPU\t$/GiB\tNETWORK\tGPU")
+	for i, r := range display {
 		netPerf := r.NetworkPerformance
 		if netPerf == "" {
 			netPerf = "-"
@@ -184,18 +212,45 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 		if r.GPU {
 			gpuStr = "yes"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%.0f GiB\t%s\t$%.4f\t%s\n",
-			r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, netPerf, r.Price, gpuStr)
+		fmt.Fprintf(w, "%d\t%s\t%d\t%.0f GiB\t$%.2f\t$%.4f\t$%.4f\t%s\t%s\n",
+			i+1, r.InstanceType, r.VCPUs, float64(r.MemoryMiB)/1024.0, r.Price*24,
+			r.PricePerVCPU, r.PricePerGiB, netPerf, gpuStr)
 	}
 	w.Flush()
 
-	if !autoYes {
-		fmt.Printf("\nTo resize: devbox resize %s %s\n", instanceID, results[0].InstanceType)
-		return nil
+	if autoYes {
+		// Auto-resize to top pick
+		best := display[0]
+		fmt.Printf("\nAuto-resizing to %s ($%.4f, efficiency score %.4f)...\n",
+			best.InstanceType, best.Price, best.EfficiencyScore)
+		return resizeInstance(ctx, dcfg, client, r53client, instanceID, best.InstanceType)
 	}
 
-	// 9. Auto-resize to cheapest
-	cheapest := results[0].InstanceType
-	fmt.Printf("\nAuto-resizing to %s (cheapest at $%.4f)...\n", cheapest, results[0].Price)
-	return resizeInstance(ctx, dcfg, client, r53client, instanceID, cheapest)
+	// 9. Interactive selection
+	fmt.Printf("\nSelect a candidate to resize to (1-%d), or press Enter to skip: ", len(display))
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+	choice, err := strconv.Atoi(line)
+	if err != nil || choice < 1 || choice > len(display) {
+		return fmt.Errorf("invalid selection: %s", line)
+	}
+	selected := display[choice-1]
+	fmt.Printf("Resizing to %s ($%.2f/day)...\n", selected.InstanceType, selected.Price*24)
+	return resizeInstance(ctx, dcfg, client, r53client, instanceID, selected.InstanceType)
+}
+
+// isAcceleratorFamily returns true for instance families designed for
+// ML inference/training or FPGAs (inf, trn, dl, p, g, f, vt).
+func isAcceleratorFamily(instanceType string) bool {
+	prefixes := []string{"inf", "trn", "dl", "p2", "p3", "p4", "p5", "g3", "g4", "g5", "g6", "f1", "vt"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(instanceType, p) {
+			return true
+		}
+	}
+	return false
 }
