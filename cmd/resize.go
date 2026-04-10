@@ -149,10 +149,10 @@ func resizeSpotInstance(ctx context.Context, dcfg config.DevboxConfig, client *e
 		imageID = *inst.ImageId
 	}
 	if imageID != "" {
-		_, err := client.DescribeImages(ctx, &ec2.DescribeImagesInput{
+		amiDesc, err := client.DescribeImages(ctx, &ec2.DescribeImagesInput{
 			ImageIds: []string{imageID},
 		})
-		if err != nil {
+		if err != nil || len(amiDesc.Images) == 0 {
 			fmt.Printf("Original AMI %s no longer exists, looking up current NixOS AMI...\n", imageID)
 			newAMI, lookupErr := lookupAMI(ctx, dcfg, client)
 			if lookupErr != nil {
