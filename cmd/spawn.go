@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"sort"
@@ -98,24 +97,11 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 				return err
 			}
 		} else {
-			// No source instance — render the full local configuration.nix into
-			// user_data so the box boots fully configured (one-phase boot).
-			rendered, rerr := renderUserData(dcfg, defaultNixFile(), volumeID)
-			if rerr != nil {
-				// Fall back to a minimal stub; nix-update can finish the job later.
-				stub := `{ config, pkgs, lib, modulesPath, ... }:
-{
-  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
-  services.openssh.enable = true;
-  services.openssh.settings.PermitRootLogin = "prohibit-password";
-}
-`
-				userData = base64.StdEncoding.EncodeToString([]byte(stub))
-				fmt.Printf("  Warning: could not render configuration.nix (%v); booting minimal stub\n", rerr)
-			} else {
-				userData = rendered
-				fmt.Println("  Using local configuration.nix for first boot")
-			}
+			// No source instance — boot a minimal stub (the full configuration.nix
+			// exceeds EC2's 16 KB user_data limit). The real config is pushed via
+			// SSH after launch (pushNixConfig below).
+			userData = stubUserData()
+			fmt.Println("  No source instance — booting minimal stub; full config pushed after launch")
 		}
 	}
 
@@ -233,7 +219,7 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 
 	// Push configuration.nix via root SSH and rebuild
 	fmt.Println("Pushing NixOS configuration...")
-	if err := pushNixConfig(ctx, dcfg, client, newID); err != nil {
+	if err := pushNixConfig(ctx, dcfg, client, newID, volumeID); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to push NixOS config: %v\n", err)
 		fmt.Fprintln(os.Stderr, "Run 'devbox nix-update' manually once the instance is ready.")
 	}

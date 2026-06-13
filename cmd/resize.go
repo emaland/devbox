@@ -37,7 +37,6 @@ const (
 var resizeStates = []string{
 	"launched",       // new instance launched (capacity not yet confirmed)
 	"stopped",        // new instance confirmed running, then stopped for swap
-	"userdata-set",   // new instance user_data updated
 	"spot-canceled",  // old spot request canceled
 	"detached",       // data volumes detached from old instance
 	"old-terminated", // old instance terminated, volumes available
@@ -282,17 +281,10 @@ func resizeSpotInstance(ctx context.Context, dcfg config.DevboxConfig, client *e
 		break
 	}
 
-	// Render fresh user_data from local configuration.nix (one-phase boot).
-	// Fall back to cloning the old instance's user_data if rendering fails.
-	userData, uerr := renderUserData(dcfg, defaultNixFile(), homeVolumeID(volumes))
-	if uerr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not render configuration.nix (%v); cloning old user_data\n", uerr)
-		if ud, ferr := awsutil.FetchUserData(ctx, client, instanceID); ferr == nil {
-			userData = ud
-		} else {
-			userData = ""
-		}
-	}
+	// Boot the replacement with a minimal stub — the full configuration.nix is
+	// too large for EC2 user_data. The real config (with the data-volume id for
+	// the format service) is pushed via SSH after the box is up.
+	userData := stubUserData()
 
 	// Tags for the new instance: carry over non-aws tags, then add the resize
 	// plan so the swap can be resumed if interrupted.
@@ -410,24 +402,6 @@ func driveResize(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Clie
 		}
 	}
 
-	// → userdata-set: ensure the new instance applies the rendered config on
-	//   every future boot.
-	if resizeAfter(cur, "userdata-set") {
-		if raw, err := renderNixConfig(dcfg, defaultNixFile(), dataVolumeMarker(homeVolumeID(plan.volumes))); err == nil {
-			if _, err := client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
-				InstanceId: aws.String(plan.newID),
-				UserData:   &types.BlobAttributeValue{Value: raw},
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not set user_data on new instance: %v\n", err)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "Warning: could not render configuration.nix: %v\n", err)
-		}
-		if err := advance("userdata-set"); err != nil {
-			return err
-		}
-	}
-
 	// → spot-canceled: cancel the old persistent spot request.
 	if resizeAfter(cur, "spot-canceled") {
 		if plan.spotReqID != "" {
@@ -516,8 +490,12 @@ func driveResize(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Clie
 		}
 	}
 
-	// → done: update DNS and clear the resize tags.
+	// → done: push the full config (the box booted a stub), update DNS, clear tags.
 	if resizeAfter(cur, "done") {
+		if err := pushNixConfig(ctx, dcfg, client, plan.newID, homeVolumeID(plan.volumes)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to push NixOS config: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Run 'devbox nix-update' manually once the instance is ready.")
+		}
 		if err := updateDNS(ctx, dcfg, client, r53client, plan.newID, dcfg.DNSName); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
 			fmt.Fprintln(os.Stderr, "The NixOS boot service should update DNS automatically.")

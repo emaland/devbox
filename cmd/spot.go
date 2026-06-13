@@ -147,20 +147,26 @@ func renderNixConfig(dcfg config.DevboxConfig, nixFile string, extra map[string]
 	return []byte(s), nil
 }
 
-// renderUserData renders configuration.nix and base64-encodes it for use as
-// EC2 user_data, giving a one-phase boot (the box comes up fully configured
-// without a post-launch SSH push). dataVolumeID, when non-empty, is the EBS
-// volume the box's auto-format service is allowed to initialize.
-func renderUserData(dcfg config.DevboxConfig, nixFile, dataVolumeID string) (string, error) {
-	raw, err := renderNixConfig(dcfg, nixFile, dataVolumeMarker(dataVolumeID))
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(raw), nil
+// nixosStub is a minimal, bootable NixOS config used as EC2 user_data. The full
+// configuration.nix is far larger than the 16 KB user_data limit, so a new box
+// boots this (SSH only) and the real config — including the @@DATA_VOLUME_ID@@
+// for the auto-format service — is delivered via the SSH push afterward
+// (pushNixConfig), which has no size limit.
+const nixosStub = `{ config, pkgs, lib, modulesPath, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
+  services.openssh.enable = true;
+  services.openssh.settings.PermitRootLogin = "prohibit-password";
+}
+`
+
+// stubUserData returns the base64-encoded minimal stub for EC2 user_data.
+func stubUserData() string {
+	return base64.StdEncoding.EncodeToString([]byte(nixosStub))
 }
 
 // dataVolumeMarker returns the @@DATA_VOLUME_ID@@ substitution map (or nil when
-// no data volume is designated).
+// no data volume is designated) for rendering the pushed config.
 func dataVolumeMarker(volumeID string) map[string]string {
 	if volumeID == "" {
 		return nil

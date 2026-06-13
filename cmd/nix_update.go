@@ -53,17 +53,19 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 
 	// Try configured user first, fall back to root (fresh instances only
 	// have root SSH until the config is applied and devbox-fetch-ssh-key runs).
-	err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, dcfg.SSHUser)
+	// No volume id here — `nix-update` targets a box whose volume is already
+	// formatted, so the format service no-ops on the unrendered marker.
+	err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, dcfg.SSHUser, "")
 	if err != nil && dcfg.SSHUser != "root" {
 		fmt.Println("Retrying as root (fresh instance)...")
-		err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root")
+		err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root", "")
 	}
 	return err
 }
 
 // pushNixConfig looks up a running instance's IP and pushes configuration.nix
 // via root SSH (for fresh instances where emaland keys aren't set up yet).
-func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID string) error {
+func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID, volumeID string) error {
 	nixFile := defaultNixFile()
 	if _, err := os.Stat(nixFile); err != nil {
 		return fmt.Errorf("reading %s: %w", nixFile, err)
@@ -91,7 +93,7 @@ func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		time.Sleep(5 * time.Second)
 	}
 
-	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root")
+	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root", volumeID)
 }
 
 func instancePublicIP(ctx context.Context, client *ec2.Client, instanceID string) (string, error) {
@@ -111,7 +113,7 @@ func instancePublicIP(ctx context.Context, client *ec2.Client, instanceID string
 	return *inst.PublicIpAddress, nil
 }
 
-func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, instanceID, nixFile, sshUser string) error {
+func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, instanceID, nixFile, sshUser, volumeID string) error {
 	keyPath := dcfg.ResolveSSHKeyPath()
 
 	sshTarget := sshUser + "@" + ip
@@ -123,7 +125,7 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 
 	// Render the config (substitute @@MARKER@@ placeholders) to a temp file so
 	// the instance never receives literal markers. SCP the rendered file.
-	rendered, err := renderNixConfig(dcfg, nixFile, nil)
+	rendered, err := renderNixConfig(dcfg, nixFile, dataVolumeMarker(volumeID))
 	if err != nil {
 		return err
 	}
