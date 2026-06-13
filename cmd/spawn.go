@@ -24,13 +24,14 @@ func newSpawnCmd() *cobra.Command {
 		name         string
 		maxPrice     string
 		from         string
+		volumeID     string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "spawn",
 		Short: "Spin up a new spot instance cloned from the primary",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from)
+			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID)
 		},
 	}
 
@@ -39,11 +40,12 @@ func newSpawnCmd() *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "Name tag for the instance (default from config)")
 	cmd.Flags().StringVar(&maxPrice, "max-price", "", "Spot max price $/hr (default from config)")
 	cmd.Flags().StringVar(&from, "from", "", "Instance ID to clone user_data from")
+	cmd.Flags().StringVar(&volumeID, "volume", "", "EBS data volume ID to attach as /dev/xvdf")
 
 	return cmd
 }
 
-func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from string) error {
+func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string) error {
 	// Apply config defaults for empty flags
 	if instanceType == "" {
 		instanceType = dcfg.DefaultType
@@ -79,19 +81,42 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 	}
 	fmt.Printf("  Subnet: %s\n", subnetID)
 
-	// Get user_data from source instance
-	sourceID := from
-	if sourceID == "" {
-		sourceID, err = autoDetectSourceInstance(ctx, client)
+	// Get user_data: clone from a source instance, or fall back to local configuration.nix
+	var userData string
+	if from != "" {
+		fmt.Printf("  Cloning user_data from: %s\n", from)
+		userData, err = awsutil.FetchUserData(ctx, client, from)
 		if err != nil {
 			return err
 		}
-	}
-	fmt.Printf("  Cloning user_data from: %s\n", sourceID)
-
-	userData, err := awsutil.FetchUserData(ctx, client, sourceID)
-	if err != nil {
-		return err
+	} else {
+		sourceID, detectErr := autoDetectSourceInstance(ctx, client)
+		if detectErr == nil {
+			fmt.Printf("  Cloning user_data from: %s\n", sourceID)
+			userData, err = awsutil.FetchUserData(ctx, client, sourceID)
+			if err != nil {
+				return err
+			}
+		} else {
+			// No source instance — render the full local configuration.nix into
+			// user_data so the box boots fully configured (one-phase boot).
+			rendered, rerr := renderUserData(dcfg, defaultNixFile(), volumeID)
+			if rerr != nil {
+				// Fall back to a minimal stub; nix-update can finish the job later.
+				stub := `{ config, pkgs, lib, modulesPath, ... }:
+{
+  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
+  services.openssh.enable = true;
+  services.openssh.settings.PermitRootLogin = "prohibit-password";
+}
+`
+				userData = base64.StdEncoding.EncodeToString([]byte(stub))
+				fmt.Printf("  Warning: could not render configuration.nix (%v); booting minimal stub\n", rerr)
+			} else {
+				userData = rendered
+				fmt.Println("  Using local configuration.nix for first boot")
+			}
+		}
 	}
 
 	// Launch the instance
@@ -152,6 +177,47 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		return fmt.Errorf("waiting for instance to start: %w", err)
 	}
 
+	// Attach data volume if requested — stop instance, attach, restart so
+	// NixOS boots with /home mounted from the start.
+	if volumeID != "" {
+		fmt.Printf("Stopping instance to attach volume %s...\n", volumeID)
+		_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
+			InstanceIds: []string{newID},
+		})
+		if err != nil {
+			return fmt.Errorf("stopping instance for volume attach: %w", err)
+		}
+		stopWaiter := ec2.NewInstanceStoppedWaiter(client)
+		if err := stopWaiter.Wait(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: []string{newID},
+		}, 5*60e9); err != nil {
+			return fmt.Errorf("waiting for stop: %w", err)
+		}
+
+		fmt.Printf("Attaching volume %s as /dev/xvdf...\n", volumeID)
+		_, err = client.AttachVolume(ctx, &ec2.AttachVolumeInput{
+			VolumeId:   aws.String(volumeID),
+			InstanceId: aws.String(newID),
+			Device:     aws.String("/dev/xvdf"),
+		})
+		if err != nil {
+			return fmt.Errorf("attaching volume: %w", err)
+		}
+		if err := awsutil.PollVolumeState(ctx, client, volumeID, "in-use", VolumePollInterval, 2*60e9); err != nil {
+			return fmt.Errorf("waiting for volume attach: %w", err)
+		}
+
+		fmt.Println("Starting instance with volume attached...")
+		if _, err := spotRetryStart(ctx, client, []string{newID}); err != nil {
+			return fmt.Errorf("restarting instance: %w", err)
+		}
+		if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: []string{newID},
+		}, 5*60e9); err != nil {
+			return fmt.Errorf("waiting for instance to start: %w", err)
+		}
+	}
+
 	// Re-describe to get public IP
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{newID},
@@ -165,13 +231,20 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		publicIP = *newInst.PublicIpAddress
 	}
 
+	// Push configuration.nix via root SSH and rebuild
+	fmt.Println("Pushing NixOS configuration...")
+	if err := pushNixConfig(ctx, dcfg, client, newID); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to push NixOS config: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Run 'devbox nix-update' manually once the instance is ready.")
+	}
+
 	fmt.Printf("\nInstance ready:\n")
 	fmt.Printf("  ID:        %s\n", newID)
 	fmt.Printf("  Type:      %s\n", instanceType)
 	fmt.Printf("  AZ:        %s\n", az)
 	fmt.Printf("  Public IP: %s\n", publicIP)
 	if publicIP != "-" {
-		fmt.Printf("  SSH:       ssh -i %s %s@%s\n", dcfg.SSHKeyPath, dcfg.SSHUser, publicIP)
+		fmt.Printf("  SSH:       devbox ssh %s\n", newID)
 	}
 	return nil
 }
@@ -189,7 +262,7 @@ func lookupAMI(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 		return "", fmt.Errorf("looking up AMI: %w", err)
 	}
 	if len(result.Images) == 0 {
-		return "", fmt.Errorf("no NixOS 24.11 AMI found")
+		return "", fmt.Errorf("no NixOS AMI found matching pattern %q from owner %s", dcfg.NixOSAMIPattern, dcfg.NixOSAMIOwner)
 	}
 	// Pick the latest by sorting on name (NixOS AMI names include dates)
 	sort.Slice(result.Images, func(i, j int) bool {

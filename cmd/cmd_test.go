@@ -595,7 +595,7 @@ func TestSpawnInstance(t *testing.T) {
 	}
 	cfg.SecurityGroup = "test-sg-spawn"
 
-	err = spawnInstance(ctx, cfg, testEC2Client, "t2.micro", "us-east-1a", "test-spawn", "0.50", sourceID)
+	err = spawnInstance(ctx, cfg, testEC2Client, "t2.micro", "us-east-1a", "test-spawn", "0.50", sourceID, "")
 	if err != nil {
 		// Spawn may fail at AMI lookup due to owner filter. That's a known LocalStack limitation.
 		if strings.Contains(err.Error(), "AMI") || strings.Contains(err.Error(), "user_data") {
@@ -647,7 +647,7 @@ func TestVolumeCreateAndList(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
 	cfg := testDevboxConfig()
-	if err := volumeCreate(ctx, cfg, testEC2Client, 1, "gp3", 3000, 250, "us-east-1a", "test-vol-list"); err != nil {
+	if _, err := volumeCreate(ctx, cfg, testEC2Client, 1, "gp3", 3000, 250, "us-east-1a", "test-vol-list"); err != nil {
 		t.Fatalf("volumeCreate: %v", err)
 	}
 	if err := volumeLS(ctx, testEC2Client); err != nil {

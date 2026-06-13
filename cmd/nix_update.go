@@ -51,13 +51,20 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 		return err
 	}
 
-	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, dcfg.SSHUser)
+	// Try configured user first, fall back to root (fresh instances only
+	// have root SSH until the config is applied and devbox-fetch-ssh-key runs).
+	err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, dcfg.SSHUser)
+	if err != nil && dcfg.SSHUser != "root" {
+		fmt.Println("Retrying as root (fresh instance)...")
+		err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root")
+	}
+	return err
 }
 
 // pushNixConfig looks up a running instance's IP and pushes configuration.nix
 // via root SSH (for fresh instances where emaland keys aren't set up yet).
 func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID string) error {
-	nixFile := "terraform/configuration.nix"
+	nixFile := defaultNixFile()
 	if _, err := os.Stat(nixFile); err != nil {
 		return fmt.Errorf("reading %s: %w", nixFile, err)
 	}
@@ -114,10 +121,27 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		"-o", "UserKnownHostsFile=/dev/null",
 	}
 
-	// SCP the file over
+	// Render the config (substitute @@MARKER@@ placeholders) to a temp file so
+	// the instance never receives literal markers. SCP the rendered file.
+	rendered, err := renderNixConfig(dcfg, nixFile, nil)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "devbox-configuration-*.nix")
+	if err != nil {
+		return fmt.Errorf("creating temp config: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(rendered); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp config: %w", err)
+	}
+	tmp.Close()
+
+	// SCP the rendered file over
 	fmt.Printf("Uploading %s to %s (%s)...\n", nixFile, instanceID, ip)
 	scpArgs := append([]string{}, sshOpts...)
-	scpArgs = append(scpArgs, nixFile, sshTarget+":/tmp/configuration.nix")
+	scpArgs = append(scpArgs, tmp.Name(), sshTarget+":/tmp/configuration.nix")
 	scpCmd := exec.CommandContext(ctx, "scp", scpArgs...)
 	scpCmd.Stdout = os.Stdout
 	scpCmd.Stderr = os.Stderr
@@ -131,10 +155,10 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// the config itself applied successfully — we treat that as a warning.
 	fmt.Println("Running nixos-rebuild switch...")
 	remoteCmd := `sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
+		`sudo nixos-rebuild switch; ` +
 		`sudo mkdir -p /home/emaland/.config/devbox && ` +
 		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix && ` +
-		`sudo chown -R emaland:users /home/emaland/.config/devbox && ` +
-		`sudo nixos-rebuild switch`
+		`sudo chown -R emaland:users /home/emaland/.config/devbox`
 	sshArgs := append([]string{}, sshOpts...)
 	sshArgs = append(sshArgs, sshTarget, remoteCmd)
 	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)

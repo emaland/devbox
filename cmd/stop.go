@@ -12,17 +12,19 @@ import (
 	"github.com/emaland/devbox/internal/config"
 )
 
-func newStopCmd() *cobra.Command {
+func newDownCmd() *cobra.Command {
 	var after string
 
 	cmd := &cobra.Command{
-		Use:   "stop [instance-id...]",
-		Short: "Stop running spot instances",
+		Use:     "down [instance-id...]",
+		Aliases: []string{"stop"},
+		Short:   "Stop the devbox (preserves the data volume)",
 		Long: `Stop running spot instances immediately, or schedule an auto-stop timer.
+The data volume is preserved; bring the box back with 'devbox up'.
 
-  devbox stop <id> [id...]          Stop instances immediately
-  devbox stop --after 4h [id]       SSH in and set auto-stop timer to 4h
-  devbox stop --after off [id]      SSH in and disable auto-stop timer`,
+  devbox down [id...]               Stop instances immediately
+  devbox down --after 4h [id]       SSH in and set auto-stop timer to 4h
+  devbox down --after off [id]      SSH in and disable auto-stop timer`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if after != "" {

@@ -103,7 +103,8 @@ func newVolumeCreateCmd() *cobra.Command {
 			if az == "" {
 				az = dcfg.DefaultAZ
 			}
-			return volumeCreate(cmd.Context(), dcfg, ec2Client, size, volType, iops, throughput, az, name)
+			_, err := volumeCreate(cmd.Context(), dcfg, ec2Client, size, volType, iops, throughput, az, name)
+			return err
 		},
 	}
 
@@ -117,7 +118,7 @@ func newVolumeCreateCmd() *cobra.Command {
 	return cmd
 }
 
-func volumeCreate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, size int, volType string, iops, throughput int, az, name string) error {
+func volumeCreate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, size int, volType string, iops, throughput int, az, name string) (string, error) {
 	input := &ec2.CreateVolumeInput{
 		AvailabilityZone: aws.String(az),
 		Size:             aws.Int32(int32(size)),
@@ -140,16 +141,16 @@ func volumeCreate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cli
 
 	result, err := client.CreateVolume(ctx, input)
 	if err != nil {
-		return fmt.Errorf("creating volume: %w", err)
+		return "", fmt.Errorf("creating volume: %w", err)
 	}
 	volID := *result.VolumeId
 	fmt.Printf("Created volume %s, waiting for available state...\n", volID)
 
 	if err := awsutil.PollVolumeState(ctx, client, volID, "available", VolumePollInterval, 2*time.Minute); err != nil {
-		return err
+		return volID, err
 	}
 	fmt.Printf("Volume %s is available.\n", volID)
-	return nil
+	return volID, nil
 }
 
 // --- attach ---

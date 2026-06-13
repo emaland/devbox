@@ -17,6 +17,74 @@
     ip route replace 169.254.169.254 dev ens5 table 100
   '';
 
+  # ── Initialize the data volume on first use (SAFE, exact match) ────
+  # A freshly-created EBS volume has no filesystem, so /home would not
+  # persist. This service formats ONLY the disk whose EBS volume-id
+  # matches @@DATA_VOLUME_ID@@ (rendered into this config by the devbox
+  # CLI when it attaches the data volume), and only when that disk is
+  # blank.
+  #
+  # Safety contract — it can never touch any other disk:
+  #   * It identifies the target by NVMe serial == the exact volume id,
+  #     so an ephemeral/instance-store NVMe or any other EBS volume is
+  #     never a candidate (no "blank disk" guessing).
+  #   * If a home-data filesystem already exists, it no-ops.
+  #   * If the matched disk has ANY filesystem/partition signature, it
+  #     refuses and leaves it untouched.
+  #   * If the marker is unrendered or no volume id is set, it no-ops.
+  systemd.services.devbox-format-home = {
+    description = "Initialize the home-data EBS volume if blank (exact volume-id match)";
+    before      = [ "home.mount" ];
+    requiredBy  = [ "home.mount" ];
+    unitConfig.DefaultDependencies = false;
+    serviceConfig = {
+      Type            = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = toString (pkgs.writeShellScript "devbox-format-home" ''
+        set -u
+
+        VOLID="@@DATA_VOLUME_ID@@"
+        case "$VOLID" in
+          ""|@@*@@) echo "no data volume id configured; skipping format"; exit 0 ;;
+        esac
+        # EBS exposes the volume id (minus the dash) as the NVMe serial.
+        WANT="''${VOLID//-/}"
+
+        # Already formatted → done (normal case for an existing volume).
+        if ${pkgs.util-linux}/bin/blkid -L home-data >/dev/null 2>&1; then
+          echo "home-data filesystem already exists; nothing to do"
+          exit 0
+        fi
+
+        # Find the whole disk whose NVMe serial equals our volume id.
+        target=""
+        for dev in $(${pkgs.util-linux}/bin/lsblk -dn -o NAME,TYPE | ${pkgs.gawk}/bin/awk '$2=="disk"{print $1}'); do
+          serial=$(${pkgs.util-linux}/bin/lsblk -dn -o SERIAL "/dev/$dev" 2>/dev/null | ${pkgs.coreutils}/bin/tr -d '[:space:]')
+          if [ "$serial" = "$WANT" ]; then target="$dev"; break; fi
+        done
+
+        if [ -z "$target" ]; then
+          echo "data volume $VOLID not found among attached disks (serial match); skipping"
+          exit 0
+        fi
+
+        # Never reformat a disk that already holds data.
+        if ${pkgs.util-linux}/bin/blkid "/dev/$target" >/dev/null 2>&1; then
+          echo "/dev/$target ($VOLID) already has a filesystem signature; leaving untouched"
+          exit 0
+        fi
+        children=$(${pkgs.util-linux}/bin/lsblk -n -o NAME "/dev/$target" | ${pkgs.coreutils}/bin/wc -l)
+        if [ "$children" -gt 1 ]; then
+          echo "/dev/$target ($VOLID) has partitions; leaving untouched"
+          exit 0
+        fi
+
+        echo "Formatting blank data volume $VOLID (/dev/$target) as ext4 (label home-data)"
+        ${pkgs.e2fsprogs}/bin/mkfs.ext4 -L home-data "/dev/$target"
+      '');
+    };
+  };
+
   # ── Filesystem ────────────────────────────────────────────────────
   # Mount the persistent EBS volume by label so it works across
   # instance types (device paths vary on Nitro).
@@ -121,6 +189,13 @@
     serviceConfig = {
       Type      = "oneshot";
       ExecStart = toString (pkgs.writeShellScript "tailscale-up" ''
+        KEY="@@TAILSCALE_AUTH_KEY@@"
+        # No auth key configured (unset, or marker left unrendered) →
+        # skip rather than calling `tailscale up --auth-key=` with a
+        # bogus value, which fails auth on every boot.
+        case "$KEY" in
+          ""|@@*@@) echo "no tailscale auth key configured; skipping tailscale up"; exit 0 ;;
+        esac
         # Wait for tailscaled to be ready
         sleep 2
         status=$(${pkgs.tailscale}/bin/tailscale status --json 2>/dev/null | ${pkgs.jq}/bin/jq -r '.BackendState // empty')
@@ -129,7 +204,7 @@
           exit 0
         fi
         ${pkgs.tailscale}/bin/tailscale up \
-          --auth-key=@@TAILSCALE_AUTH_KEY@@ \
+          --auth-key="$KEY" \
           --ssh \
           --hostname=dev-workstation
       '');
@@ -171,8 +246,8 @@
           -H "X-aws-ec2-metadata-token: $TOKEN" \
           http://169.254.169.254/latest/meta-data/public-ipv4)
 
-        ZONE_ID="Z09070421BNE0435R08B2"
-        RECORD_NAME="dev.frob.io"
+        ZONE_ID="@@DNS_ZONE_ID@@"
+        RECORD_NAME="@@DNS_RECORD_NAME@@"
 
         ${pkgs.awscli2}/bin/aws route53 change-resource-record-sets \
           --hosted-zone-id "$ZONE_ID" \
@@ -314,11 +389,24 @@
     wants       = [ "network-online.target" ];
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
-      Type      = "oneshot";
-      User      = "emaland";
+      Type            = "oneshot";
+      User            = "emaland";
+      # Bound the boot-time switch so a slow/large rebuild can't hang
+      # boot indefinitely (it previously ran with no limit).
+      TimeoutStartSec = "30min";
       ExecStart = toString (pkgs.writeShellScript "devbox-home-manager" ''
         export HOME=/home/emaland
-        export PATH=${lib.makeBinPath [ pkgs.home-manager pkgs.nix pkgs.git pkgs.openssh ]}:$PATH
+        export PATH=${lib.makeBinPath [ pkgs.home-manager pkgs.nix pkgs.git pkgs.openssh pkgs.util-linux ]}:$PATH
+
+        # Only run against the persistent /home volume. If it isn't
+        # mounted (e.g. the data volume failed to attach/mount), skip:
+        # running home-manager with an ephemeral HOME corrupts the nix
+        # profile (the ~/.nix-profile → /tmp/fake breakage) and wastes a
+        # heavy rebuild that won't persist.
+        if ! mountpoint -q /home; then
+          echo "/home is not a mountpoint; skipping home-manager switch"
+          exit 0
+        fi
 
         FLAKE_FILE="$HOME/.config/devbox/home-flake"
         if [ -f "$FLAKE_FILE" ]; then

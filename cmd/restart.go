@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -44,19 +43,8 @@ func restartInstances(ctx context.Context, client *ec2.Client, ids []string) err
 	}
 	fmt.Println("Stopped. Starting...")
 	// Persistent spot requests lag behind instance state — retry if not ready.
-	var result *ec2.StartInstancesOutput
-	for attempts := 0; attempts < 6; attempts++ {
-		result, err = client.StartInstances(ctx, &ec2.StartInstancesInput{
-			InstanceIds: ids,
-		})
-		if err == nil {
-			break
-		}
-		if strings.Contains(err.Error(), "IncorrectSpotRequestState") && attempts < 5 {
-			fmt.Println("Spot request not ready yet, waiting...")
-			time.Sleep(10 * time.Second)
-			continue
-		}
+	result, err := spotRetryStart(ctx, client, ids)
+	if err != nil {
 		return fmt.Errorf("starting instances: %w", err)
 	}
 	runWaiter := ec2.NewInstanceRunningWaiter(client)

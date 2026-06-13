@@ -64,9 +64,9 @@ func NewRootCmd() *cobra.Command {
 		SilenceUsage: true,
 	}
 	root.AddCommand(
-		newListCmd(),
-		newStopCmd(),
-		newStartCmd(),
+		newUpCmd(),
+		newDownCmd(),
+		newStatusCmd(),
 		newRebootCmd(),
 		newRestartCmd(),
 		newTerminateCmd(),
@@ -83,6 +83,7 @@ func NewRootCmd() *cobra.Command {
 		newVolumeCmd(),
 		newInfraCmd(),
 		newNixUpdateCmd(),
+		newConfigCmd(),
 	)
 	return root
 }
