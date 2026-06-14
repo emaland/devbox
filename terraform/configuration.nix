@@ -103,34 +103,35 @@
 
   security.sudo.wheelNeedsPassword = false;
 
-  # ── Restore configuration.nix from persistent /home volume ─────
-  # On instance replacement (resize, spawn), the root volume is new
-  # but /home survives. This copies the saved config back to
-  # /etc/nixos and rebuilds so the new instance matches the old one.
+  # ── Sync configuration.nix from the persistent /home volume ────
+  # On instance replacement (resize, spawn) the root volume is new but
+  # /home survives, so this copies the saved config back to /etc/nixos
+  # for the next rebuild.
+  #
+  # It deliberately does NOT run a nested `nixos-rebuild switch`: doing
+  # so collided with boot- and switch-time activation (the nested switch
+  # raced the real one and failed, leaving the box half-configured — no
+  # /home mount, missing users — and `nixos-rebuild` isn't even on a
+  # service's PATH, so it exited 127). Activation is handled by the
+  # devbox config push (spawn/resize) or a manual `nixos-rebuild`. This
+  # service only syncs the file and can never fail the boot.
   systemd.services.devbox-restore-nixos-config = {
-    description = "Restore configuration.nix from persistent volume";
+    description = "Sync configuration.nix from the persistent volume";
     after       = [ "home.mount" ];
     before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" "devbox-claude.service" ];
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
-      Type      = "oneshot";
+      Type            = "oneshot";
+      RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "devbox-restore-nixos-config" ''
         SAVED="/home/emaland/.config/devbox/configuration.nix"
         TARGET="/etc/nixos/configuration.nix"
-
-        if [ ! -f "$SAVED" ]; then
-          echo "No saved configuration.nix on persistent volume, skipping"
-          exit 0
+        if [ -r "$SAVED" ] && ! ${pkgs.diffutils}/bin/cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
+          echo "Syncing $TARGET from the persistent volume"
+          ${pkgs.coreutils}/bin/cp "$SAVED" "$TARGET" || true
+        else
+          echo "configuration.nix already in sync (or no readable saved copy)"
         fi
-
-        if cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
-          echo "configuration.nix already matches, skipping rebuild"
-          exit 0
-        fi
-
-        echo "Restoring configuration.nix from persistent volume"
-        cp "$SAVED" "$TARGET"
-        nixos-rebuild switch --no-build-nix
       '');
     };
   };
