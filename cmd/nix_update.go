@@ -160,13 +160,21 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// is still in flight collides on the switch-to-configuration transient unit
 	// (so /home wouldn't mount until a reboot). is-system-running --wait blocks
 	// until boot completes (running or degraded).
+	// Persist the saved /home copy BEFORE the switch (when /home is mounted) so
+	// the boot-time restore service sees a matching saved config and won't
+	// revert /etc/nixos to the older copy. nixos-rebuild switch restarts sshd
+	// and can cut this session short, so the before-switch copy is what makes
+	// the update stick on an existing box; the after-switch copy covers a fresh
+	// box whose /home only mounts during the switch.
 	fmt.Println("Waiting for boot to settle, then running nixos-rebuild switch...")
-	remoteCmd := `sudo systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
-		`sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
-		`sudo nixos-rebuild switch; ` +
-		`sudo mkdir -p /home/emaland/.config/devbox && ` +
+	persist := `sudo mkdir -p /home/emaland/.config/devbox && ` +
 		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix && ` +
 		`sudo chown -R emaland:users /home/emaland/.config/devbox`
+	remoteCmd := `sudo systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
+		`sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
+		`if mountpoint -q /home 2>/dev/null; then ` + persist + `; fi; ` +
+		`sudo nixos-rebuild switch; ` +
+		persist
 	sshArgs := append([]string{}, sshOpts...)
 	sshArgs = append(sshArgs, sshTarget, remoteCmd)
 	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
