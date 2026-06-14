@@ -155,8 +155,14 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// survives instance replacements, and rebuild.  nixos-rebuild switch
 	// exits non-zero if any service fails during activation, even when
 	// the config itself applied successfully — we treat that as a warning.
-	fmt.Println("Running nixos-rebuild switch...")
-	remoteCmd := `sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
+	// Wait for the box to finish its initial boot before switching. SSH comes
+	// up early, and running `nixos-rebuild switch` while first-boot activation
+	// is still in flight collides on the switch-to-configuration transient unit
+	// (so /home wouldn't mount until a reboot). is-system-running --wait blocks
+	// until boot completes (running or degraded).
+	fmt.Println("Waiting for boot to settle, then running nixos-rebuild switch...")
+	remoteCmd := `sudo systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
+		`sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
 		`sudo nixos-rebuild switch; ` +
 		`sudo mkdir -p /home/emaland/.config/devbox && ` +
 		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix && ` +
