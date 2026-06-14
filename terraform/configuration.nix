@@ -6,16 +6,69 @@
   networking.hostName = "dev-workstation";
   networking.dhcpcd.extraConfig = "nohook hostname";
 
+  # ── Stop amazon-init from clobbering us on every reboot ────────────
+  # The amazon-image module's amazon-init.service unconditionally copies
+  # the EC2 user_data over /etc/nixos/configuration.nix and runs
+  # `nixos-rebuild switch` on EVERY boot — there is no "already applied"
+  # guard. Because devbox uses a tiny SSH-only *stub* as user_data (the
+  # full config is >16 KB, the user_data limit, so it's pushed over SSH
+  # instead), letting amazon-init run on a reboot reverts the system to
+  # that stub: it overwrites this file, drops the emaland user, and
+  # unmounts /home. amazon-init is only needed for the first-boot SSH
+  # bootstrap; once this hardened config is active we never want it to
+  # run again. Detaching it from multi-user.target leaves the unit
+  # present (runnable by hand) but stops it from starting at boot.
+  systemd.services.amazon-init.wantedBy = lib.mkForce [ ];
+
   # Ensure IMDS is always reachable via the primary interface.
   # Docker/Tailscale veth interfaces can steal the 169.254.0.0/16
   # link-local route from the main table. A policy routing rule with
   # high priority (low number) forces IMDS traffic to a dedicated
   # routing table that only has the ens5 route — immune to other
   # interfaces adding/removing routes in the main table.
-  networking.localCommands = ''
-    ip rule add to 169.254.169.254 lookup 100 priority 100 2>/dev/null || true
-    ip route replace 169.254.169.254 dev ens5 table 100
-  '';
+  #
+  # This must run AFTER the primary interface is up. The old approach
+  # (networking.localCommands) ran inside network-setup before ens5 had
+  # carrier, so `ip route replace ... dev ens5` failed with "Device for
+  # nexthop is not up", left table 100 EMPTY, and the boot was degraded.
+  # With an empty table 100 the rule falls through to the main table,
+  # where Docker's veth 169.254.0.0/16 route wins — silently breaking
+  # IMDS (and update-route53, auto-stop, etc.) once containers start.
+  # A oneshot ordered after network-online.target, waiting for the link
+  # and tolerating a transient failure, fixes this. Once table 100 holds
+  # the IMDS route, the rule keeps IMDS pinned to ens5 no matter what
+  # Docker/Tailscale later do to the main table.
+  systemd.services.devbox-imds-route = {
+    description = "Pin IMDS (169.254.169.254) to the primary interface";
+    after       = [ "network-online.target" ];
+    wants       = [ "network-online.target" ];
+    wantedBy    = [ "multi-user.target" ];
+    serviceConfig = {
+      Type            = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = toString (pkgs.writeShellScript "devbox-imds-route" ''
+        set -u
+        IF=ens5
+        # Wait for the primary interface to come up (carrier present).
+        for _ in $(seq 1 30); do
+          if ${pkgs.iproute2}/bin/ip link show "$IF" up 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q "state UP"; then
+            break
+          fi
+          sleep 1
+        done
+        ${pkgs.iproute2}/bin/ip rule add to 169.254.169.254 lookup 100 priority 100 2>/dev/null || true
+        # Retry the route a few times in case carrier is still settling.
+        for _ in $(seq 1 10); do
+          if ${pkgs.iproute2}/bin/ip route replace 169.254.169.254 dev "$IF" table 100; then
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "warning: could not pin IMDS route to $IF" >&2
+        exit 0
+      '');
+    };
+  };
 
   # ── Initialize the data volume on first use (SAFE, exact match) ────
   # A freshly-created EBS volume has no filesystem, so /home would not
