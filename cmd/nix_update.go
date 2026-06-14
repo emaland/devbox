@@ -167,12 +167,17 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// the update stick on an existing box; the after-switch copy covers a fresh
 	// box whose /home only mounts during the switch.
 	fmt.Println("Waiting for boot to settle, then running nixos-rebuild switch...")
-	persist := `sudo mkdir -p /home/emaland/.config/devbox && ` +
-		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix && ` +
-		`sudo chown -R emaland:users /home/emaland/.config/devbox`
+	// Persist the saved /home copy BEFORE the switch so the boot-time restore
+	// service sees a matching saved config and skips (otherwise it reverts
+	// /etc/nixos to the older copy when the switch re-triggers it). cp is the
+	// critical step; chown is best-effort (emaland may not exist yet on a fresh
+	// box, where this copy lands on the not-yet-mounted /home and is harmless).
+	persist := `sudo mkdir -p /home/emaland/.config/devbox; ` +
+		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix; ` +
+		`sudo chown -R emaland:users /home/emaland/.config/devbox 2>/dev/null || true`
 	remoteCmd := `sudo systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
-		`sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix && ` +
-		`if mountpoint -q /home 2>/dev/null; then ` + persist + `; fi; ` +
+		`sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix; ` +
+		persist + `; ` +
 		`sudo nixos-rebuild switch; ` +
 		persist
 	sshArgs := append([]string{}, sshOpts...)
