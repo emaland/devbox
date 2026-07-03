@@ -152,9 +152,30 @@
     isNormalUser = true;
     uid          = 1001;
     extraGroups  = [ "wheel" "docker" ];
+    # Extra authorized keys, in addition to the EC2 key-pair key that
+    # devbox-fetch-ssh-key installs into ~/.ssh/authorized_keys each boot.
+    # These are written to /etc/ssh/authorized_keys.d/emaland — a separate
+    # file sshd also checks — so the fetch service never clobbers them.
+    openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAz5otg2dmDpJbCO75OlSZZPrP1vIRCv1sVNWeOovsMR emaland@ipad"
+    ];
   };
 
   security.sudo.wheelNeedsPassword = false;
+
+  # ── Run generic dynamically-linked binaries (nix-ld) ──────────────
+  # Prebuilt Linux binaries installed outside Nix — notably Claude Code's
+  # native self-updating binary in ~/.local/share/claude — expect a
+  # loader at /lib64/ld-linux-x86-64.so.2. NixOS ships only a stub there
+  # that prints "cannot run dynamically linked executables". nix-ld
+  # replaces it with a real loader plus a library search path, so those
+  # binaries just work.
+  programs.nix-ld.enable = true;
+  programs.nix-ld.libraries = with pkgs; [
+    stdenv.cc.cc.lib
+    zlib
+    openssl
+  ];
 
   # ── Sync configuration.nix from the persistent /home volume ────
   # On instance replacement (resize, spawn) the root volume is new but
