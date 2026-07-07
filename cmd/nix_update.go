@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -12,6 +13,11 @@ import (
 
 	"github.com/emaland/devbox/internal/config"
 )
+
+// nixupStartMarker is echoed at the top of the remote apply script so the
+// completion poller can show only the current run's journal, not the history
+// journalctl -u keeps for prior runs of the (reused) transient unit name.
+const nixupStartMarker = "@@DEVBOX-NIXUP-START@@"
 
 func newNixUpdateCmd() *cobra.Command {
 	var nixFile string
@@ -184,21 +190,91 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// /etc/nixos to the older copy when the switch re-triggers it). cp is the
 	// critical step; chown is best-effort (emaland may not exist yet on a fresh
 	// box, where this copy lands on the not-yet-mounted /home and is harmless).
-	persist := `sudo mkdir -p /home/emaland/.config/devbox; ` +
-		`sudo cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix; ` +
-		`sudo chown -R emaland:users /home/emaland/.config/devbox 2>/dev/null || true`
-	remoteCmd := `sudo systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
-		`sudo cp /tmp/configuration.nix /etc/nixos/configuration.nix; ` +
+	// This runs inside a systemd-run unit as root with a minimal PATH, so no
+	// sudo (unavailable there, and redundant) and set PATH explicitly so
+	// nixos-rebuild/cp/etc. resolve.
+	persist := `mkdir -p /home/emaland/.config/devbox; ` +
+		`cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix; ` +
+		`chown -R emaland:users /home/emaland/.config/devbox 2>/dev/null || true`
+	// The apply script captures nixos-rebuild's own exit code (the trailing
+	// persist would otherwise mask it) and writes it to a marker file that
+	// signals completion to the poller below. It sources /etc/set-environment
+	// for NIX_PATH etc. (the transient unit's env is otherwise minimal, so
+	// nixos-rebuild can't find <nixpkgs/nixos>), and emits a start marker so
+	// the poller can show only the current run's log, not prior units' history.
+	applyScript := `echo ` + nixupStartMarker + `; ` +
+		`. /etc/set-environment 2>/dev/null || true; ` +
+		`export PATH=/run/wrappers/bin:/run/current-system/sw/bin:$PATH; ` +
+		`systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
+		`cp /tmp/configuration.nix /etc/nixos/configuration.nix; ` +
 		persist + `; ` +
-		`sudo nixos-rebuild switch; ` +
-		persist
-	sshArgs := append([]string{}, sshOpts...)
-	sshArgs = append(sshArgs, sshTarget, remoteCmd)
-	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
-	sshCmd.Stdout = os.Stdout
-	sshCmd.Stderr = os.Stderr
-	if err := sshCmd.Run(); err != nil {
-		fmt.Printf("\nWarning: nixos-rebuild reported errors (likely service failures, not build errors).\n")
+		`nixos-rebuild switch; rc=$?; ` +
+		persist + `; ` +
+		`echo "$rc" | tee /tmp/devbox-nixup.rc >/dev/null`
+
+	// Run the switch as a transient systemd unit and poll for completion,
+	// instead of holding one long SSH channel open across the whole rebuild.
+	// nixos-rebuild switch restarts sshd mid-activation; a synchronous channel
+	// has no keepalive and stalls on the dropped connection for many minutes.
+	// Detaching it into `systemd-run` lets the switch finish independently while
+	// we watch it over short, keepalive'd connections that reconnect freely.
+	// applyScript contains no single quotes, so single-quoting it is safe.
+	const unit = "devbox-nixup"
+	launch := `sudo systemctl reset-failed ` + unit + ` 2>/dev/null; ` +
+		`sudo rm -f /tmp/devbox-nixup.rc; ` +
+		`sudo systemd-run --unit=` + unit + ` --collect /bin/sh -c '` + applyScript + `'`
+	launchArgs := append([]string{}, sshOpts...)
+	launchArgs = append(launchArgs, sshTarget, launch)
+	if out, err := exec.CommandContext(ctx, "ssh", launchArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("starting remote nixos-rebuild: %w\n%s", err, out)
+	}
+
+	fmt.Println("Running nixos-rebuild switch (this can take several minutes on a fresh box)...")
+	pollOpts := append([]string{}, sshOpts...)
+	pollOpts = append(pollOpts,
+		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+		"-o", "ConnectTimeout=10")
+	query := `journalctl -u ` + unit + ` -o cat --no-pager 2>/dev/null; ` +
+		`echo "@@RC@@"; cat /tmp/devbox-nixup.rc 2>/dev/null`
+	printed := 0
+	deadline := time.Now().Add(30 * time.Minute)
+	for {
+		args := append([]string{}, pollOpts...)
+		args = append(args, sshTarget, query)
+		out, _ := exec.CommandContext(ctx, "ssh", args...).CombinedOutput()
+		logPart, rcPart, found := strings.Cut(string(out), "@@RC@@")
+		if found {
+			// journalctl -u shows every past run of this unit name; skip to the
+			// last start marker so we only stream the current invocation (and
+			// print nothing until that marker appears).
+			lines := strings.Split(strings.TrimRight(logPart, "\n"), "\n")
+			lastStart := -1
+			for i, l := range lines {
+				if strings.Contains(l, nixupStartMarker) {
+					lastStart = i
+				}
+			}
+			if lastStart >= 0 {
+				if printed < lastStart+1 {
+					printed = lastStart + 1
+				}
+				for ; printed < len(lines); printed++ {
+					if lines[printed] != "" {
+						fmt.Println("  " + lines[printed])
+					}
+				}
+			}
+			if rc := strings.TrimSpace(rcPart); rc != "" {
+				if rc != "0" {
+					fmt.Printf("\nWarning: nixos-rebuild exited %s (usually service-activation warnings, not a build failure).\n", rc)
+				}
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after 30m waiting for nixos-rebuild on %s; it may still be running (check: journalctl -u %s)", instanceID, unit)
+		}
+		time.Sleep(10 * time.Second)
 	}
 
 	fmt.Printf("NixOS configuration updated on %s.\n", instanceID)
