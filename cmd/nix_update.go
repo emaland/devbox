@@ -76,10 +76,15 @@ func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		return err
 	}
 
-	// Wait for SSH to become available on fresh instance
+	// Wait for SSH to become available on the freshly-booted stub. A cold
+	// instance can take a couple of minutes to bring up sshd, so poll for up
+	// to 5 minutes; returning early here (instead of charging ahead into scp)
+	// gives the caller a clear "SSH never came up" error rather than a cryptic
+	// scp failure.
 	fmt.Println("Waiting for SSH to become available...")
 	keyPath := dcfg.ResolveSSHKeyPath()
-	for i := 0; i < 12; i++ {
+	sshReady := false
+	for i := 0; i < 30; i++ {
 		testCmd := exec.CommandContext(ctx, "ssh",
 			"-i", keyPath,
 			"-o", "StrictHostKeyChecking=no",
@@ -88,9 +93,16 @@ func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 			"root@"+ip, "true",
 		)
 		if testCmd.Run() == nil {
+			sshReady = true
 			break
 		}
-		time.Sleep(5 * time.Second)
+		if i%3 == 2 {
+			fmt.Printf("  still waiting for SSH on %s (%ds elapsed)...\n", ip, (i+1)*10)
+		}
+		time.Sleep(10 * time.Second)
+	}
+	if !sshReady {
+		return fmt.Errorf("SSH on %s (%s) did not become available within 5 minutes", instanceID, ip)
 	}
 
 	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root", volumeID)

@@ -492,9 +492,17 @@ func driveResize(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Clie
 
 	// → done: push the full config (the box booted a stub), update DNS, clear tags.
 	if resizeAfter(cur, "done") {
+		// The config push is the second half of the two-phase boot: without it
+		// the box stays on the SSH-only stub (no emaland user, no /home mount,
+		// no services). If it fails, DO NOT clear the resize tags — leaving them
+		// keeps the swap resumable via `devbox resize --resume`, and we return an
+		// error so the failure is loud instead of a warning that scrolls past
+		// (especially under `recover --yes`).
 		if err := pushNixConfig(ctx, dcfg, client, plan.newID, homeVolumeID(plan.volumes)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to push NixOS config: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Run 'devbox nix-update' manually once the instance is ready.")
+			return fmt.Errorf("pushing NixOS config to new instance %s: %w\n"+
+				"The volume swap is complete but the box is still on the SSH-only stub.\n"+
+				"Finish it with: devbox resize --resume   (or: devbox nix-update %s)",
+				plan.newID, err, plan.newID)
 		}
 		if err := updateDNS(ctx, dcfg, client, r53client, plan.newID, dcfg.DNSName); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: DNS update failed: %v\n", err)
