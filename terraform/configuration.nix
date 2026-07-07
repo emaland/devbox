@@ -374,6 +374,67 @@
     };
   };
 
+  # ── Slack boot notification ─────────────────────────────────────
+  # On every boot, posts the instance type / AZ / IP and current spot
+  # price to Slack. The webhook URL is read from /home/emaland/.secrets
+  # (export SLACK_WEBHOOK_URL=...) so it never lives in this repo; if it
+  # is unset the service logs and no-ops. Needs ec2:DescribeSpotPriceHistory
+  # on the instance role (granted by the ec2-selfmanage policy).
+  systemd.services.devbox-slack-notify = {
+    description = "Notify Slack that the devbox booted (with cost)";
+    after       = [ "network-online.target" "update-route53.service" ];
+    wants       = [ "network-online.target" ];
+    wantedBy    = [ "multi-user.target" ];
+    serviceConfig = {
+      Type      = "oneshot";
+      ExecStart = toString (pkgs.writeShellScript "devbox-slack-notify" ''
+        SECRETS=/home/emaland/.secrets
+        [ -f "$SECRETS" ] && . "$SECRETS"
+        if [ -z "''${SLACK_WEBHOOK_URL:-}" ]; then
+          echo "SLACK_WEBHOOK_URL not set in $SECRETS; skipping Slack notify"
+          exit 0
+        fi
+
+        TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
+          "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+        imds() { ${pkgs.curl}/bin/curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+          "http://169.254.169.254/latest/meta-data/$1"; }
+        ITYPE=$(imds instance-type)
+        AZ=$(imds placement/availability-zone)
+        REGION=''${AZ%?}
+
+        # NB: no --max-items — it enables the CLI paginator, which prints the
+        # NextToken ("None") as a second output line and corrupts $PRICE.
+        # --start-time now bounds the result to the current price point.
+        PRICE=$(${pkgs.awscli2}/bin/aws ec2 describe-spot-price-history \
+          --region "$REGION" --instance-types "$ITYPE" \
+          --availability-zone "$AZ" --product-descriptions "Linux/UNIX" \
+          --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --query 'SpotPriceHistory[0].SpotPrice' \
+          --output text 2>/dev/null | head -n1)
+        [ "$PRICE" = "None" ] && PRICE=""
+
+        if [ -n "$PRICE" ]; then
+          DAILY=$(${pkgs.gawk}/bin/awk "BEGIN{printf \"%.2f\", $PRICE*24}")
+          COST=":  \$$PRICE/hr (~\$$DAILY/day at 24h)"
+        else
+          COST=" (spot price unavailable)"
+        fi
+
+        MSG=":computer: *devbox booted* — \`$(${pkgs.nettools}/bin/hostname)\`
+• type: \`$ITYPE\`  ($AZ)
+• spot$COST"
+
+        PAYLOAD=$(${pkgs.jq}/bin/jq -n --arg t "$MSG" '{text:$t}')
+        ${pkgs.curl}/bin/curl -s -X POST -H 'Content-type: application/json' \
+          --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" >/dev/null \
+          && echo "posted boot notification to Slack" \
+          || echo "warning: Slack POST failed" >&2
+      '');
+    };
+  };
+
   # ── Boot history MOTD ───────────────────────────────────────────
   # Shows last 20 boot-history entries on interactive login.
   environment.etc."profile.d/boot-history.sh" = {
@@ -518,9 +579,32 @@
           exit 0
         fi
 
-        # Kill any leftover session from before the reboot
-        ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
+        # Start the tmux server so the user's tmux config loads — this is
+        # what re-arms tmux-continuum's periodic session saving.
+        ${pkgs.tmux}/bin/tmux start-server 2>/dev/null || true
 
+        # Restore the tmux sessions/windows/panes saved before the reboot.
+        # tmux-continuum's own auto-restore only triggers when a client
+        # attaches, so on a headless boot we invoke tmux-resurrect's restore
+        # explicitly. The restore script is derived from whatever resurrect
+        # the user's tmux config loaded, so it survives plugin updates.
+        TMUX_CONF="$HOME/.config/tmux/tmux.conf"
+        if [ -f "$TMUX_CONF" ]; then
+          RES_TMUX=$(${pkgs.gnugrep}/bin/grep -oE \
+            '/nix/store/[^ ]*resurrect[^ ]*/resurrect\.tmux' "$TMUX_CONF" | head -1)
+          if [ -n "$RES_TMUX" ]; then
+            RESTORE="$(dirname "$RES_TMUX")/scripts/restore.sh"
+            if [ -x "$RESTORE" ]; then
+              ${pkgs.tmux}/bin/tmux run-shell "$RESTORE"
+              sleep 3
+              echo "Restored saved tmux sessions"
+            fi
+          fi
+        fi
+
+        # Ensure a dedicated claude session (recreate so it always resumes the
+        # latest conversation with --continue). Separate from restored sessions.
+        ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
         ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
           "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue 'continue from where you left off'"
 

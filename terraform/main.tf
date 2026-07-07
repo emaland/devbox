@@ -97,6 +97,35 @@ resource "aws_iam_role_policy" "route53_update" {
   })
 }
 
+# Lets the box stop itself (auto-stop scheduler) and read spot prices
+# (boot-time Slack cost notification). StopInstances is scoped by the
+# devbox-managed tag so the role can only stop devbox instances.
+resource "aws_iam_role_policy" "ec2_selfmanage" {
+  name = "ec2-selfmanage"
+  role = aws_iam_role.dev.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "StopSelf"
+        Effect   = "Allow"
+        Action   = "ec2:StopInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/devbox-managed" = "true" }
+        }
+      },
+      {
+        Sid      = "SpotPrices"
+        Effect   = "Allow"
+        Action   = "ec2:DescribeSpotPriceHistory"
+        Resource = "*"
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.dev.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
