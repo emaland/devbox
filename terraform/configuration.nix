@@ -20,6 +20,26 @@
   # present (runnable by hand) but stops it from starting at boot.
   systemd.services.amazon-init.wantedBy = lib.mkForce [ ];
 
+  # ── Pin the transient hostname ────────────────────────────────────
+  # networking.hostName sets the *static* hostname (/etc/hostname), but on
+  # a fresh instance amazon-init's first-boot stub rebuild (and/or DHCP)
+  # sets the *transient* hostname to the EC2 default (ip-172-31-x-x), which
+  # overrides the static one for `hostname`/uname until something resets
+  # it — and nothing did, so the box kept showing ip-172-31-…. This pins
+  # the transient hostname back to the static one on every boot. (plain
+  # `hostname` works on NixOS; `hostnamectl set-hostname` is blocked here.)
+  systemd.services.devbox-fix-hostname = {
+    description = "Pin transient hostname to ${config.networking.hostName}";
+    after       = [ "network-online.target" ];
+    wants       = [ "network-online.target" ];
+    wantedBy    = [ "multi-user.target" ];
+    serviceConfig = {
+      Type            = "oneshot";
+      RemainAfterExit = true;
+      ExecStart       = "${pkgs.nettools}/bin/hostname ${config.networking.hostName}";
+    };
+  };
+
   # Ensure IMDS is always reachable via the primary interface.
   # Docker/Tailscale veth interfaces can steal the 169.254.0.0/16
   # link-local route from the main table. A policy routing rule with
