@@ -318,6 +318,12 @@
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
       Type      = "oneshot";
+      # Stay active after running so nixos-rebuild switch doesn't re-run this on
+      # every config deploy. Re-running mid-switch races the IMDS policy route
+      # (which switch-to-configuration is also restarting), so it burns its full
+      # ~4min IMDS-credential retry and stalls the whole switch. The public IP
+      # only changes on a real boot, where this runs fresh anyway.
+      RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "update-route53" ''
         # Wait for IMDS credentials to become available (IAM role
         # propagation can lag behind network-online.target).
@@ -371,6 +377,9 @@
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
       Type      = "oneshot";
+      # Stay active after running so nixos-rebuild switch doesn't re-log a
+      # spurious "boot" line to /var/log/boot-history on every config deploy.
+      RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "devbox-boot-log" ''
         TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
           "http://169.254.169.254/latest/api/token" \
@@ -407,6 +416,11 @@
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
       Type      = "oneshot";
+      # Stay "active (exited)" after running so nixos-rebuild switch does not
+      # re-trigger this on every config deploy — only a real reboot (fresh unit
+      # state) fires it again. Without this, each `devbox nix-update` produced a
+      # spurious "devbox booted" Slack alert.
+      RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "devbox-slack-notify" ''
         SECRETS=/home/emaland/.secrets
         [ -f "$SECRETS" ] && . "$SECRETS"
@@ -478,14 +492,40 @@
   };
 
   # ── Auto-stop service ──────────────────────────────────────────
-  # Logs the auto-stop event and stops the instance via the EC2 API.
+  # Fires when the auto-stop timer expires. Stops the instance via the EC2
+  # API — but only if no one is using the box. If a user is logged in or
+  # connected, it defers and re-checks shortly, so an active session is
+  # never yanked out from under you; the box stops only after you've left.
   systemd.services.devbox-autostop = {
-    description = "Auto-stop this instance";
+    description = "Auto-stop this instance when idle";
     serviceConfig = {
       Type      = "oneshot";
       ExecStart = toString (pkgs.writeShellScript "devbox-autostop" ''
-        echo "$(date '+%Y-%m-%d %H:%M:%S') | auto-stop | timer expired" \
-          >> /var/log/boot-history
+        LOG=/var/log/boot-history
+        stamp() { ${pkgs.coreutils}/bin/date '+%Y-%m-%d %H:%M:%S'; }
+
+        # "Active" = a logged-in interactive session (who/utmp, covers SSH and
+        # Tailscale SSH) or an established inbound SSH connection on :22.
+        ACTIVE=""
+        if ${pkgs.coreutils}/bin/who 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q .; then
+          ACTIVE="login session"
+        elif ${pkgs.iproute2}/bin/ss -tnH state established 2>/dev/null \
+             | ${pkgs.gnugrep}/bin/grep -qE ':22[[:space:]]'; then
+          ACTIVE="ssh connection"
+        fi
+
+        if [ -n "$ACTIVE" ]; then
+          echo "$(stamp) | auto-stop | deferred ($ACTIVE)" >> "$LOG"
+          # Re-check soon so the box stops promptly once the user disconnects.
+          ${pkgs.systemd}/bin/systemctl stop devbox-autostop-poll.timer devbox-autostop-poll.service 2>/dev/null || true
+          ${pkgs.systemd}/bin/systemctl reset-failed devbox-autostop-poll.timer devbox-autostop-poll.service 2>/dev/null || true
+          ${pkgs.systemd}/bin/systemd-run --collect --unit=devbox-autostop-poll \
+            --on-active=20min \
+            ${pkgs.systemd}/bin/systemctl start devbox-autostop.service
+          exit 0
+        fi
+
+        echo "$(stamp) | auto-stop | timer expired (idle)" >> "$LOG"
         TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
           "http://169.254.169.254/latest/api/token" \
           -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
