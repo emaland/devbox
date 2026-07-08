@@ -196,21 +196,55 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	persist := `mkdir -p /home/emaland/.config/devbox; ` +
 		`cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix; ` +
 		`chown -R emaland:users /home/emaland/.config/devbox 2>/dev/null || true`
+	// Reuse a local Nix binary cache kept on the persistent /home volume so a
+	// fresh box (post resize/recover) substitutes prebuilt paths from local gp3
+	// disk instead of re-downloading the whole closure from cache.nixos.org.
+	//
+	// The store lives on the *root* volume, which is new on every swap; only
+	// /home is recycled — so we stage the closure there. On a fresh box /home is
+	// not mounted yet, so we mount the data volume at /home first (its canonical
+	// mountpoint, which the switch's home.mount then finds already satisfied) —
+	// that both exposes the cache for substitution and avoids a second mount of
+	// the same device. If a cache is present we point the switch at it; the paths
+	// we stage are unsigned, so require-sigs=false (our own volume). After the
+	// switch we (re)populate the cache from the running system for the next fresh
+	// box — regardless of the switch's exit code, since a flaky activation-time
+	// service (e.g. update-route53) still yields a valid /run/current-system.
+	// The whole thing is best-effort: any failure just falls back to the network.
+	cacheDir := "/home/.nix-cache"
+	// cachePre: on a fresh box /home is not mounted yet, so mount the data volume
+	// at /home (its canonical mountpoint, which the switch's home.mount then finds
+	// already satisfied) — that exposes the cache and avoids a second mount of the
+	// same device. If a cache is present, point the switch at it; the staged paths
+	// are unsigned, so require-sigs=false (our own volume).
+	cachePre := `if ! grep -qs " /home " /proc/mounts; then mount /dev/disk/by-label/home-data /home 2>/dev/null || true; fi; ` +
+		`OPT=""; if [ -d ` + cacheDir + ` ]; then OPT="--option extra-substituters file://` + cacheDir + ` --option extra-trusted-substituters file://` + cacheDir + ` --option require-sigs false"; echo "devbox: substituting from local nix cache ` + cacheDir + `"; fi`
+	// cachePost: repopulate the cache for the next fresh box. This runs AFTER the
+	// rc marker is written, so the client returns as soon as the switch is done —
+	// the first-time nix copy (~GBs) then finishes in the background inside the
+	// unit. Populated regardless of the switch's exit code (a flaky activation-time
+	// service still yields a valid /run/current-system). Best-effort throughout.
+	cachePost := `if grep -qs " /home " /proc/mounts; then echo "devbox: updating local nix cache in background"; mkdir -p ` + cacheDir + `; nix copy --to "file://` + cacheDir + `" /run/current-system 2>/dev/null || true; chown -R emaland:users ` + cacheDir + ` 2>/dev/null || true; fi`
+
 	// The apply script captures nixos-rebuild's own exit code (the trailing
 	// persist would otherwise mask it) and writes it to a marker file that
 	// signals completion to the poller below. It sources /etc/set-environment
 	// for NIX_PATH etc. (the transient unit's env is otherwise minimal, so
 	// nixos-rebuild can't find <nixpkgs/nixos>), and emits a start marker so
 	// the poller can show only the current run's log, not prior units' history.
+	// The rc marker is written before cachePost so the client isn't blocked on the
+	// slow first-time cache copy.
 	applyScript := `echo ` + nixupStartMarker + `; ` +
 		`. /etc/set-environment 2>/dev/null || true; ` +
 		`export PATH=/run/wrappers/bin:/run/current-system/sw/bin:$PATH; ` +
 		`systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
 		`cp /tmp/configuration.nix /etc/nixos/configuration.nix; ` +
 		persist + `; ` +
-		`nixos-rebuild switch; rc=$?; ` +
+		cachePre + `; ` +
+		`nixos-rebuild switch $OPT; rc=$?; ` +
 		persist + `; ` +
-		`echo "$rc" | tee /tmp/devbox-nixup.rc >/dev/null`
+		`echo "$rc" | tee /tmp/devbox-nixup.rc >/dev/null; ` +
+		cachePost
 
 	// Run the switch as a transient systemd unit and poll for completion,
 	// instead of holding one long SSH channel open across the whole rebuild.
@@ -220,7 +254,8 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// we watch it over short, keepalive'd connections that reconnect freely.
 	// applyScript contains no single quotes, so single-quoting it is safe.
 	const unit = "devbox-nixup"
-	launch := `sudo systemctl reset-failed ` + unit + ` 2>/dev/null; ` +
+	launch := `sudo systemctl stop ` + unit + ` 2>/dev/null; ` +
+		`sudo systemctl reset-failed ` + unit + ` 2>/dev/null; ` +
 		`sudo rm -f /tmp/devbox-nixup.rc; ` +
 		`sudo systemd-run --unit=` + unit + ` --collect /bin/sh -c '` + applyScript + `'`
 	launchArgs := append([]string{}, sshOpts...)
