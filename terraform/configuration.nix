@@ -646,19 +646,22 @@
         # Restore the tmux sessions/windows/panes saved before the reboot.
         # tmux-continuum's own auto-restore only triggers when a client
         # attaches, so on a headless boot we invoke tmux-resurrect's restore
-        # explicitly. The restore script is derived from whatever resurrect
-        # the user's tmux config loaded, so it survives plugin updates.
-        TMUX_CONF="$HOME/.config/tmux/tmux.conf"
-        if [ -f "$TMUX_CONF" ]; then
-          RES_TMUX=$(${pkgs.gnugrep}/bin/grep -oE \
-            '/nix/store/[^ ]*resurrect[^ ]*/resurrect\.tmux' "$TMUX_CONF" | head -1)
-          if [ -n "$RES_TMUX" ]; then
-            RESTORE="$(dirname "$RES_TMUX")/scripts/restore.sh"
-            if [ -x "$RESTORE" ]; then
-              ${pkgs.tmux}/bin/tmux run-shell "$RESTORE"
-              sleep 3
-              echo "Restored saved tmux sessions"
-            fi
+        # explicitly. Check system config (/etc/tmux.conf, written by the
+        # programs.tmux NixOS module) then user config as a fallback.
+        RES_TMUX=""
+        for TMUX_CONF in /etc/tmux.conf "$HOME/.config/tmux/tmux.conf" "$HOME/.tmux.conf"; do
+          if [ -f "$TMUX_CONF" ]; then
+            RES_TMUX=$(${pkgs.gnugrep}/bin/grep -oE \
+              '/nix/store/[^ ]*resurrect[^ ]*/resurrect\.tmux' "$TMUX_CONF" | head -1)
+            [ -n "$RES_TMUX" ] && break
+          fi
+        done
+        if [ -n "$RES_TMUX" ]; then
+          RESTORE="$(dirname "$RES_TMUX")/scripts/restore.sh"
+          if [ -x "$RESTORE" ]; then
+            ${pkgs.tmux}/bin/tmux run-shell "$RESTORE"
+            sleep 3
+            echo "Restored saved tmux sessions"
           fi
         fi
 
@@ -671,6 +674,27 @@
         echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
       '');
     };
+  };
+
+  # ── tmux with session save/restore ───────────────────────────────
+  # resurrect saves sessions manually (prefix + Ctrl-s) and on shutdown.
+  # continuum auto-saves every 15 minutes and auto-restores on server start.
+  programs.tmux = {
+    enable  = true;
+    plugins = with pkgs.tmuxPlugins; [
+      sensible
+      resurrect
+      {
+        plugin = continuum;
+        extraConfig = ''
+          set -g @continuum-restore 'on'
+          set -g @continuum-save-interval '15'
+        '';
+      }
+    ];
+    extraConfig = ''
+      set -g @resurrect-capture-pane-contents 'on'
+    '';
   };
 
   # ── SSM Agent ─────────────────────────────────────────────────────
@@ -698,7 +722,6 @@
     curl
     wget
     htop
-    tmux
     vim
     jq
     python3
