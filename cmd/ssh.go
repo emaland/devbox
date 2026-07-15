@@ -44,7 +44,7 @@ func autoDetectRunningInstance(ctx context.Context, client *ec2.Client) (string,
 func autoDetectInstance(ctx context.Context, client *ec2.Client, state string) (string, error) {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
-			{Name: aws.String("instance-lifecycle"), Values: []string{"spot"}},
+			{Name: aws.String("tag:devbox-managed"), Values: []string{"true"}},
 			{Name: aws.String("instance-state-name"), Values: []string{state}},
 		},
 	})
@@ -58,7 +58,7 @@ func autoDetectInstance(ctx context.Context, client *ec2.Client, state string) (
 		}
 	}
 	if len(ids) == 0 {
-		return "", fmt.Errorf("no %s spot instances found", state)
+		return "", fmt.Errorf("no %s devbox instances found", state)
 	}
 	if len(ids) > 1 {
 		return "", fmt.Errorf("multiple %s instances found (%s) — specify one explicitly", state, strings.Join(ids, ", "))

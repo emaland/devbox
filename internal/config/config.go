@@ -28,6 +28,7 @@ type DevboxConfig struct {
 	TailscaleAuthKey string `json:"tailscale_auth_key"`
 	DataVolumeName   string `json:"data_volume_name"`
 	DataVolumeSize   int    `json:"data_volume_size"`
+	UseSpot          bool   `json:"use_spot"`
 }
 
 // secretKeys are config keys whose values should be masked when displayed.
@@ -55,6 +56,7 @@ func DefaultConfig() DevboxConfig {
 		NixOSAMIPattern: "nixos/*",
 		DataVolumeName:  "dev-data-volume",
 		DataVolumeSize:  512,
+		UseSpot:         true,
 	}
 }
 

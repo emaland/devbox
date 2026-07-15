@@ -55,13 +55,13 @@ func startInstances(ctx context.Context, client *ec2.Client, ids []string) error
 	return nil
 }
 
-// autoDetectBox finds the single managed devbox spot instance in any active
-// state. Returns ("", "", nil) when none exist so callers can decide whether
-// that's an error (resize) or a cue to create one (up).
+// autoDetectBox finds the single managed devbox instance (spot or on-demand)
+// in any active state. Returns ("", "", nil) when none exist so callers can
+// decide whether that's an error (resize) or a cue to create one (up).
 func autoDetectBox(ctx context.Context, client *ec2.Client) (string, types.InstanceStateName, error) {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
-			{Name: aws.String("instance-lifecycle"), Values: []string{"spot"}},
+			{Name: aws.String("tag:devbox-managed"), Values: []string{"true"}},
 			{Name: aws.String("instance-state-name"), Values: []string{"running", "stopped", "stopping", "pending"}},
 		},
 	})

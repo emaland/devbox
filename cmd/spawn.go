@@ -119,21 +119,15 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		IamInstanceProfile: &types.IamInstanceProfileSpecification{
 			Name: aws.String(dcfg.IAMProfile),
 		},
-		UserData: aws.String(userData),
-		InstanceMarketOptions: &types.InstanceMarketOptionsRequest{
-			MarketType: types.MarketTypeSpot,
-			SpotOptions: &types.SpotMarketOptions{
-				SpotInstanceType:             types.SpotInstanceTypePersistent,
-				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
-				MaxPrice:                     aws.String(maxPrice),
-			},
-		},
+		UserData:                            aws.String(userData),
+		InstanceInitiatedShutdownBehavior:   types.ShutdownBehaviorStop,
 		BlockDeviceMappings: []types.BlockDeviceMapping{
 			{
 				DeviceName: aws.String("/dev/xvda"),
 				Ebs: &types.EbsBlockDevice{
-					VolumeSize: aws.Int32(75),
-					VolumeType: types.VolumeTypeGp3,
+					VolumeSize:           aws.Int32(75),
+					VolumeType:           types.VolumeTypeGp3,
+					DeleteOnTermination:  aws.Bool(false),
 				},
 			},
 		},
@@ -146,6 +140,16 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 				},
 			},
 		},
+	}
+	if dcfg.UseSpot {
+		runInput.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
+			MarketType: types.MarketTypeSpot,
+			SpotOptions: &types.SpotMarketOptions{
+				SpotInstanceType:             types.SpotInstanceTypePersistent,
+				InstanceInterruptionBehavior: types.InstanceInterruptionBehaviorStop,
+				MaxPrice:                     aws.String(maxPrice),
+			},
+		}
 	}
 
 	result, err := client.RunInstances(ctx, runInput)
@@ -289,7 +293,7 @@ func lookupSubnet(ctx context.Context, client *ec2.Client, az string) (string, e
 func autoDetectSourceInstance(ctx context.Context, client *ec2.Client) (string, error) {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
-			{Name: aws.String("instance-lifecycle"), Values: []string{"spot"}},
+			{Name: aws.String("tag:devbox-managed"), Values: []string{"true"}},
 			{Name: aws.String("instance-state-name"), Values: []string{"running", "stopped"}},
 		},
 	})

@@ -31,8 +31,8 @@ func listInstances(ctx context.Context, client *ec2.Client) error {
 	input := &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
 			{
-				Name:   aws.String("instance-lifecycle"),
-				Values: []string{"spot"},
+				Name:   aws.String("tag:devbox-managed"),
+				Values: []string{"true"},
 			},
 			{
 				Name:   aws.String("instance-state-name"),
