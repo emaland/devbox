@@ -578,9 +578,12 @@
     serviceConfig = {
       Type            = "oneshot";
       User            = "emaland";
-      # Bound the boot-time switch so a slow/large rebuild can't hang
-      # boot indefinitely (it previously ran with no limit).
-      TimeoutStartSec = "30min";
+      # Bound the boot-time switch so a slow/large rebuild can't run
+      # forever (it previously ran with no limit). 60min gives a fresh
+      # instance type enough headroom for a full first-time package build
+      # even with the local cache reuse above; Wants=multi-user.target is a
+      # soft dependency, so this was never actually gating boot completion.
+      TimeoutStartSec = "60min";
       ExecStart = toString (pkgs.writeShellScript "devbox-home-manager" ''
         export HOME=/home/emaland
         export PATH=${lib.makeBinPath [ pkgs.home-manager pkgs.nix pkgs.git pkgs.openssh pkgs.util-linux ]}:$PATH
@@ -595,14 +598,26 @@
           exit 0
         fi
 
+        # Reuse the same local binary cache the system-level nixos-rebuild
+        # switch substitutes from (populated onto the persistent /home volume
+        # after that switch). Without this, home-manager — a separate
+        # profile — re-fetches every package from the network on a fresh
+        # instance even when the system closure just proved it's all sitting
+        # right here, which is slow enough to hit TimeoutStartSec above.
+        OPT=""
+        if [ -d /home/.nix-cache ]; then
+          OPT="--option extra-substituters file:///home/.nix-cache --option extra-trusted-substituters file:///home/.nix-cache --option require-sigs false"
+          echo "devbox: substituting from local nix cache /home/.nix-cache"
+        fi
+
         FLAKE_FILE="$HOME/.config/devbox/home-flake"
         if [ -f "$FLAKE_FILE" ]; then
           FLAKE_URL=$(cat "$FLAKE_FILE")
           echo "Switching home-manager with flake: $FLAKE_URL"
-          ${pkgs.home-manager}/bin/home-manager switch --flake "$FLAKE_URL"
+          ${pkgs.home-manager}/bin/home-manager switch --flake "$FLAKE_URL" $OPT
         else
           echo "Switching home-manager with local config"
-          ${pkgs.home-manager}/bin/home-manager switch
+          ${pkgs.home-manager}/bin/home-manager switch $OPT
         fi
       '');
     };
