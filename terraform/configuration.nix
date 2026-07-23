@@ -491,41 +491,53 @@
     mode = "0644";
   };
 
-  # ── Auto-stop service ──────────────────────────────────────────
-  # Fires when the auto-stop timer expires. Stops the instance via the EC2
-  # API — but only if no one is using the box. If a user is logged in or
-  # connected, it defers and re-checks shortly, so an active session is
-  # never yanked out from under you; the box stops only after you've left.
+  # ── Auto-stop (idle timer) ─────────────────────────────────────
+  # A true idle timer that RESETS whenever the box is in use. The
+  # devbox-autostop.timer below polls this every 10 min; each poll, if a user
+  # is active, it touches the last-active marker (resetting the countdown).
+  # The box stops only after the full idle window with no activity — default
+  # 4h, overridable via /etc/devbox/autostop-after ("off" disables).
   systemd.services.devbox-autostop = {
-    description = "Auto-stop this instance when idle";
+    description = "Stop this instance after it has been idle";
     serviceConfig = {
       Type      = "oneshot";
       ExecStart = toString (pkgs.writeShellScript "devbox-autostop" ''
         LOG=/var/log/boot-history
+        STATE=/run/devbox-last-active
         stamp() { ${pkgs.coreutils}/bin/date '+%Y-%m-%d %H:%M:%S'; }
 
-        # "Active" = a logged-in interactive session (who/utmp, covers SSH and
-        # Tailscale SSH) or an established inbound SSH connection on :22.
-        ACTIVE=""
-        if ${pkgs.coreutils}/bin/who 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q .; then
-          ACTIVE="login session"
-        elif ${pkgs.iproute2}/bin/ss -tnH state established 2>/dev/null \
-             | ${pkgs.gnugrep}/bin/grep -qE ':22[[:space:]]'; then
-          ACTIVE="ssh connection"
-        fi
+        # Idle window (resettable via /etc/devbox/autostop-after; "off" disables).
+        WINDOW="4h"
+        [ -f /etc/devbox/autostop-after ] && WINDOW=$(${pkgs.coreutils}/bin/cat /etc/devbox/autostop-after)
+        [ "$WINDOW" = "off" ] && exit 0
+        num=$(printf '%s' "$WINDOW" | ${pkgs.coreutils}/bin/tr -cd '0-9'); [ -z "$num" ] && num=4
+        case "$WINDOW" in
+          *d*) SECS=$((num * 86400));;
+          *h*) SECS=$((num * 3600));;
+          *min*|*m*) SECS=$((num * 60));;
+          *s*) SECS=$num;;
+          *) SECS=$((num * 3600));;
+        esac
 
-        if [ -n "$ACTIVE" ]; then
-          echo "$(stamp) | auto-stop | deferred ($ACTIVE)" >> "$LOG"
-          # Re-check soon so the box stops promptly once the user disconnects.
-          ${pkgs.systemd}/bin/systemctl stop devbox-autostop-poll.timer devbox-autostop-poll.service 2>/dev/null || true
-          ${pkgs.systemd}/bin/systemctl reset-failed devbox-autostop-poll.timer devbox-autostop-poll.service 2>/dev/null || true
-          ${pkgs.systemd}/bin/systemd-run --collect --unit=devbox-autostop-poll \
-            --on-active=20min \
-            ${pkgs.systemd}/bin/systemctl start devbox-autostop.service
+        # First poll of the boot seeds the marker so the window counts from now.
+        [ -f "$STATE" ] || ${pkgs.coreutils}/bin/touch "$STATE"
+
+        # Active? Reset the idle countdown and stop here. "Active" = a logged-in
+        # session (who/utmp; covers SSH and Tailscale SSH) or an established
+        # inbound :22 connection.
+        if ${pkgs.coreutils}/bin/who 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q . \
+           || ${pkgs.iproute2}/bin/ss -tnH state established 2>/dev/null | ${pkgs.gnugrep}/bin/grep -qE ':22[[:space:]]'; then
+          ${pkgs.coreutils}/bin/touch "$STATE"
           exit 0
         fi
 
-        echo "$(stamp) | auto-stop | timer expired (idle)" >> "$LOG"
+        # Idle: stop only once the full window has elapsed since last activity.
+        NOW=$(${pkgs.coreutils}/bin/date +%s)
+        LAST=$(${pkgs.coreutils}/bin/stat -c %Y "$STATE" 2>/dev/null || echo "$NOW")
+        IDLE=$((NOW - LAST))
+        [ "$IDLE" -lt "$SECS" ] && exit 0
+
+        echo "$(stamp) | auto-stop | idle ''${IDLE}s >= ''${SECS}s, stopping" >> "$LOG"
         TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
           "http://169.254.169.254/latest/api/token" \
           -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
@@ -542,37 +554,16 @@
     };
   };
 
-  # ── Auto-stop scheduler ────────────────────────────────────────
-  # Reads /etc/devbox/autostop-after (default 8h) and creates a
-  # transient systemd timer to trigger devbox-autostop.service.
-  systemd.services.devbox-schedule-autostop = {
-    description = "Schedule auto-stop timer on boot";
-    after       = [ "devbox-boot-log.service" ];
-    wants       = [ "devbox-boot-log.service" ];
-    wantedBy    = [ "multi-user.target" ];
-    serviceConfig = {
-      Type      = "oneshot";
-      ExecStart = toString (pkgs.writeShellScript "devbox-schedule-autostop" ''
-        # Cancel any previous transient timer
-        ${pkgs.systemd}/bin/systemctl stop devbox-autostop-sched.timer 2>/dev/null || true
-
-        TIMEOUT="8h"
-        if [ -f /etc/devbox/autostop-after ]; then
-          TIMEOUT=$(cat /etc/devbox/autostop-after)
-        fi
-
-        if [ "$TIMEOUT" = "off" ]; then
-          echo "Auto-stop disabled"
-          exit 0
-        fi
-
-        ${pkgs.systemd}/bin/systemd-run \
-          --unit=devbox-autostop-sched \
-          --on-active="$TIMEOUT" \
-          ${pkgs.systemd}/bin/systemctl start devbox-autostop.service
-
-        echo "Auto-stop scheduled in $TIMEOUT"
-      '');
+  # ── Auto-stop poll timer ───────────────────────────────────────
+  # Runs devbox-autostop every 10 min (the idle-reset granularity). The idle
+  # window itself is 4h by default — see devbox-autostop above.
+  systemd.timers.devbox-autostop = {
+    description = "Poll for idle auto-stop";
+    wantedBy    = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec       = "10min";
+      OnUnitActiveSec = "10min";
+      Unit            = "devbox-autostop.service";
     };
   };
 
@@ -684,16 +675,12 @@
     plugins = with pkgs.tmuxPlugins; [
       sensible
       resurrect
-      {
-        plugin = continuum;
-        extraConfig = ''
-          set -g @continuum-restore 'on'
-          set -g @continuum-save-interval '15'
-        '';
-      }
+      continuum
     ];
     extraConfig = ''
       set -g @resurrect-capture-pane-contents 'on'
+      set -g @continuum-restore 'on'
+      set -g @continuum-save-interval '15'
     '';
   };
 

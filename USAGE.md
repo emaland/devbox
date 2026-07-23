@@ -7,9 +7,15 @@ EC2 spot instance.
 
 There is **one devbox** (a persistent spot instance) and **one data volume**
 (mounted at `/home`, survives instance replacement). Most commands auto-target
-"the box," so you rarely pass an instance ID. The box boots **fully configured
-in one phase** — the real `configuration.nix` is rendered into EC2 user-data, so
-no post-boot SSH push is needed.
+"the box," so you rarely pass an instance ID.
+
+The box boots in **two phases**: a tiny SSH-only stub config goes in EC2
+user-data (the full `configuration.nix` is larger than EC2's 16 KB user-data
+limit), then the CLI renders the real config — substituting `@@MARKER@@`
+placeholders for your DNS zone, data-volume id, etc. — and pushes it over SSH,
+running `nixos-rebuild switch`. That rendered config is also saved to `/home`
+so it survives instance replacement, and the per-boot `amazon-init` re-apply is
+disabled so a plain **reboot keeps your config** (it won't revert to the stub).
 
 ## Daily lifecycle — the front door
 

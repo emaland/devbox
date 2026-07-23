@@ -122,8 +122,10 @@ The Terraform directory also includes `configuration.nix`, which defines what ru
 - `/home` mounted from a persistent EBS volume (by label, so it works across instance types)
 - Boot-time DNS update via Route 53
 - Boot history logger — every boot appends instance metadata to `/var/log/boot-history`
-- Auto-stop timer — instance self-stops after 8h by default, configurable via `devbox stop --after`
+- Auto-stop idle timer — instance self-stops after 4h idle by default (resets whenever a session is active), configurable via `devbox stop --after`
 - home-manager switch on boot — applies latest home-manager config (supports remote flakes or local config)
+- IMDS pinned to the primary interface via policy routing (a dedicated routing table ordered after the link is up), so Docker/Tailscale veth interfaces can't hijack the `169.254.169.254` route and break instance-metadata access
+- Reboot-stable: `amazon-init` is detached from `multi-user.target` so it won't re-apply the bootstrap user-data and revert the system on reboot
 - MOTD showing last 20 boot events on login
 - System packages: git, curl, wget, htop, tmux, vim, jq, python3, emacs, gcc, make, awscli, home-manager
 
@@ -173,12 +175,12 @@ devbox ssh i-abc123
 
 ### Auto-stop timer
 
-Instances auto-stop after 8 hours by default. You can change the timer on a running instance:
+Instances auto-stop after 4 hours idle by default (the window resets whenever a session is active). You can change the window on a running instance:
 
 ```bash
-# Set auto-stop to 4 hours
-devbox stop --after 4h
-devbox stop --after 4h i-abc123
+# Set auto-stop to 2 hours idle
+devbox stop --after 2h
+devbox stop --after 2h i-abc123
 
 # Disable auto-stop
 devbox stop --after off
@@ -384,6 +386,7 @@ devbox talks directly to the AWS API using the Go SDK v2. There's no local state
 - **DNS** uses Route 53 `ChangeResourceRecordSets` to upsert an A record.
 - **Search** paginates `DescribeInstanceTypes` (filtered to spot-capable, current-gen) then fetches `DescribeSpotPriceHistory` and joins the results.
 - **Spawn** discovers the AMI, security group, and subnet from AWS, fetches `user_data` from the source instance, and calls `RunInstances` with persistent spot + stop-on-interruption.
+- **Config delivery is two-phase.** The full `configuration.nix` exceeds EC2's 16 KB user-data limit, so a new box boots a tiny SSH-only stub via user-data; the CLI then renders the real config (substituting `@@MARKER@@` placeholders for the DNS zone, data-volume id, etc.) and pushes it over SSH with `nixos-rebuild switch`. The rendered config is saved to `/home` so it survives instance replacement, and `amazon-init` (which would otherwise re-apply the stub user-data on every boot and revert the system) is detached from `multi-user.target` once the real config is active — so a reboot keeps the configured system instead of reverting to the stub.
 - **Resize** for on-demand instances uses `ModifyInstanceAttribute` between a stop/start cycle. For spot instances, it launches a replacement instance with the new type, confirms capacity, then swaps non-root EBS volumes and terminates the old instance.
 - **Recover** combines `DescribeInstanceTypes` (for current specs/architecture), `fetchInstanceTypes` (for candidates), and `DescribeSpotPriceHistory` (filtered to the instance's AZ) to find alternatives with capacity, then optionally calls resize.
 - **Volume** commands wrap the EC2 volume and snapshot APIs. `volume move` chains `CreateSnapshot` → `CopySnapshot` (cross-region) → `CreateVolume` to relocate a volume while preserving its type, IOPS, throughput, and tags.
