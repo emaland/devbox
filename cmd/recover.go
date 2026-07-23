@@ -219,11 +219,8 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 	w.Flush()
 
 	if autoYes {
-		// Auto-resize to top pick
-		best := display[0]
-		fmt.Printf("\nAuto-resizing to %s ($%.4f, efficiency score %.4f)...\n",
-			best.InstanceType, best.Price, best.EfficiencyScore)
-		return resizeInstance(ctx, dcfg, client, r53client, instanceID, best.InstanceType)
+		fmt.Println("\nAuto-resizing — trying candidates in order until one has spot capacity...")
+		return tryResizeCandidates(ctx, dcfg, client, r53client, instanceID, display)
 	}
 
 	// 9. Interactive selection
@@ -238,9 +235,31 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 	if err != nil || choice < 1 || choice > len(display) {
 		return fmt.Errorf("invalid selection: %s", line)
 	}
-	selected := display[choice-1]
-	fmt.Printf("Resizing to %s ($%.2f/day)...\n", selected.InstanceType, selected.Price*24)
-	return resizeInstance(ctx, dcfg, client, r53client, instanceID, selected.InstanceType)
+	return tryResizeCandidates(ctx, dcfg, client, r53client, instanceID, display[choice-1:])
+}
+
+// tryResizeCandidates attempts to resize into each candidate in order,
+// automatically skipping ones that fail with InsufficientInstanceCapacity —
+// AWS has no API to check Spot capacity ahead of time, so a real launch
+// attempt is the only ground-truth signal — and stopping at the first that
+// succeeds. Safe to chain: a failed launch always leaves the old instance,
+// its spot request, and volumes intact (see resizeSpotInstance).
+func tryResizeCandidates(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, instanceID string, candidates []awsutil.SpotSearchResult) error {
+	for i, c := range candidates {
+		fmt.Printf("Trying %s ($%.2f/day)...\n", c.InstanceType, c.Price*24)
+		err := resizeInstance(ctx, dcfg, client, r53client, instanceID, c.InstanceType)
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "InsufficientInstanceCapacity") {
+			return err
+		}
+		fmt.Printf("  no spot capacity for %s right now.\n", c.InstanceType)
+		if i < len(candidates)-1 {
+			fmt.Println("  trying the next candidate...")
+		}
+	}
+	return fmt.Errorf("no spot capacity available for any of the %d candidates tried", len(candidates))
 }
 
 // isAcceleratorFamily returns true for instance families designed for
