@@ -1,5 +1,15 @@
 package main
 
-import "github.com/emaland/devbox/cmd"
+import (
+	_ "embed"
 
-func main() { cmd.Execute() }
+	"github.com/emaland/devbox/cmd"
+)
+
+//go:embed terraform/configuration.nix
+var embeddedNixConfig []byte
+
+func main() {
+	cmd.EmbeddedNixConfig = embeddedNixConfig
+	cmd.Execute()
+}

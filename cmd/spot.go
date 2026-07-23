@@ -117,6 +117,27 @@ func defaultNixFile() string {
 	return "terraform/configuration.nix"
 }
 
+// EmbeddedNixConfig is the built-in copy of terraform/configuration.nix,
+// embedded into the binary by main.go so devbox works when run from any
+// working directory (not just a checkout of this repo). Set once at startup.
+var EmbeddedNixConfig []byte
+
+// readNixConfigSource returns the raw (unrendered) contents of nixFile. A
+// copy on disk always takes precedence (so editing configuration.nix in a
+// checkout of this repo and re-running takes effect without a rebuild); when
+// the default path isn't present on disk — the common case for an installed
+// binary run outside the repo — it falls back to the embedded copy.
+func readNixConfigSource(nixFile string) ([]byte, error) {
+	data, err := os.ReadFile(nixFile)
+	if err == nil {
+		return data, nil
+	}
+	if os.IsNotExist(err) && nixFile == defaultNixFile() && len(EmbeddedNixConfig) > 0 {
+		return EmbeddedNixConfig, nil
+	}
+	return nil, fmt.Errorf("reading %s: %w", nixFile, err)
+}
+
 // renderNixConfig reads configuration.nix and substitutes the @@MARKER@@
 // placeholders with values from the devbox config (plus any per-instance
 // `extra` substitutions, e.g. the data volume id). Markers whose value is
@@ -124,9 +145,9 @@ func defaultNixFile() string {
 // (case "@@*@@") and no-op rather than acting on a bogus value. The result is
 // the concrete NixOS config baked into user_data and pushed to instances.
 func renderNixConfig(dcfg config.DevboxConfig, nixFile string, extra map[string]string) ([]byte, error) {
-	data, err := os.ReadFile(nixFile)
+	data, err := readNixConfigSource(nixFile)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", nixFile, err)
+		return nil, err
 	}
 	s := string(data)
 	repl := map[string]string{

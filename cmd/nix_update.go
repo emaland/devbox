@@ -47,9 +47,9 @@ func newNixUpdateCmd() *cobra.Command {
 }
 
 func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID, nixFile string) error {
-	// Verify the file exists before we talk to AWS
-	if _, err := os.Stat(nixFile); err != nil {
-		return fmt.Errorf("reading %s: %w", nixFile, err)
+	// Verify the config is available (disk or embedded) before we talk to AWS
+	if _, err := readNixConfigSource(nixFile); err != nil {
+		return err
 	}
 
 	ip, err := instancePublicIP(ctx, client, instanceID)
@@ -73,8 +73,8 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 // via root SSH (for fresh instances where emaland keys aren't set up yet).
 func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID, volumeID string) error {
 	nixFile := defaultNixFile()
-	if _, err := os.Stat(nixFile); err != nil {
-		return fmt.Errorf("reading %s: %w", nixFile, err)
+	if _, err := readNixConfigSource(nixFile); err != nil {
+		return err
 	}
 
 	ip, err := instancePublicIP(ctx, client, instanceID)
