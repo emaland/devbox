@@ -127,7 +127,29 @@ The Terraform directory also includes `configuration.nix`, which defines what ru
 - IMDS pinned to the primary interface via policy routing (a dedicated routing table ordered after the link is up), so Docker/Tailscale veth interfaces can't hijack the `169.254.169.254` route and break instance-metadata access
 - Reboot-stable: `amazon-init` is detached from `multi-user.target` so it won't re-apply the bootstrap user-data and revert the system on reboot
 - MOTD showing last 20 boot events on login
+- Lingering enabled for `emaland`, so home-manager's systemd `--user` units start at boot and survive logout (see "Required secrets" below)
 - System packages: git, curl, wget, htop, tmux, vim, jq, python3, emacs, gcc, make, awscli, home-manager
+
+### Required secrets
+
+Some home-manager units read credentials from `/home/emaland/.secrets`, which is
+provisioned out of band (this repo does not create or copy it). If a key is
+missing the box still boots normally — the failure is deferred to first use.
+
+| Key | Needed by | Symptom if missing |
+| --- | --- | --- |
+| `FIREWORKS_API_KEY` | `llm-proxy` user service (backs the `claude-fw` / `claude-fw-flash` aliases) | Service starts and passes health checks; Fireworks requests fail auth at request time |
+| `DEEPINFRA_API_KEY` | `llm-proxy` user service (backs the `claude-di` / `claude-di-flash` aliases) | Same, for DeepInfra requests |
+
+`llm-proxy` translates Claude Code's Anthropic `/v1/messages` protocol to the
+OpenAI-only APIs those providers serve, so the aliases cannot work without it.
+It binds to loopback only, since it holds these provider keys and has no auth of
+its own. To check a box:
+
+```bash
+systemctl --user status llm-proxy
+journalctl --user -u llm-proxy -e     # warns on startup if ~/.secrets is unreadable
+```
 
 ### Manual terraform (if you prefer)
 
