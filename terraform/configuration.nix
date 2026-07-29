@@ -172,6 +172,11 @@
     isNormalUser = true;
     uid          = 1001;
     extraGroups  = [ "wheel" "docker" ];
+    # home-manager installs systemd --user units (e.g. llm-proxy, which bridges
+    # Claude Code to OpenAI-only model providers). Without lingering those only
+    # run while an interactive login session is open, so they never start at
+    # boot and die on logout.
+    linger       = true;
     # Extra authorized keys, in addition to the EC2 key-pair key that
     # devbox-fetch-ssh-key installs into ~/.ssh/authorized_keys each boot.
     # These are written to /etc/ssh/authorized_keys.d/emaland — a separate
