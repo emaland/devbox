@@ -278,6 +278,11 @@
     };
   };
 
+  # Never let the OOM killer take sshd — losing remote access is the one
+  # failure mode that requires physical/console intervention to recover
+  # from, so it gets the strongest protection on the box.
+  systemd.services.sshd.serviceConfig.OOMScoreAdjust = -1000;
+
   # ── Tailscale ─────────────────────────────────────────────────────
   services.tailscale.enable = true;
 
@@ -640,9 +645,18 @@
       Type            = "oneshot";
       RemainAfterExit = true;
       User            = "emaland";
+      # oom_score_adj is inherited across fork(), so this covers the tmux
+      # server and everything it spawns under this cgroup (Claude Code
+      # included) without needing to target the node process directly.
+      OOMScoreAdjust  = -900;
       ExecStart = toString (pkgs.writeShellScript "devbox-claude" ''
         export HOME=/home/emaland
-        export PATH=${lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.curl pkgs.openssh pkgs.nodejs ]}:/etc/profiles/per-user/emaland/bin:$PATH
+        export PATH=${lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.curl pkgs.openssh pkgs.nodejs ]}:$HOME/.local/bin:/etc/profiles/per-user/emaland/bin:$PATH
+        # Interactive logins get TMUX_TMPDIR=$XDG_RUNTIME_DIR from home-manager's
+        # hm-session-vars.sh (sourced via /etc/profile.d). This script isn't a
+        # login shell so it must set the same value itself, or this server binds
+        # a different socket (/tmp/tmux-$UID) than `tmux attach` will look in.
+        export TMUX_TMPDIR="''${XDG_RUNTIME_DIR:-/run/user/$(${pkgs.coreutils}/bin/id -u)}"
         PROJECT_DIR="$HOME/scratch/git/ions"
 
         if [ ! -d "$PROJECT_DIR" ]; then
@@ -678,9 +692,13 @@
 
         # Ensure a dedicated claude session (recreate so it always resumes the
         # latest conversation with --continue). Separate from restored sessions.
+        if [ ! -x "$HOME/.local/bin/claude" ]; then
+          echo "$HOME/.local/bin/claude not found or not executable, skipping"
+          exit 0
+        fi
         ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
         ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
-          "/etc/profiles/per-user/emaland/bin/claude --dangerously-skip-permissions --continue 'continue from where you left off'"
+          "$HOME/.local/bin/claude --dangerously-skip-permissions --continue || $HOME/.local/bin/claude --dangerously-skip-permissions"
 
         echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
       '');
