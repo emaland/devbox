@@ -290,7 +290,7 @@ func resizeSpotInstance(ctx context.Context, dcfg config.DevboxConfig, client *e
 	// plan so the swap can be resumed if interrupted.
 	tags := []types.Tag{}
 	for _, t := range inst.Tags {
-		if t.Key != nil && !strings.HasPrefix(*t.Key, "aws:") {
+		if t.Key != nil && !strings.HasPrefix(*t.Key, "aws:") && !strings.HasPrefix(*t.Key, "devbox-resize-") {
 			tags = append(tags, t)
 		}
 	}
