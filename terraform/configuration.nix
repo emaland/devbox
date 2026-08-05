@@ -172,10 +172,12 @@
     isNormalUser = true;
     uid          = 1001;
     extraGroups  = [ "wheel" "docker" ];
-    # home-manager installs systemd --user units (e.g. llm-proxy, which bridges
-    # Claude Code to OpenAI-only model providers). Without lingering those only
+    # home-manager installs systemd --user units without lingering those only
     # run while an interactive login session is open, so they never start at
-    # boot and die on logout.
+    # boot and die on logout. (llm-proxy, previously the example here, moved
+    # from a systemd --user unit to a Docker Compose stack on 2026-08-05 —
+    # see home.nix's dotfiles/langfuse/ — but linger is still needed for
+    # whatever else home-manager brings in as a --user unit.)
     linger       = true;
     # Extra authorized keys, in addition to the EC2 key-pair key that
     # devbox-fetch-ssh-key installs into ~/.ssh/authorized_keys each boot.
