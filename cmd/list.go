@@ -16,6 +16,10 @@ import (
 	"github.com/emaland/devbox/internal/awsutil"
 )
 
+// onDemandPriceCache memoizes on-demand price lookups per instance type for
+// the lifetime of a single `devbox ls` invocation.
+type onDemandPriceCache map[string]string
+
 func newStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "status",
@@ -58,8 +62,9 @@ func listInstances(ctx context.Context, client *ec2.Client) error {
 	volNames := resolveAttachedVolumeNames(ctx, client, instances)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "INSTANCE ID\tNAME\tTYPE\tSTATE\tAZ\tPUBLIC IP\tSPOT $/hr\tVOLUMES")
+	fmt.Fprintln(w, "INSTANCE ID\tNAME\tTYPE\tSTATE\tAZ\tPUBLIC IP\t$/hr\tVOLUMES")
 
+	odCache := onDemandPriceCache{}
 	for _, inst := range instances {
 		name := awsutil.NameTag(inst.Tags)
 		publicIP := "-"
@@ -71,8 +76,14 @@ func listInstances(ctx context.Context, client *ec2.Client) error {
 			az = *inst.Placement.AvailabilityZone
 		}
 		price := "-"
-		if p, err := latestSpotPrice(ctx, client, string(inst.InstanceType), az); err == nil && p != "" {
-			price = p
+		if inst.InstanceLifecycle == types.InstanceLifecycleTypeSpot {
+			if p, err := latestSpotPrice(ctx, client, string(inst.InstanceType), az); err == nil && p != "" {
+				price = p + " (spot)"
+			}
+		} else {
+			if p, err := onDemandPrice(ctx, odCache, string(inst.InstanceType), az); err == nil && p != "" {
+				price = p + " (on-demand)"
+			}
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			*inst.InstanceId,

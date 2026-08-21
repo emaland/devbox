@@ -14,6 +14,7 @@ import (
 
 func newDownCmd() *cobra.Command {
 	var after string
+	var force bool
 
 	cmd := &cobra.Command{
 		Use:     "down [instance-id...]",
@@ -23,6 +24,7 @@ func newDownCmd() *cobra.Command {
 The data volume is preserved; bring the box back with 'devbox up'.
 
   devbox down [id...]               Stop instances immediately
+  devbox down --force [id]          Force stop a wedged/unresponsive instance
   devbox down --after 4h [id]       SSH in and set auto-stop timer to 4h
   devbox down --after off [id]      SSH in and disable auto-stop timer`,
 		Args: cobra.ArbitraryArgs,
@@ -37,18 +39,26 @@ The data volume is preserved; bring the box back with 'devbox up'.
 				}
 				args = []string{id}
 			}
-			return stopInstances(cmd.Context(), ec2Client, args)
+			return stopInstancesForce(cmd.Context(), ec2Client, args, force)
 		},
 	}
 
 	cmd.Flags().StringVar(&after, "after", "", "schedule auto-stop after duration (e.g. 4h, 30m) or 'off' to disable")
+	cmd.Flags().BoolVar(&force, "force", false, "force stop without a clean OS shutdown (use for wedged/unresponsive instances)")
 
 	return cmd
 }
 
 func stopInstances(ctx context.Context, client *ec2.Client, ids []string) error {
+	return stopInstancesForce(ctx, client, ids, false)
+}
+
+func stopInstancesForce(ctx context.Context, client *ec2.Client, ids []string, force bool) error {
 	input := &ec2.StopInstancesInput{
 		InstanceIds: ids,
+	}
+	if force {
+		input.Force = &force
 	}
 	result, err := client.StopInstances(ctx, input)
 	if err != nil {

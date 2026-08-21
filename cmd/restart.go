@@ -10,10 +10,16 @@ import (
 )
 
 func newRestartCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+
+	cmd := &cobra.Command{
 		Use:   "restart [instance-id...]",
 		Short: "Stop then start instances (new host)",
-		Args:  cobra.ArbitraryArgs,
+		Long: `Stop then start instances (new host).
+
+  devbox restart [id...]          Stop then start instances
+  devbox restart --force [id]     Force stop a wedged/unresponsive instance, then start`,
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
@@ -22,16 +28,24 @@ func newRestartCmd() *cobra.Command {
 				}
 				args = []string{id}
 			}
-			return restartInstances(cmd.Context(), ec2Client, args)
+			return restartInstancesForce(cmd.Context(), ec2Client, args, force)
 		},
 	}
+
+	cmd.Flags().BoolVar(&force, "force", false, "force stop without a clean OS shutdown (use for wedged/unresponsive instances)")
+
+	return cmd
 }
 
-func restartInstances(ctx context.Context, client *ec2.Client, ids []string) error {
+func restartInstancesForce(ctx context.Context, client *ec2.Client, ids []string, force bool) error {
 	fmt.Printf("Stopping %d instance(s)...\n", len(ids))
-	_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{
+	stopInput := &ec2.StopInstancesInput{
 		InstanceIds: ids,
-	})
+	}
+	if force {
+		stopInput.Force = &force
+	}
+	_, err := client.StopInstances(ctx, stopInput)
 	if err != nil {
 		return fmt.Errorf("stopping instances: %w", err)
 	}
