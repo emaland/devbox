@@ -38,6 +38,7 @@ type fakeGateway struct {
 	mu       sync.Mutex
 	code     int
 	body     string
+	sequence []string // bodies for the next requests, in order; then body stays
 	requests []string // every request line and header, for leak checks
 	authOK   int
 	authBad  int
@@ -65,6 +66,9 @@ func newFakeGateway(t *testing.T) *fakeGateway {
 			return
 		}
 		g.authOK++
+		if len(g.sequence) > 0 {
+			g.body, g.sequence = g.sequence[0], g.sequence[1:]
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(g.code)
 		io.WriteString(w, g.body)
