@@ -84,7 +84,9 @@ let
       ++ map (provider: provider.command) providerEntries));
 
   # The unit's main process: run the start-up checks, then become the
-  # gateway. Prepare runs here rather than in ExecStartPre because systemd
+  # gateway, whose command it is given as arguments. ExecStart therefore names
+  # the gateway's own store path (`<launcher> <node> <package>/…/cli.js …`),
+  # so tools of the same build can tell that the unit runs it. Prepare runs here rather than in ExecStartPre because systemd
   # honours RestartPreventExitStatus for the main process only; a refusal
   # (exit 78) must not be retried. The tools' PATH is given to prepare alone,
   # so the gateway and its agents keep the unit's PATH.
@@ -95,7 +97,11 @@ let
   # it itself. A timeout exits 124, which is retried.
   launcher = pkgs.writeShellScript "ahp-gateway-launch" ''
     PATH=${prepareTools} ${pkgs.coreutils}/bin/timeout ${toString startTimeout} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
-    exec ${node} ${cli} --config ${runtimeConfig}
+    if [ "$#" -eq 0 ]; then
+      echo "ahp-gateway-launch: no command to run" >&2
+      exit 64
+    fi
+    exec "$@"
   '';
 
   startTimeout = cfg.readyTimeoutSec + 15;
@@ -301,7 +307,7 @@ in
         RuntimeDirectory = "ahp-gateway";
         RuntimeDirectoryMode = "0700";
         UnsetEnvironment = "CLAUDECODE";
-        ExecStart = "${launcher}";
+        ExecStart = "${launcher} ${node} ${cli} --config ${runtimeConfig}";
         Restart = "on-failure";
         RestartSec = 2;
         KillMode = "mixed";

@@ -33,7 +33,7 @@ refuse() {
 }
 
 # Every check below fails closed: a missing tool is a refusal, not a pass.
-for tool in jq ss find realpath sort sed; do
+for tool in jq ss find realpath sort sed stat id; do
   command -v "$tool" >/dev/null 2>&1 || refuse "$tool is not available, so the start-up checks cannot run"
 done
 
@@ -60,8 +60,12 @@ if [ -n "$holder" ]; then
   refuse "process $pid has the gateway database open ($database); stop it first"
 fi
 
-# 2. State dir: private to the user.
+# 2. State dir: the user's own, and private to the user.
 mkdir -p "$state"
+owner="$(stat -c %u "$state")"
+if [ "$owner" != "$(id -u)" ]; then
+  refuse "the state dir $state is owned by uid $owner, not by this user ($(id -u)); give it to this user with chown"
+fi
 chmod 0700 "$state"
 
 # 3. Token: created once, atomically, never replaced.

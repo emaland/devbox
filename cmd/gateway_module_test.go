@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -214,8 +215,14 @@ func TestGatewayModuleUnit(t *testing.T) {
 	// gateway): systemd honours RestartPreventExitStatus for the main
 	// process only, so a prepare step in ExecStartPre exiting 78 would be
 	// retried anyway.
-	if exec := fmt.Sprint(service["ExecStart"]); !strings.Contains(exec, "ahp-gateway-launch") {
+	exec := fmt.Sprint(service["ExecStart"])
+	if !strings.Contains(exec, "ahp-gateway-launch ") {
 		t.Errorf("ExecStart %q, want the launcher", exec)
+	}
+	// The gateway's own store path is on the command line, so a CLI of the
+	// same build can tell that the unit runs it: launcher, node, cli.js.
+	if !regexp.MustCompile(`ahp-gateway-launch /nix/store/[^ ]+/bin/node /nix/store/[a-z0-9]{32}-ahp-acp-gateway-0\.2\.2/lib/node_modules/ahp-acp-gateway/dist/src/cli\.js --config /run/ahp-gateway/config\.json$`).MatchString(exec) {
+		t.Errorf("ExecStart %q does not name the package's own cli.js after the launcher", exec)
 	}
 	if pre, set := service["ExecStartPre"]; set {
 		t.Errorf("ExecStartPre %v: prepare must run in the main process", pre)
@@ -644,6 +651,28 @@ func TestPrepareStateDirAndToken(t *testing.T) {
 	}
 }
 
+func TestPrepareRefusesAStateDirOwnedBySomeoneElse(t *testing.T) {
+	// An existing directory this user does not own: a root-owned one.
+	other := "/var/empty"
+	info, err := os.Stat(other)
+	if err != nil || os.Geteuid() == 0 {
+		t.Skip("needs a non-root user and a root-owned /var/empty")
+	}
+	if stat, ok := info.Sys().(interface{ Uid() uint32 }); ok && int(stat.Uid()) == os.Geteuid() {
+		t.Skip("/var/empty is ours here")
+	}
+	p := newPrepareBox(t)
+	p.stateDir = other
+	p.writeBase(trueProgram(t))
+	out, status := p.run(public022)
+	if status != 78 {
+		t.Fatalf("exit %d, want 78:\n%s", status, out)
+	}
+	if !strings.Contains(out, "owned") {
+		t.Errorf("the message should say who owns it: %s", out)
+	}
+}
+
 func TestPrepareRefusesAnEmptyOrShortToken(t *testing.T) {
 	for _, content := range []string{"", "\n", "short\n"} {
 		t.Run(strconv.Quote(content), func(t *testing.T) {
@@ -826,6 +855,11 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 	launcher := strings.TrimSpace(string(out))
 	clean := []string{"PATH=/nonexistent"}
 
+	// The gateway command the unit gives the launcher.
+	var execStart string
+	evalJSON(t, moduleExpression(t, "{}"), "config.systemd.services.ahp-gateway.serviceConfig.ExecStart", &execStart)
+	unitCommand := strings.Fields(execStart)
+
 	t.Run("the database held by another process is refused with 78", func(t *testing.T) {
 		p := newPrepareBox(t)
 		p.mustRun(public022)
@@ -854,7 +888,7 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 	t.Run("a good start runs the gateway after prepare", func(t *testing.T) {
 		p := newPrepareBox(t)
 		marker := filepath.Join(t.TempDir(), "gateway-ran")
-		got, status := p.runProgram([]string{launcher}, public022, append(clean, "AHP_TEST_MARKER="+marker)...)
+		got, status := p.runProgram(unitCommand, public022, append(clean, "AHP_TEST_MARKER="+marker)...)
 		if status != 0 {
 			t.Fatalf("exit %d:\n%s", status, got)
 		}
@@ -863,6 +897,23 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 		}
 		if _, err := os.Stat(marker); err != nil {
 			t.Error("the gateway did not run after prepare")
+		}
+	})
+
+	t.Run("the launcher runs exactly the command it is given", func(t *testing.T) {
+		p := newPrepareBox(t)
+		marker := filepath.Join(t.TempDir(), "args")
+		writer := filepath.Join(t.TempDir(), "record-args")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + marker + "\n"
+		if err := os.WriteFile(writer, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		got, status := p.runProgram([]string{launcher, "/bin/sh", writer, "one", "two words"}, public022, "PATH=/run/current-system/sw/bin")
+		if status != 0 {
+			t.Fatalf("exit %d:\n%s", status, got)
+		}
+		if args := read(t, marker); args != "one\ntwo words\n" {
+			t.Errorf("the command got %q", args)
 		}
 	})
 
