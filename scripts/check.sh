@@ -8,7 +8,8 @@
 # Checks:
 #   secrets  gitleaks over the full history of every branch
 #   go       go vet and go test (needs Docker for the LocalStack tests)
-#   nix      the NixOS template evaluates (markers left unrendered)
+#   nix      the NixOS template and the lifecycle VM tests evaluate (markers
+#            left unrendered)
 #   shell    shellcheck on every script the NixOS template builds with
 #            writeShellScript, and on the scripts in terraform/devbox
 #
@@ -108,7 +109,10 @@ check_nix() {
   # so it evaluates on any machine with nixpkgs. Unrendered markers are a
   # supported state and must evaluate too.
   nix-instantiate '<nixpkgs/nixos>' -A system \
-    -I nixos-config="$PWD/$template" --add-root "$scratch/system.drv" >/dev/null
+    -I nixos-config="$PWD/$template" --add-root "$scratch/system.drv" >/dev/null || return 1
+  # The lifecycle VM tests need KVM to run (nix-build tests/vm/lifecycle.nix);
+  # here they are only evaluated, so they cannot rot unnoticed.
+  nix-instantiate tests/vm/lifecycle.nix --add-root "$scratch/lifecycle-vm.drv" >/dev/null
 }
 
 check_shell() {
