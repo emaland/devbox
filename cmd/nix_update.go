@@ -9,10 +9,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/spf13/cobra"
 
-	"github.com/emaland/devbox/internal/awsutil"
 	"github.com/emaland/devbox/internal/config"
 )
 
@@ -49,8 +47,11 @@ func newNixUpdateCmd() *cobra.Command {
 }
 
 func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID, nixFile string) error {
-	// Verify the config is available (disk or embedded) before we talk to AWS
-	if _, err := readNixConfigSource(nixFile); err != nil {
+	// Check everything the push needs from this machine (template, extra keys
+	// file, hosted zone id) before touching the box, so a local problem is
+	// reported once and is not mistaken for an ssh failure below.
+	dcfg, err := preflightNixConfig(ctx, dcfg, nixFile, findHostedZoneID)
+	if err != nil {
 		return err
 	}
 
@@ -143,18 +144,9 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		"-o", "UserKnownHostsFile=/dev/null",
 	}
 
-	// The hosted zone id is not built in; without an explicit dns_zone_id it is
-	// looked up from dns_zone before rendering.
-	dcfg, err := resolveDNSZoneID(ctx, dcfg, func(ctx context.Context, zone string) (string, error) {
-		return awsutil.FindHostedZone(ctx, route53.NewFromConfig(awsCfg), zone)
-	})
-	if err != nil {
-		return err
-	}
-
 	// Render the config (substitute @@MARKER@@ placeholders) to a temp file so
 	// the instance never receives literal markers. SCP the rendered file.
-	rendered, err := renderNixConfig(dcfg, nixFile, dataVolumeMarker(volumeID))
+	rendered, err := renderForPush(ctx, dcfg, nixFile, volumeID, findHostedZoneID)
 	if err != nil {
 		return err
 	}

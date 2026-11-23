@@ -8,11 +8,14 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/route53"
 
+	"github.com/emaland/devbox/internal/awsutil"
 	"github.com/emaland/devbox/internal/config"
 )
 
@@ -158,7 +161,6 @@ func renderNixConfig(dcfg config.DevboxConfig, nixFile string, extra map[string]
 	if err != nil {
 		return nil, err
 	}
-	s := string(data)
 	repl := map[string]string{
 		"@@DNS_ZONE_ID@@":        dcfg.DNSZoneID,
 		"@@DNS_RECORD_NAME@@":    strings.TrimSuffix(dcfg.DNSName, "."),
@@ -171,22 +173,70 @@ func renderNixConfig(dcfg config.DevboxConfig, nixFile string, extra map[string]
 	for k, v := range extra {
 		repl[k] = v
 	}
+	// One pass over the template: a substituted value is never scanned again,
+	// so marker text inside one value cannot pull in another value.
+	var pairs []string
 	for marker, val := range repl {
 		if val == "" {
 			continue
 		}
-		s = strings.ReplaceAll(s, marker, val)
+		pairs = append(pairs, marker, val)
 	}
-	return []byte(s), nil
+	return []byte(strings.NewReplacer(pairs...).Replace(string(data))), nil
+}
+
+// renderForPush is what a push sends to the box: the hosted zone id is
+// resolved first (it has no built-in default), then the template is rendered.
+func renderForPush(ctx context.Context, dcfg config.DevboxConfig, nixFile, volumeID string, find zoneFinder) ([]byte, error) {
+	dcfg, err := resolveDNSZoneID(ctx, dcfg, find)
+	if err != nil {
+		return nil, err
+	}
+	return renderNixConfig(dcfg, nixFile, dataVolumeMarker(volumeID))
+}
+
+// preflightNixConfig checks, before any instance is created or changed,
+// everything a later config push needs from this machine: the template, the
+// extra keys file and the hosted zone id. It returns dcfg with the zone id
+// filled in, and says how many extra ssh keys the push will install, because
+// a push replaces the box's extra keys with exactly that set.
+func preflightNixConfig(ctx context.Context, dcfg config.DevboxConfig, nixFile string, find zoneFinder) (config.DevboxConfig, error) {
+	if _, err := readNixConfigSource(nixFile); err != nil {
+		return dcfg, err
+	}
+	keysFile := dcfg.ResolveAuthorizedKeysFile()
+	keys, err := readAuthorizedKeys(keysFile)
+	if err != nil {
+		return dcfg, err
+	}
+	if len(keys) == 0 {
+		fmt.Printf("Warning: no extra ssh keys to install (%s). After the config is applied only the EC2 key pair can log in; any extra key the box has now is removed.\n", describeKeysFile(keysFile))
+	} else {
+		fmt.Printf("Extra ssh keys to install: %d (from %s)\n", len(keys), keysFile)
+	}
+	return resolveDNSZoneID(ctx, dcfg, find)
+}
+
+func describeKeysFile(path string) string {
+	if path == "" {
+		return "authorized_keys_file is not set"
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path + " does not exist"
+	}
+	return path + " holds no keys"
 }
 
 // authorizedKeyLine matches one ssh public key: a known key type, base64 key
-// material, and an optional comment. The comment may not contain characters
-// that are special inside a double-quoted Nix string (", \, $), because the
-// key is rendered into one.
+// material, and an optional comment, separated by single spaces. The comment
+// is limited to printable ASCII without the characters that are special inside
+// a double-quoted Nix string (", \, $), because the key is rendered into one.
+// Control characters are excluded on purpose: Nix reads a carriage return in a
+// string as a line break, which would turn the rest of the line into a second,
+// unchecked entry.
 var authorizedKeyLine = regexp.MustCompile(
 	`^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)` +
-		` [A-Za-z0-9+/]+={0,3}( [^"\\$]*)?$`)
+		` [A-Za-z0-9+/]+={0,3}( [ !#%-\[\]-~]*)?$`)
 
 // readAuthorizedKeys returns the ssh public keys in path, one per line,
 // skipping blank lines and # comments. A missing file (or an empty path) means
@@ -206,23 +256,37 @@ func readAuthorizedKeys(path string) ([]string, error) {
 	}
 	var keys []string
 	for i, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		// Accept CRLF line endings, then refuse any other control character
+		// anywhere, comment lines included: a file with carriage-return-only
+		// line endings would otherwise read as one long comment and silently
+		// yield no keys.
+		line = strings.Trim(strings.TrimSuffix(line, "\r"), " \t")
+		hasControl := strings.IndexFunc(line, unicode.IsControl) >= 0
+		if !hasControl && (line == "" || strings.HasPrefix(line, "#")) {
 			continue
 		}
-		if !authorizedKeyLine.MatchString(line) {
-			return nil, fmt.Errorf("%s line %d is not an ssh public key (expected \"<type> <base64> [comment]\", no options, and no quote, backslash or dollar sign in the comment)", path, i+1)
+		if hasControl || !authorizedKeyLine.MatchString(line) || strings.Contains(line, "@@") {
+			return nil, fmt.Errorf("%s line %d is not an accepted ssh public key (expected \"<type> <base64> [comment]\" separated by single spaces; no options; printable ASCII only; no quote, backslash, dollar sign or @@ in the comment)", path, i+1)
 		}
 		keys = append(keys, line)
 	}
 	return keys, nil
 }
 
+// zoneFinder looks up a hosted zone id from its name.
+type zoneFinder func(ctx context.Context, zone string) (string, error)
+
+// findHostedZoneID is the zoneFinder used by commands: Route 53 with the
+// command's AWS credentials. Tests replace it.
+var findHostedZoneID zoneFinder = func(ctx context.Context, zone string) (string, error) {
+	return awsutil.FindHostedZone(ctx, route53.NewFromConfig(awsCfg), zone)
+}
+
 // resolveDNSZoneID returns dcfg with DNSZoneID filled in. An explicit
 // dns_zone_id wins. Otherwise the id is looked up from dns_zone with find, so
 // no account-specific id has to be built into this program. With no dns_zone
 // either, the id stays empty and the boot-time DNS updater on the box skips.
-func resolveDNSZoneID(ctx context.Context, dcfg config.DevboxConfig, find func(ctx context.Context, zone string) (string, error)) (config.DevboxConfig, error) {
+func resolveDNSZoneID(ctx context.Context, dcfg config.DevboxConfig, find zoneFinder) (config.DevboxConfig, error) {
 	if dcfg.DNSZoneID != "" || dcfg.DNSZone == "" {
 		return dcfg, nil
 	}

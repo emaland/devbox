@@ -142,7 +142,7 @@ rendered file exists only on the box.
 
 | Marker | Filled from | If not set |
 |--------|-------------|------------|
-| `@@DNS_ZONE_ID@@` | `dns_zone_id`, or looked up from `dns_zone` | The push stops with an error if the lookup fails |
+| `@@DNS_ZONE_ID@@` | `dns_zone_id`, or looked up from `dns_zone` | The command stops with an error before it changes anything if the lookup fails. With `dns_zone` empty too, the boot-time DNS update is skipped |
 | `@@DNS_RECORD_NAME@@` | `dns_name` | The boot-time DNS update is skipped |
 | `@@TAILSCALE_AUTH_KEY@@` | `tailscale_auth_key` | Tailscale auto-connect is skipped |
 | `@@DATA_VOLUME_ID@@` | the attached data volume | The format-if-blank service is skipped |
@@ -150,13 +150,22 @@ rendered file exists only on the box.
 
 Extra ssh public keys (a tablet, a second laptop) go in
 `~/.config/devbox/authorized_keys` on the machine you run `devbox` from, one
-`<type> <base64> [comment]` per line. Blank lines and `#` comments are ignored.
-Lines with options, or with a quote, backslash or dollar sign in the comment,
-are rejected. Do not add keys to `configuration.nix` itself.
+`<type> <base64> [comment]` per line, separated by single spaces. Blank lines
+and `#` comments are ignored. A line with options, control or non-ASCII
+characters, or a quote, backslash, dollar sign or `@@` in the comment is
+rejected, and the command stops before it touches any instance. Do not add keys
+to `configuration.nix` itself.
 
-If a key used to be written directly in `configuration.nix`, put it in that file
-**before** the next `devbox nix-update`. Otherwise the update removes it from
-the box.
+A push installs exactly the keys in that file and removes any other extra key
+from the box. `nix-update`, `spawn` and `resize` print how many keys they will
+install, and warn when it is none. If a key used to be written directly in
+`configuration.nix`, put it in that file **before** the next `devbox
+nix-update`.
+
+Docker and the Nix daemon keep data on `/home` and do not start when `/home` is
+not mounted. On a box that already has images under `/var/lib/docker`, moving
+the data root leaves them behind on the root disk; remove them by hand once the
+new location is in use.
 
 ### Required secrets
 
