@@ -62,7 +62,8 @@ fi
 
 # 2. State dir: the user's own, and private to the user.
 mkdir -p "$state"
-owner="$(stat -c %u "$state")"
+# -L: the owner of what chmod below changes, the directory, not a link to it.
+owner="$(stat -L -c %u "$state")"
 if [ "$owner" != "$(id -u)" ]; then
   refuse "the state dir $state is owned by uid $owner, not by this user ($(id -u)); give it to this user with chown"
 fi

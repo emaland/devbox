@@ -84,23 +84,24 @@ let
       ++ map (provider: provider.command) providerEntries));
 
   # The unit's main process: run the start-up checks, then become the
-  # gateway, whose command it is given as arguments. ExecStart therefore names
-  # the gateway's own store path (`<launcher> <node> <package>/…/cli.js …`),
-  # so tools of the same build can tell that the unit runs it. Prepare runs here rather than in ExecStartPre because systemd
-  # honours RestartPreventExitStatus for the main process only; a refusal
-  # (exit 78) must not be retried. The tools' PATH is given to prepare alone,
-  # so the gateway and its agents keep the unit's PATH.
-  prepareTools = lib.makeBinPath (with pkgs; [ jq iproute2 coreutils findutils gnused ]);
+  # gateway, whose command it is given as arguments. ExecStart therefore
+  # names the gateway's own store path (`<launcher> <node> <package>/…/cli.js
+  # …`), so tools of the same build can tell that the unit runs it.
   #
+  # Prepare runs here rather than in ExecStartPre because systemd honours
+  # RestartPreventExitStatus for the main process only; a refusal (exit 78)
+  # must not be retried. The tools' PATH is given to prepare alone, so the
+  # gateway and its agents keep the unit's PATH.
+  prepareTools = lib.makeBinPath (with pkgs; [ jq iproute2 coreutils findutils gnused ]);
   # The unit counts as started as soon as the launcher starts, so the start
   # timeout does not cover prepare (a large backup, say); the launcher bounds
   # it itself. A timeout exits 124, which is retried.
   launcher = pkgs.writeShellScript "ahp-gateway-launch" ''
-    PATH=${prepareTools} ${pkgs.coreutils}/bin/timeout ${toString startTimeout} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
     if [ "$#" -eq 0 ]; then
       echo "ahp-gateway-launch: no command to run" >&2
       exit 64
     fi
+    PATH=${prepareTools} ${pkgs.coreutils}/bin/timeout ${toString startTimeout} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
     exec "$@"
   '';
 

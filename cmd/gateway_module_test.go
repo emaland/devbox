@@ -661,15 +661,30 @@ func TestPrepareRefusesAStateDirOwnedBySomeoneElse(t *testing.T) {
 	if stat, ok := info.Sys().(interface{ Uid() uint32 }); ok && int(stat.Uid()) == os.Geteuid() {
 		t.Skip("/var/empty is ours here")
 	}
-	p := newPrepareBox(t)
-	p.stateDir = other
-	p.writeBase(trueProgram(t))
-	out, status := p.run(public022)
-	if status != 78 {
-		t.Fatalf("exit %d, want 78:\n%s", status, out)
-	}
-	if !strings.Contains(out, "owned") {
-		t.Errorf("the message should say who owns it: %s", out)
+	for name, stateDir := range map[string]func(t *testing.T) string{
+		"the directory itself": func(t *testing.T) string { return other },
+		// A link this user owns, to a directory it does not: the check must
+		// look at what chmod changes, the directory.
+		"a link to it": func(t *testing.T) string {
+			link := filepath.Join(t.TempDir(), "state")
+			if err := os.Symlink(other, link); err != nil {
+				t.Fatal(err)
+			}
+			return link
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := newPrepareBox(t)
+			p.stateDir = stateDir(t)
+			p.writeBase(trueProgram(t))
+			out, status := p.run(public022)
+			if status != 78 {
+				t.Fatalf("exit %d, want 78:\n%s", status, out)
+			}
+			if !strings.Contains(out, "owned") {
+				t.Errorf("the message should say who owns it: %s", out)
+			}
+		})
 	}
 }
 
@@ -867,7 +882,7 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 			t.Fatal(err)
 		}
 		pid := holdOpen(t, p.db())
-		got, status := p.runProgram([]string{launcher}, public022, clean...)
+		got, status := p.runProgram(unitCommand, public022, clean...)
 		if status != 78 || !strings.Contains(got, strconv.Itoa(pid)) {
 			t.Errorf("exit %d, want 78 naming pid %d:\n%s", status, pid, got)
 		}
@@ -880,7 +895,7 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer listener.Close()
-		if got, status := p.runProgram([]string{launcher}, public022, clean...); status != 78 {
+		if got, status := p.runProgram(unitCommand, public022, clean...); status != 78 {
 			t.Errorf("exit %d, want 78:\n%s", status, got)
 		}
 	})
@@ -914,6 +929,17 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 		}
 		if args := read(t, marker); args != "one\ntwo words\n" {
 			t.Errorf("the command got %q", args)
+		}
+	})
+
+	t.Run("with no command it stops before prepare changes anything", func(t *testing.T) {
+		p := newPrepareBox(t)
+		got, status := p.runProgram([]string{launcher}, public022, clean...)
+		if status != 64 {
+			t.Errorf("exit %d, want 64:\n%s", status, got)
+		}
+		if _, err := os.Stat(filepath.Join(p.stateDir, "token")); err == nil {
+			t.Error("prepare ran: a token was made")
 		}
 	})
 
