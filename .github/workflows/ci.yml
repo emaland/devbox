@@ -41,9 +41,29 @@ jobs:
         # A finding prints the rule, commit, file and line, never the value.
         # Do not fix a finding forward: the value stays in history. See
         # CONTRIBUTING.md.
+        #
+        # gitleaks' own verbose output is not used: besides the redacted
+        # match it prints the surrounding line and the commit author's name
+        # and email. The report goes to a file that is never uploaded, and
+        # only four fields of it are printed.
         run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/gitleaks-report.json"
+          status=0
           "$RUNNER_TEMP/gitleaks/gitleaks" git --redact=100 --no-banner --no-color \
-            --log-opts="--all" --verbose .
+            --log-opts="--all" --report-format json --report-path "$report" . \
+            >/dev/null 2>&1 || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "No findings."
+            exit 0
+          fi
+          if [ -s "$report" ]; then
+            echo "Findings (rule, commit, file, line):"
+            jq -r '.[] | "\(.RuleID)  \(.Commit[0:7])  \(.File)  \(.StartLine)"' "$report"
+          else
+            echo "gitleaks exited with status $status and wrote no report."
+          fi
+          exit 1
 
   go:
     # Minimal check on the existing code. The cmd tests start LocalStack in
