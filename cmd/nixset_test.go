@@ -5,10 +5,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -48,7 +51,14 @@ func newBox(t *testing.T) box {
 // status.
 func (b box) run(args ...string) (string, int) {
 	b.t.Helper()
+	return b.runEnv(nil, args...)
+}
+
+// runEnv is run with extra environment variables ("NAME=value").
+func (b box) runEnv(env []string, args ...string) (string, int) {
+	b.t.Helper()
 	command := exec.Command("sh", append([]string{realInstallScript()}, args...)...)
+	command.Env = append(os.Environ(), env...)
 	out, err := command.CombinedOutput()
 	var exit *exec.ExitError
 	switch {
@@ -65,6 +75,11 @@ func (b box) run(args ...string) (string, int) {
 // push packs a set and installs it, as a push does.
 func (b box) push(stamp, main, layout string, localModule []byte) (string, int) {
 	b.t.Helper()
+	return b.pushEnv(nil, stamp, main, layout, localModule)
+}
+
+func (b box) pushEnv(env []string, stamp, main, layout string, localModule []byte) (string, int) {
+	b.t.Helper()
 	tree := map[string][]byte{"devbox/modules/example.nix": []byte("{ }\n")}
 	if layout != "" {
 		tree["devbox/layout-version"] = []byte(layout + "\n")
@@ -77,7 +92,7 @@ func (b box) push(stamp, main, layout string, localModule []byte) (string, int) 
 	if err := os.WriteFile(tarball, packed, 0o600); err != nil {
 		b.t.Fatal(err)
 	}
-	return b.run("install", tarball, b.config, b.saved, stamp)
+	return b.runEnv(env, "install", tarball, b.config, b.saved, stamp)
 }
 
 func (b box) mustPush(stamp, main, layout string, localModule []byte) {
@@ -89,7 +104,7 @@ func (b box) mustPush(stamp, main, layout string, localModule []byte) {
 
 func (b box) mustSave() {
 	b.t.Helper()
-	if out, status := b.run("save", b.config, b.saved, "nobody-such-user:nobody-such-group"); status != 0 {
+	if out, status := b.run("save", b.config, b.saved); status != 0 {
 		b.t.Fatalf("save exited %d:\n%s", status, out)
 	}
 }
@@ -163,9 +178,9 @@ func TestInstallSetRefusesAnOlderLayout(t *testing.T) {
 	b := newBox(t)
 	b.mustPush("20260101T000000Z", "new layout\n", "2", nil)
 
-	for name, layout := range map[string]string{"older number": "1", "no layout file": ""} {
-		t.Run(name, func(t *testing.T) {
-			out, status := b.push("20260102T000000Z", "from an old CLI\n", layout, nil)
+	for i, layout := range []string{"1", ""} {
+		t.Run("layout "+strconv.Quote(layout), func(t *testing.T) {
+			out, status := b.push(fmt.Sprintf("2026010%dT000000Z", i+2), "from an old CLI\n", layout, nil)
 			if status != 3 {
 				t.Fatalf("exit %d, want 3:\n%s", status, out)
 			}
@@ -577,4 +592,337 @@ func TestSetForPush(t *testing.T) {
 			t.Fatal("the preflight should catch it before any instance work")
 		}
 	})
+}
+
+// ---- The saved copy is owned by the user; the script runs as root. ----
+
+// fresh replaces /etc/nixos with an empty directory, as an instance
+// replacement does. The saved copy on /home survives.
+func (b box) fresh() {
+	b.t.Helper()
+	if err := os.RemoveAll(b.config); err != nil {
+		b.t.Fatal(err)
+	}
+	if err := os.MkdirAll(b.config, 0o755); err != nil {
+		b.t.Fatal(err)
+	}
+}
+
+func TestCarryForwardDoesNotFollowLinksInTheSavedCopy(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "main\n", "1", []byte("operator\n"))
+	b.mustSave()
+	b.fresh()
+
+	secret := filepath.Join(t.TempDir(), "readable-only-by-root")
+	if err := os.WriteFile(secret, []byte("not for the box\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	savedLocal := filepath.Join(b.saved, "current", "local.nix")
+	if err := os.Remove(savedLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, savedLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	out, status := b.push("20260102T000000Z", "main two\n", "1", nil)
+	if status == 0 {
+		t.Errorf("a saved local.nix that is a link was accepted:\n%s", out)
+	}
+	if data, err := os.ReadFile(filepath.Join(b.config, "current", "local.nix")); err == nil && strings.Contains(string(data), "not for the box") {
+		t.Error("the link target was copied into the config")
+	}
+}
+
+func TestSaveDoesNotWriteThroughALinkedMarker(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "main\n", "1", []byte("operator\n"))
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("keep me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(b.saved, "local-module-expected")); err != nil {
+		t.Fatal(err)
+	}
+	b.mustSave()
+	if got := read(t, victim); got != "keep me\n" {
+		t.Errorf("save wrote through the marker link; the target now reads %q", got)
+	}
+}
+
+func TestRestoreRefusesAnUntrustworthySavedCopy(t *testing.T) {
+	setUp := func(t *testing.T) box {
+		b := newBox(t)
+		b.mustPush("20260101T000000Z", "in use\n", "1", nil)
+		b.mustSave()
+		return b
+	}
+	inUseSurvives := func(t *testing.T, b box) {
+		t.Helper()
+		if got := read(t, filepath.Join(b.config, "configuration.nix")); got != "in use\n" {
+			t.Errorf("the set in use was changed or lost: %q", got)
+		}
+		if _, err := os.Lstat(filepath.Join(b.config, "sets", "20260101T000000Z")); err != nil {
+			t.Errorf("the set in use was deleted: %v", err)
+		}
+	}
+	elsewhere := func(t *testing.T) string {
+		dir := filepath.Join(t.TempDir(), "elsewhere")
+		if err := os.MkdirAll(filepath.Join(dir, "devbox"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "configuration.nix"), []byte("from elsewhere\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	relink := func(t *testing.T, b box, target string) {
+		t.Helper()
+		current := filepath.Join(b.saved, "current")
+		if err := os.Remove(current); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, current); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name   string
+		break_ func(t *testing.T, b box)
+	}{
+		{"the saved set is a link to another directory", func(t *testing.T, b box) {
+			set := filepath.Join(b.saved, "sets", "20260105T000000Z")
+			if err := os.Symlink(elsewhere(t), set); err != nil {
+				t.Fatal(err)
+			}
+			relink(t, b, "sets/20260105T000000Z")
+		}},
+		{"current points outside sets/", func(t *testing.T, b box) {
+			relink(t, b, elsewhere(t))
+		}},
+		{"the saved set holds a link", func(t *testing.T, b box) {
+			src := filepath.Join(b.saved, "sets", "20260101T000000Z")
+			dst := filepath.Join(b.saved, "sets", "20260105T000000Z")
+			if err := exec.Command("cp", "-R", src, dst).Run(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dst, "configuration.nix"), []byte("changed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("/", filepath.Join(dst, "devbox", "root")); err != nil {
+				t.Fatal(err)
+			}
+			relink(t, b, "sets/20260105T000000Z")
+		}},
+		{"the saved set has no main file", func(t *testing.T, b box) {
+			dst := filepath.Join(b.saved, "sets", "20260105T000000Z")
+			if err := os.MkdirAll(filepath.Join(dst, "devbox"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			relink(t, b, "sets/20260105T000000Z")
+		}},
+		{"a set name with a newline", func(t *testing.T, b box) {
+			src := filepath.Join(b.saved, "sets", "20260101T000000Z")
+			dst := filepath.Join(b.saved, "sets", "\nb")
+			if err := exec.Command("cp", "-R", src, dst).Run(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dst, "configuration.nix"), []byte("changed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			relink(t, b, "sets/\nb")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := setUp(t)
+			tc.break_(t, b)
+			out, status := b.run("restore", b.config, b.saved)
+			if status == 0 {
+				t.Errorf("restore accepted it:\n%s", out)
+			}
+			inUseSurvives(t, b)
+		})
+	}
+}
+
+func TestPruneIgnoresNamesItDidNotMake(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "one\n", "1", nil)
+	odd := filepath.Join(b.config, "sets", "\nb")
+	if err := os.MkdirAll(odd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b.mustPush("20260102T000000Z", "two\n", "1", nil)
+	if got := read(t, filepath.Join(b.config, "configuration.nix")); got != "two\n" {
+		t.Fatalf("in use: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(b.config, "sets", "20260101T000000Z")); err != nil {
+		t.Errorf("the previous set was pruned: %v", err)
+	}
+}
+
+func TestInstallWhenTheSavedCopyCannotBeSeen(t *testing.T) {
+	t.Run("home volume exists but is not mounted, nothing on the box: stop", func(t *testing.T) {
+		b := newBox(t)
+		out, status := b.pushEnv([]string{"DEVBOX_SAVED_STATE=unmounted"}, "20260101T000000Z", "main\n", "1", nil)
+		if status != 4 {
+			t.Fatalf("exit %d, want 4:\n%s", status, out)
+		}
+		if exists(filepath.Join(b.config, "current")) {
+			t.Error("a set was switched to")
+		}
+	})
+	t.Run("home volume exists but is not mounted, local.nix on the box: go on", func(t *testing.T) {
+		b := newBox(t)
+		b.mustPush("20260101T000000Z", "main\n", "1", []byte("operator\n"))
+		out, status := b.pushEnv([]string{"DEVBOX_SAVED_STATE=unmounted"}, "20260102T000000Z", "main two\n", "1", nil)
+		if status != 0 {
+			t.Fatalf("exit %d:\n%s", status, out)
+		}
+		if got := read(t, filepath.Join(b.config, "current", "local.nix")); got != "operator\n" {
+			t.Errorf("local.nix = %q", got)
+		}
+	})
+	t.Run("a brand-new blank volume has no saved copy at all: go on", func(t *testing.T) {
+		b := newBox(t)
+		out, status := b.pushEnv([]string{"DEVBOX_SAVED_STATE=none"}, "20260101T000000Z", "main\n", "1", nil)
+		if status != 0 {
+			t.Fatalf("exit %d:\n%s", status, out)
+		}
+	})
+	t.Run("an unknown state is an error", func(t *testing.T) {
+		b := newBox(t)
+		if _, status := b.pushEnv([]string{"DEVBOX_SAVED_STATE=maybe"}, "20260101T000000Z", "main\n", "1", nil); status == 0 {
+			t.Error("accepted")
+		}
+	})
+}
+
+func TestInstallChecksTheLayoutOfTheSavedSetOnAFreshRoot(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "new layout\n", "2", nil)
+	b.mustSave()
+	b.fresh()
+	out, status := b.push("20260102T000000Z", "from an old CLI\n", "1", nil)
+	if status != 3 {
+		t.Fatalf("exit %d, want 3:\n%s", status, out)
+	}
+}
+
+func TestSaveRefreshesAChangedSavedSet(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "one\n", "1", nil)
+	b.mustSave()
+	// Same name, different content in the saved copy (for example a restore
+	// that was interrupted, or a hand edit).
+	if err := os.WriteFile(filepath.Join(b.saved, "current", "configuration.nix"), []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b.mustSave()
+	if got := read(t, filepath.Join(b.saved, "configuration.nix")); got != "one\n" {
+		t.Errorf("the saved copy was not refreshed: %q", got)
+	}
+}
+
+// The boot-time restore service lives in the template. Run its script with
+// the box's paths pointed at temporary directories.
+func runRestoreService(t *testing.T, b box) string {
+	t.Helper()
+	data, err := os.ReadFile(realTemplate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := regexp.MustCompile(`(?s)writeShellScript "devbox-restore-nixos-config" ''\n(.*?)\n\s*''\);`).FindSubmatch(data)
+	if match == nil {
+		t.Fatal("restore service script not found in the template")
+	}
+	script := strings.NewReplacer(
+		"/home/emaland/.config/devbox", b.saved,
+		"/etc/nixos", b.config,
+		"${pkgs.bash}/bin/sh", "sh",
+		"${./devbox/install_set.sh}", realInstallScript(),
+	).Replace(string(match[1]))
+	if strings.Contains(script, "${") && regexp.MustCompile(`\$\{(pkgs|\./)`).MatchString(script) {
+		t.Fatal("unhandled Nix interpolation left in the restore script")
+	}
+	out, err := exec.Command("sh", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("restore service failed: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+func TestRestoreServiceOldPathNeverWritesThroughTheLink(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "set in use\n", "1", nil)
+	// The saved copy is still the old single file: save never reached /home.
+	if err := os.WriteFile(filepath.Join(b.saved, "configuration.nix"), []byte("old single file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreService(t, b)
+	if got := read(t, filepath.Join(b.config, "sets", "20260101T000000Z", "configuration.nix")); got != "set in use\n" {
+		t.Errorf("the old single file was written into the set in use: %q", got)
+	}
+}
+
+func TestRestoreServiceRestoresTheSavedSet(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "saved set\n", "1", []byte("operator\n"))
+	b.mustSave()
+	b.fresh()
+	runRestoreService(t, b)
+	if got := read(t, filepath.Join(b.config, "configuration.nix")); got != "saved set\n" {
+		t.Errorf("in use after the restore service: %q", got)
+	}
+}
+
+func TestRestoreServiceOldSingleFileStillRestores(t *testing.T) {
+	b := newBox(t)
+	if err := os.WriteFile(filepath.Join(b.saved, "configuration.nix"), []byte("old single file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runRestoreService(t, b)
+	if got := read(t, filepath.Join(b.config, "configuration.nix")); got != "old single file\n" {
+		t.Errorf("configuration.nix = %q", got)
+	}
+}
+
+// The remote steps of a push, in order. Only the ordering and guards are
+// checked here; the script itself is exercised by the tests above.
+func TestRemoteApplyScript(t *testing.T) {
+	script := remoteApplyScript("/tmp/devbox-push.abc123", "20260101T000000Z")
+	at := func(needle string) int {
+		t.Helper()
+		i := strings.Index(script, needle)
+		if i < 0 {
+			t.Fatalf("apply script lacks %q:\n%s", needle, script)
+		}
+		return i
+	}
+	mount := at("mount /dev/disk/by-label/home-data /home")
+	state := at("DEVBOX_SAVED_STATE=")
+	install := at(" install /tmp/devbox-push.abc123/")
+	rebuild := at("nixos-rebuild switch")
+	save := at(" save " + remoteConfigDir + " " + remoteSavedDir)
+	if !(mount < state && state < install && install < rebuild) {
+		t.Error("order must be: mount /home, work out the saved state, install, then rebuild")
+	}
+	if !(install < save) {
+		t.Error("the saved copy must be written only after the set is installed")
+	}
+	if !strings.Contains(script, "runuser -u emaland") {
+		t.Error("the saved copy must be written as its owner, not by root")
+	}
+	if !strings.Contains(script, "mountpoint -q /home") {
+		t.Error("the saved copy must be written only when /home is mounted")
+	}
+	if !strings.Contains(script, "rm -rf /tmp/devbox-push.abc123") {
+		t.Error("the upload directory must be removed")
+	}
+	if strings.Contains(script, "'") {
+		t.Error("the apply script is single-quoted by the caller and must contain no single quote")
+	}
 }

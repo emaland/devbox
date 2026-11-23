@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -132,10 +133,85 @@ func describeInstallFailure(status string) string {
 	case "3":
 		return "this devbox CLI is older than the config on the box"
 	case "4":
-		return "the box expects an operator local.nix and none was found"
+		return "the operator's local.nix may be needed and could not be found, or the saved copy on /home is unusable or not mounted"
 	default:
 		return "install step exited " + status
 	}
+}
+
+// remoteUploadDir is what `mktemp -d /tmp/devbox-push.XXXXXXXXXX` prints.
+var remoteUploadDir = regexp.MustCompile(`^/tmp/devbox-push\.[A-Za-z0-9]{10}$`)
+
+// remoteApplyScript is what runs on the box, as root, inside a transient
+// systemd unit: install the uploaded set, rebuild, keep the saved copy in
+// step, and report the result in a marker file the poller reads.
+//
+// It contains no single quote, because the caller single-quotes it.
+func remoteApplyScript(uploadDir, stamp string) string {
+	installer := `sh ` + uploadDir + `/` + remoteInstallScriptName
+
+	// /home is mounted first: installing the set may need the saved copy on it
+	// (the operator's local.nix on a fresh root volume). On a fresh box /home
+	// is not mounted yet; mounting the data volume at its canonical mountpoint
+	// is what the switch's home.mount then finds already satisfied.
+	mountHome := `if ! mountpoint -q /home; then mount /dev/disk/by-label/home-data /home 2>/dev/null || true; fi`
+
+	// Whether the saved copy can be seen, for the install step: a home volume
+	// that exists but is not mounted hides it; a blank new volume has none.
+	savedState := `if mountpoint -q /home; then DEVBOX_SAVED_STATE=mounted; ` +
+		`elif blkid -L home-data >/dev/null 2>&1; then DEVBOX_SAVED_STATE=unmounted; ` +
+		`else DEVBOX_SAVED_STATE=none; fi; export DEVBOX_SAVED_STATE`
+
+	// The saved copy belongs to the user and is written as the user, never by
+	// root. The script is handed over on standard input, so the user does not
+	// need to read the upload directory. Only when /home is the real volume:
+	// a copy written to the root volume underneath it would be hidden, then
+	// restored over newer sets at the next boot.
+	persist := `if mountpoint -q /home && id emaland >/dev/null 2>&1; then ` +
+		`runuser -u emaland -- mkdir -p ` + remoteSavedDir + ` && ` +
+		`runuser -u emaland -- sh -s save ` + remoteConfigDir + ` ` + remoteSavedDir + ` <` + uploadDir + `/` + remoteInstallScriptName + ` ` +
+		`|| echo "devbox: warning: could not update the saved config set on /home"; ` +
+		`else echo "devbox: /home is not mounted; the saved config set was not updated"; fi`
+
+	// Reuse a local Nix binary cache kept on the persistent /home volume so a
+	// fresh box (post resize/recover) substitutes prebuilt paths from local gp3
+	// disk instead of re-downloading the whole closure from cache.nixos.org.
+	// The store lives on the *root* volume, which is new on every swap; only
+	// /home is recycled, so the closure is staged there. The staged paths are
+	// unsigned, so require-sigs=false (our own volume). Best effort: any
+	// failure just falls back to the network.
+	cacheDir := "/home/.nix-cache"
+	cachePre := `OPT=""; if [ -d ` + cacheDir + ` ]; then OPT="--option extra-substituters file://` + cacheDir + ` --option extra-trusted-substituters file://` + cacheDir + ` --option require-sigs false"; echo "devbox: substituting from local nix cache ` + cacheDir + `"; fi`
+	// cachePost repopulates the cache for the next fresh box after the rc
+	// marker is written, so the client returns as soon as the switch is done
+	// and the first-time copy (GBs) finishes inside the unit. Populated
+	// regardless of the switch's exit code: a flaky activation-time service
+	// still yields a valid /run/current-system.
+	cachePost := `if mountpoint -q /home; then echo "devbox: updating local nix cache in background"; mkdir -p ` + cacheDir + `; nix copy --to "file://` + cacheDir + `" /run/current-system 2>/dev/null || true; chown -R emaland:users ` + cacheDir + ` 2>/dev/null || true; fi`
+
+	// The script captures nixos-rebuild's own exit code (the trailing persist
+	// would otherwise mask it) and writes it to a marker file that signals
+	// completion to the poller. It sources /etc/set-environment for NIX_PATH
+	// (the transient unit's environment is otherwise minimal), and echoes a
+	// start marker so the poller shows only this run's log. If the set cannot
+	// be installed, nixos-rebuild is not run and the marker says so with an
+	// "install:" prefix, which the poller reports as a failure rather than as
+	// a rebuild warning.
+	return `echo ` + nixupStartMarker + `; ` +
+		`. /etc/set-environment 2>/dev/null || true; ` +
+		`export PATH=/run/wrappers/bin:/run/current-system/sw/bin:$PATH; ` +
+		`systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
+		mountHome + `; ` +
+		savedState + `; ` +
+		`if ` + installer + ` install ` + uploadDir + `/` + remoteSetTarName + ` ` + remoteConfigDir + ` ` + remoteSavedDir + ` ` + stamp + `; then ` +
+		persist + `; ` +
+		cachePre + `; ` +
+		`nixos-rebuild switch $OPT; rc=$?; ` +
+		persist + `; ` +
+		`echo "$rc" | tee /tmp/devbox-nixup.rc >/dev/null; ` +
+		cachePost + `; ` +
+		`else echo "install:$?" | tee /tmp/devbox-nixup.rc >/dev/null; fi; ` +
+		`rm -rf ` + uploadDir
 }
 
 func instancePublicIP(ctx context.Context, client *ec2.Client, instanceID string) (string, error) {
@@ -187,9 +263,23 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		return fmt.Errorf("writing the install script: %w", err)
 	}
 
+	// Upload into a directory of its own on the box, made by mktemp with mode
+	// 0700, never to fixed names in /tmp, where anything could have put a file
+	// of its own first.
+	mkdirArgs := append([]string{}, sshOpts...)
+	mkdirArgs = append(mkdirArgs, sshTarget, `mktemp -d /tmp/devbox-push.XXXXXXXXXX`)
+	out, err := exec.CommandContext(ctx, "ssh", mkdirArgs...).Output()
+	if err != nil {
+		return fmt.Errorf("creating an upload directory on %s: %w", instanceID, err)
+	}
+	remoteDir := strings.TrimSpace(string(out))
+	if !remoteUploadDir.MatchString(remoteDir) {
+		return fmt.Errorf("unexpected upload directory from %s: %q", instanceID, remoteDir)
+	}
+
 	fmt.Printf("Uploading %s and its modules to %s (%s)...\n", nixFile, instanceID, ip)
 	scpArgs := append([]string{}, sshOpts...)
-	scpArgs = append(scpArgs, localTar, localScript, sshTarget+":/tmp/")
+	scpArgs = append(scpArgs, localTar, localScript, sshTarget+":"+remoteDir+"/")
 	scpCmd := exec.CommandContext(ctx, "scp", scpArgs...)
 	scpCmd.Stdout = os.Stdout
 	scpCmd.Stderr = os.Stderr
@@ -197,93 +287,7 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		return fmt.Errorf("scp failed: %w", err)
 	}
 
-	// Move into place, save a copy to the persistent /home volume so it
-	// survives instance replacements, and rebuild.  nixos-rebuild switch
-	// exits non-zero if any service fails during activation, even when
-	// the config itself applied successfully — we treat that as a warning.
-	// Wait for the box to finish its initial boot before switching. SSH comes
-	// up early, and running `nixos-rebuild switch` while first-boot activation
-	// is still in flight collides on the switch-to-configuration transient unit
-	// (so /home wouldn't mount until a reboot). is-system-running --wait blocks
-	// until boot completes (running or degraded).
-	// Persist the saved /home copy BEFORE the switch (when /home is mounted) so
-	// the boot-time restore service sees a matching saved config and won't
-	// revert /etc/nixos to the older copy. nixos-rebuild switch restarts sshd
-	// and can cut this session short, so the before-switch copy is what makes
-	// the update stick on an existing box; the after-switch copy covers a fresh
-	// box whose /home only mounts during the switch.
-	fmt.Println("Waiting for boot to settle, then running nixos-rebuild switch...")
-	// Persist the saved /home copy BEFORE the switch so the boot-time restore
-	// service sees a matching saved config and skips (otherwise it reverts
-	// /etc/nixos to the older copy when the switch re-triggers it). cp is the
-	// critical step; chown is best-effort (emaland may not exist yet on a fresh
-	// box, where this copy lands on the not-yet-mounted /home and is harmless).
-	// This runs inside a systemd-run unit as root with a minimal PATH, so no
-	// sudo (unavailable there, and redundant) and set PATH explicitly so
-	// nixos-rebuild/cp/etc. resolve.
-	// The set is installed under /etc/nixos and mirrored to the saved copy by
-	// install_set.sh. `persist` is best effort: on a fresh box /home may not
-	// be the real volume yet.
-	installer := `sh /tmp/` + remoteInstallScriptName
-	persist := `mkdir -p ` + remoteSavedDir + `; ` +
-		installer + ` save ` + remoteConfigDir + ` ` + remoteSavedDir + ` emaland:users || true`
-	// Reuse a local Nix binary cache kept on the persistent /home volume so a
-	// fresh box (post resize/recover) substitutes prebuilt paths from local gp3
-	// disk instead of re-downloading the whole closure from cache.nixos.org.
-	//
-	// The store lives on the *root* volume, which is new on every swap; only
-	// /home is recycled — so we stage the closure there. On a fresh box /home is
-	// not mounted yet, so we mount the data volume at /home first (its canonical
-	// mountpoint, which the switch's home.mount then finds already satisfied) —
-	// that both exposes the cache for substitution and avoids a second mount of
-	// the same device. If a cache is present we point the switch at it; the paths
-	// we stage are unsigned, so require-sigs=false (our own volume). After the
-	// switch we (re)populate the cache from the running system for the next fresh
-	// box — regardless of the switch's exit code, since a flaky activation-time
-	// service (e.g. update-route53) still yields a valid /run/current-system.
-	// The whole thing is best-effort: any failure just falls back to the network.
-	cacheDir := "/home/.nix-cache"
-	// cachePre: on a fresh box /home is not mounted yet, so mount the data volume
-	// at /home (its canonical mountpoint, which the switch's home.mount then finds
-	// already satisfied) — that exposes the cache and avoids a second mount of the
-	// same device. If a cache is present, point the switch at it; the staged paths
-	// are unsigned, so require-sigs=false (our own volume).
-	mountHome := `if ! grep -qs " /home " /proc/mounts; then mount /dev/disk/by-label/home-data /home 2>/dev/null || true; fi`
-	cachePre := `OPT=""; if [ -d ` + cacheDir + ` ]; then OPT="--option extra-substituters file://` + cacheDir + ` --option extra-trusted-substituters file://` + cacheDir + ` --option require-sigs false"; echo "devbox: substituting from local nix cache ` + cacheDir + `"; fi`
-	// cachePost: repopulate the cache for the next fresh box. This runs AFTER the
-	// rc marker is written, so the client returns as soon as the switch is done —
-	// the first-time nix copy (~GBs) then finishes in the background inside the
-	// unit. Populated regardless of the switch's exit code (a flaky activation-time
-	// service still yields a valid /run/current-system). Best-effort throughout.
-	cachePost := `if grep -qs " /home " /proc/mounts; then echo "devbox: updating local nix cache in background"; mkdir -p ` + cacheDir + `; nix copy --to "file://` + cacheDir + `" /run/current-system 2>/dev/null || true; chown -R emaland:users ` + cacheDir + ` 2>/dev/null || true; fi`
-
-	// The apply script captures nixos-rebuild's own exit code (the trailing
-	// persist would otherwise mask it) and writes it to a marker file that
-	// signals completion to the poller below. It sources /etc/set-environment
-	// for NIX_PATH etc. (the transient unit's env is otherwise minimal, so
-	// nixos-rebuild can't find <nixpkgs/nixos>), and emits a start marker so
-	// the poller can show only the current run's log, not prior units' history.
-	// The rc marker is written before cachePost so the client isn't blocked on the
-	// slow first-time cache copy.
-	//
-	// /home is mounted first, because installing the set may need the saved
-	// copy on it (the operator's local.nix on a fresh root volume). If the set
-	// cannot be installed nothing is switched, and the marker file says so
-	// with an "install:" prefix, which the poller reports as a failure rather
-	// than as a rebuild warning.
-	applyScript := `echo ` + nixupStartMarker + `; ` +
-		`. /etc/set-environment 2>/dev/null || true; ` +
-		`export PATH=/run/wrappers/bin:/run/current-system/sw/bin:$PATH; ` +
-		`systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
-		mountHome + `; ` +
-		`if ` + installer + ` install /tmp/` + remoteSetTarName + ` ` + remoteConfigDir + ` ` + remoteSavedDir + ` ` + newSetStamp(time.Now()) + `; then ` +
-		persist + `; ` +
-		cachePre + `; ` +
-		`nixos-rebuild switch $OPT; rc=$?; ` +
-		persist + `; ` +
-		`echo "$rc" | tee /tmp/devbox-nixup.rc >/dev/null; ` +
-		cachePost + `; ` +
-		`else echo "install:$?" | tee /tmp/devbox-nixup.rc >/dev/null; fi`
+	applyScript := remoteApplyScript(remoteDir, newSetStamp(time.Now()))
 
 	// Run the switch as a transient systemd unit and poll for completion,
 	// instead of holding one long SSH channel open across the whole rebuild.
@@ -340,7 +344,7 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 			}
 			if rc := strings.TrimSpace(rcPart); rc != "" {
 				if status, failed := strings.CutPrefix(rc, "install:"); failed {
-					return fmt.Errorf("the config set was not installed on %s (%s); nothing was switched. The reason is in the output above", instanceID, describeInstallFailure(status))
+					return fmt.Errorf("the config set was not installed on %s (%s), and nixos-rebuild was not run. The reason is in the output above", instanceID, describeInstallFailure(status))
 				}
 				if rc != "0" {
 					fmt.Printf("\nWarning: nixos-rebuild exited %s (usually service-activation warnings, not a build failure).\n", rc)

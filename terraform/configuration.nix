@@ -236,21 +236,27 @@
     after       = [ "home.mount" ];
     before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" ];
     wantedBy    = [ "multi-user.target" ];
-    path        = [ pkgs.coreutils pkgs.findutils pkgs.diffutils ];
+    path        = [ pkgs.coreutils pkgs.findutils pkgs.diffutils pkgs.gnutar ];
     serviceConfig = {
       Type            = "oneshot";
       RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "devbox-restore-nixos-config" ''
         SAVED_DIR="/home/emaland/.config/devbox"
         CONFIG_DIR="/etc/nixos"
-        if [ -e "$SAVED_DIR/current/configuration.nix" ]; then
+        if [ -L "$SAVED_DIR/current" ] || [ -e "$SAVED_DIR/current" ]; then
           ${pkgs.bash}/bin/sh ${./devbox/install_set.sh} restore "$CONFIG_DIR" "$SAVED_DIR" \
             || echo "warning: could not restore the saved config set" >&2
           exit 0
         fi
+        # An old single-file saved copy. Only for a box that has never had a
+        # set: on one that has, configuration.nix is a link into the set in
+        # use, and copying over it would put an old main file beside a newer
+        # tree.
         SAVED="$SAVED_DIR/configuration.nix"
         TARGET="$CONFIG_DIR/configuration.nix"
-        if [ -r "$SAVED" ] && ! cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
+        if [ -L "$CONFIG_DIR/current" ] || [ -L "$TARGET" ]; then
+          echo "the saved copy is an old single file; keeping the config set in use"
+        elif [ -r "$SAVED" ] && ! cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
           echo "Syncing $TARGET from the persistent volume"
           cp "$SAVED" "$TARGET" || true
         else

@@ -151,7 +151,8 @@ volume, and restored from there at boot after an instance replacement.
   an instance replacement). Once a box has had one, a push that cannot find it
   anywhere stops before switching instead of building a system without it.
   It is not a place for secrets: it is readable by every user on the box and
-  its values end up in the Nix store.
+  its values end up in the Nix store. To stop using one, push an empty
+  module (`{ }`) as `local.nix`; a push never removes it on its own.
 - **Older CLI binaries.** A push carries a layout version. The box refuses a
   set older than the one it runs, so an old binary cannot push a config that
   lacks modules the box depends on. Binaries from before this check push a
