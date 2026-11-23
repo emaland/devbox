@@ -1,8 +1,10 @@
 # 031: Devbox lifecycle: auto-stop that sees agents, spot notices, clean stop, resume on boot
 
-Status: **proposed, revision 2** (answers the first design review: every CLI
-stop path, stale spot notices, a requested stop while the gateway restarts,
-where `resume status` reads its source). Builds on note 030 (the gateway as a
+Status: **accepted at design review, revision 3.** Revision 2 answered the
+first review (every CLI stop path, stale spot notices, a requested stop while
+the gateway restarts, where `resume status` reads its source); revision 3
+takes the diff check's two remaining points (the unreachable rule in time,
+and no cap exemption for attached clients). Builds on note 030 (the gateway as a
 system unit). Covers auto-stop, the spot interruption watcher, the stop paths
 and resume on boot. The CLI commands that sit on top (`devbox agents`,
 `devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
@@ -124,18 +126,19 @@ cap (`/etc/devbox/autostop-busy-cap`, default 12 h, `off` disables it),
 | 7 | No gateway installed | not activity | clear busy-since |
 | 8 | 5 to 7, window elapsed since last-active | **stop** (idle) | |
 | 9 | 5 to 7, window not elapsed | nothing | |
-| 10 | `stop-when-idle` requested (2.6), and the gateway answered idle or waiting, or no gateway is installed, or it has been unreachable for 3 polls in a row | **stop** (requested), logins ignored | |
+| 10 | `stop-when-idle` requested (2.6), and the gateway answered idle or waiting, or no gateway is installed, or it has been unreachable without a break for 30 min | **stop** (requested), logins ignored | `unreachable-since` |
 
-Row 10 never stops on a single unreachable answer: right after boot, during
+Row 10 never stops on an unreachable answer alone: right after boot, during
 start-up repair or a restart after a crash, the gateway cannot yet report the
-continuations it is about to start. Three polls (30 min) of unreachable is
-"the gateway is not coming back", and the box is not kept up for it.
+continuations it is about to start. Thirty minutes unreachable is "the
+gateway is not coming back", and the box is not kept up for it. The rule is
+in time, not polls, because each request also runs a poll at once.
 
 "Continuously busy" means busy at every poll: one poll that is not busy
-clears `busy-since`. A login clears it too, and so does `clients > 0` in the
-status (an editor attached through a tunnel `who` does not show), since the
-cap exists for boxes nobody is watching; a client does not count as activity
-for the idle window. A turn that waits for permission is not activity
+clears `busy-since`. A login clears it too, since the cap exists for boxes
+nobody is watching. An attached editor does not: a laptop left awake with a
+tunnel up must not keep a stuck agent running, and a tunnel over ssh already
+counts as a login. A turn that waits for permission is not activity
 (row 5), so a box left with a question on screen stops after the idle window
 like before. The waiting turn is continued at the next start, once and only
 within the gateway's maximum age for continuations; a second interruption, or
@@ -350,7 +353,7 @@ approval per run) is the only place the real EC2 timings can be seen.
 | Every row of the auto-stop table, including the cap reached, the cap `off`, an unreachable gateway logged once and again when the reason changes, a bad token file | Go test runs `autostop.sh` with fakes for `who`, `ss`, `aws`, `systemctl`, `date` and a local HTTP server for `/status` | shell |
 | The token reaches the gateway only as the `Authorization` header and is in no argument, log line or notice | Same harness: the server checks the header, the fakes record their arguments | shell |
 | Stop order: notice, gateway stop, then `stop-instances`; a failed gateway stop still stops the instance; a failed `stop-instances` starts the gateway again | Fakes record the order | shell |
-| Row 10: a requested stop does not happen on one or two unreachable polls and does on the third; a `clients > 0` poll clears the cap | Same harness | shell |
+| Row 10: a requested stop does not happen on quick repeated unreachable polls, nor before 30 min unreachable after an answer, and does at 30 min; an attached client does not hold off the cap | Same harness | shell |
 | Watcher: no notice; stop notice (gateway stopped once, notice posted once, not repeated after a watcher restart, redone when the watcher died before `stopped` was written); rebalance (notice, no stop); a notice dated before boot or more than 2 min in the past (no stop); metadata unreachable (logged once) and recovering; token renewal on 401; still running 5 min after the action time, with the notice still shown, starts the gateway once | Go test runs `spot-watch.sh --once` repeatedly, and once in its loop, against a fake metadata server, with boot time and clock from fakes | shell |
 | CLI guard on `down`, `restart`, `reboot`, `terminate`, `resize`: refuses busy and unreadable, `--force` goes on, `--hard` skips ssh, a failed dry run stops before the gateway is touched, a failed EC2 call starts the gateway again, several ids are all checked first | Go tests with the ssh call and EC2 faked | Go |
 | Resume summary: each row of 2.7, and the wait ending while still pending | Go test with the HTTP server | shell |
