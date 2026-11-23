@@ -3,18 +3,23 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/spf13/cobra"
 )
 
 func newTerminateCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+	cmd := &cobra.Command{
 		Use:   "terminate [instance-id]",
 		Short: "Terminate a spot instance and cancel its spot request",
 		Long: `Terminate a spot instance, cancel its persistent spot request, and
-report which EBS volumes were preserved (DeleteOnTermination=false).`,
+report which EBS volumes were preserved (DeleteOnTermination=false). A running
+instance is refused while an agent is working, and its gateway is stopped
+cleanly first so the sessions on the data volume can be continued elsewhere.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			instanceID := ""
@@ -31,9 +36,38 @@ report which EBS volumes were preserved (DeleteOnTermination=false).`,
 				}
 				instanceID = id
 			}
-			return terminateInstance(cmd.Context(), ec2Client, instanceID)
+			ctx := cmd.Context()
+			running, err := instanceIsRunning(ctx, ec2Client, instanceID)
+			if err != nil {
+				return err
+			}
+			if !running {
+				return terminateInstance(ctx, ec2Client, instanceID)
+			}
+			guard := stopGuard{force: force, out: os.Stdout}
+			return guard.run(ctx, []string{instanceID},
+				func(ctx context.Context) error {
+					_, err := ec2Client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{instanceID}, DryRun: aws.Bool(true)})
+					return dryRunAllowed(err)
+				},
+				func(ctx context.Context) error { return terminateInstance(ctx, ec2Client, instanceID) })
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "terminate even if an agent is working, or its status cannot be read (the gateway is still stopped cleanly first)")
+	return cmd
+}
+
+// instanceIsRunning: only a running instance has a gateway to check.
+func instanceIsRunning(ctx context.Context, client *ec2.Client, instanceID string) (bool, error) {
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}})
+	if err != nil {
+		return false, fmt.Errorf("describing instance: %w", err)
+	}
+	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
+		return false, fmt.Errorf("instance %s not found", instanceID)
+	}
+	state := desc.Reservations[0].Instances[0].State
+	return state != nil && (state.Name == types.InstanceStateNameRunning || state.Name == types.InstanceStateNamePending), nil
 }
 
 func terminateInstance(ctx context.Context, client *ec2.Client, instanceID string) error {

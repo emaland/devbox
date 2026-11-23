@@ -247,7 +247,7 @@ func recoverInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.
 func tryResizeCandidates(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, instanceID string, candidates []awsutil.SpotSearchResult) error {
 	for i, c := range candidates {
 		fmt.Printf("Trying %s ($%.2f/day)...\n", c.InstanceType, c.Price*24)
-		err := resizeInstance(ctx, dcfg, client, r53client, instanceID, c.InstanceType)
+		err := resizeInstance(ctx, dcfg, client, r53client, stopGuard{out: os.Stdout}, instanceID, c.InstanceType)
 		if err == nil {
 			return nil
 		}
