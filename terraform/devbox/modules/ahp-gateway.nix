@@ -89,8 +89,12 @@ let
   # (exit 78) must not be retried. The tools' PATH is given to prepare alone,
   # so the gateway and its agents keep the unit's PATH.
   prepareTools = lib.makeBinPath (with pkgs; [ jq iproute2 coreutils findutils gnused ]);
+  #
+  # The unit counts as started as soon as the launcher starts, so the start
+  # timeout does not cover prepare (a large backup, say); the launcher bounds
+  # it itself. A timeout exits 124, which is retried.
   launcher = pkgs.writeShellScript "ahp-gateway-launch" ''
-    PATH=${prepareTools} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
+    PATH=${prepareTools} ${pkgs.coreutils}/bin/timeout ${toString startTimeout} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
     exec ${node} ${cli} --config ${runtimeConfig}
   '';
 
@@ -235,7 +239,8 @@ in
       {
         # Without linger the user's runtime directory goes away at the last
         # logout, under the running gateway and its agents.
-        assertion = account.linger or false;
+        # null (the default) means "not managed", which is not enough here.
+        assertion = account.linger == true;
         message = "services.ahp-gateway: users.users.${cfg.user}.linger must be true.";
       }
       {
@@ -283,9 +288,9 @@ in
       unitConfig = {
         RequiresMountsFor = [ cfg.stateDir home ];
         StartLimitBurst = 5;
-        # Five starts that each spend a full start timeout in prepare and
-        # another waiting for readiness, then stop and wait, must fit inside
-        # the window, or the limit is never reached.
+        # Five starts that each spend a full start timeout in prepare (bounded
+        # by the launcher) and another waiting for readiness, then stop and
+        # wait, must fit inside the window, or the limit is never reached.
         StartLimitIntervalSec = 6 * (2 * startTimeout + cfg.stopTimeoutSec + 2);
       };
 

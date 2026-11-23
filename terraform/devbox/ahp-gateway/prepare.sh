@@ -33,7 +33,7 @@ refuse() {
 }
 
 # Every check below fails closed: a missing tool is a refusal, not a pass.
-for tool in jq ss find realpath sort; do
+for tool in jq ss find realpath sort sed; do
   command -v "$tool" >/dev/null 2>&1 || refuse "$tool is not available, so the start-up checks cannot run"
 done
 
@@ -68,6 +68,9 @@ chmod 0700 "$state"
 if [ -L "$token_file" ] && [ ! -e "$token_file" ]; then
   refuse "the token file $token_file is a link to nothing; remove it and a new one is made at the next start"
 fi
+if [ -e "$token_file" ] && { [ ! -f "$token_file" ] || [ ! -r "$token_file" ]; }; then
+  refuse "the token file $token_file is not a readable file"
+fi
 if [ ! -e "$token_file" ]; then
   temporary="$token_file.new.$$"
   rm -f "$temporary"
@@ -80,16 +83,13 @@ if [ ! -e "$token_file" ]; then
   ln "$temporary" "$token_file" 2>/dev/null || true
   rm -f "$temporary"
 fi
-chmod 0600 "$token_file"
-# One line of URL-safe characters, at least 32 of them.
-token_value="$(cat "$token_file")"
-case "$token_value" in
-  *[!A-Za-z0-9_-]*) refuse "the token file $token_file holds something other than one line of letters, digits, - and _; remove it and a new one is made at the next start" ;;
-esac
-if [ "${#token_value}" -lt 32 ]; then
-  refuse "the token file $token_file is empty or too short; remove it and a new one is made at the next start"
+chmod 0600 "$token_file" 2>/dev/null || refuse "cannot set the mode of the token file $token_file; is it owned by another user?"
+# One line of at least 32 letters, digits, - and _, and an optional newline.
+# Checked by jq, the same reader that writes it into the config below: the
+# shell would drop NUL bytes and every trailing newline before checking.
+if ! jq -Rse 'test("\\A[A-Za-z0-9_-]{32,}\\n?\\z")' "$token_file" >/dev/null 2>&1; then
+  refuse "the token file $token_file must hold one line of at least 32 letters, digits, - and _; remove it and a new one is made at the next start"
 fi
-unset token_value
 
 # 4. Every enabled provider is a program in the Nix store: nothing is
 #    downloaded or looked up on PATH when a session starts.
@@ -165,12 +165,19 @@ fi
 case "$change" in
   older)
     if [ "$allow_downgrade" != 1 ]; then
+      # Prefer the newest backup made while this version was the one that
+      # wrote the database (it is labelled with that version); otherwise the
+      # newest of all.
+      chosen=""
       newest=""
       for candidate in "$backup_dir"/devbox-*; do
-        [ -d "$candidate" ] && newest="$candidate"
+        [ -d "$candidate" ] || continue
+        newest="$candidate"
+        case "$candidate" in *-"$build_version") chosen="$candidate" ;; esac
       done
-      if [ -n "$newest" ]; then
-        restore="To go back, stop ahp-gateway.service, copy the files in $newest over $database and its -wal and -shm files, and delete $record"
+      [ -n "$chosen" ] || chosen="$newest"
+      if [ -n "$chosen" ]; then
+        restore="To go back, stop ahp-gateway.service, remove $database-wal and $database-shm, copy the files in $chosen over the database, and delete $record"
       else
         restore="There is no backup in $backup_dir to go back to"
       fi

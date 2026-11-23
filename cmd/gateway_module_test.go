@@ -81,7 +81,7 @@ let
     d=$out/lib/node_modules/ahp-acp-gateway
     mkdir -p $d/dist/src
     cp ${%s} $d/ahp-acp-gateway.default.json
-    echo 'process.exit(0)' > $d/dist/src/cli.js
+    echo 'if (process.env.AHP_TEST_MARKER) require("fs").writeFileSync(process.env.AHP_TEST_MARKER, "ran\\n"); process.exit(0)' > $d/dist/src/cli.js
   '';
   system = extra: import <nixpkgs/nixos> {
     configuration = { lib, ... }: {
@@ -306,6 +306,20 @@ func TestGatewayModuleAssertions(t *testing.T) {
 		case tc.want != "" && !strings.Contains(got, tc.want):
 			t.Errorf("%s: want a failing assertion mentioning %q, got %q", tc.name, tc.want, got)
 		}
+	}
+}
+
+func TestGatewayModuleRequiresLinger(t *testing.T) {
+	needNix(t)
+	expression := strings.Replace(moduleExpression(t, "{}"),
+		"uid = 1234; linger = true;", "uid = 1234;", 1)
+	if !strings.Contains(expression, "uid = 1234; };") {
+		t.Fatal("test fixture changed; update this test")
+	}
+	var messages []string
+	evalJSON(t, "let s = "+expression+"; in map (a: a.message) (builtins.filter (a: !a.assertion) s.config.assertions)", "", &messages)
+	if !strings.Contains(strings.Join(messages, "\n"), "linger") {
+		t.Errorf("want a failing assertion about linger, got %q", messages)
 	}
 }
 
@@ -657,6 +671,8 @@ func TestPrepareRefusesAMalformedToken(t *testing.T) {
 		"inner space":       valid[:20] + " " + valid[20:] + "\n",
 		"second line":       valid + "\n" + valid + "\n",
 		"control character": valid + "\x01\n",
+		"NUL byte":          valid + "\x00" + valid + "\n",
+		"several newlines":  valid + "\n\n\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := newPrepareBox(t)
@@ -671,6 +687,15 @@ func TestPrepareRefusesAMalformedToken(t *testing.T) {
 			}
 		})
 	}
+	t.Run("a directory", func(t *testing.T) {
+		p := newPrepareBox(t)
+		if err := os.MkdirAll(filepath.Join(p.stateDir, "token"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if out, status := p.run(public022); status != 78 {
+			t.Errorf("exit %d, want 78:\n%s", status, out)
+		}
+	})
 	t.Run("a dangling link", func(t *testing.T) {
 		p := newPrepareBox(t)
 		if err := os.MkdirAll(p.stateDir, 0o700); err != nil {
@@ -828,12 +853,24 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 
 	t.Run("a good start runs the gateway after prepare", func(t *testing.T) {
 		p := newPrepareBox(t)
-		got, status := p.runProgram([]string{launcher}, public022, clean...)
+		marker := filepath.Join(t.TempDir(), "gateway-ran")
+		got, status := p.runProgram([]string{launcher}, public022, append(clean, "AHP_TEST_MARKER="+marker)...)
 		if status != 0 {
 			t.Fatalf("exit %d:\n%s", status, got)
 		}
 		if _, err := os.Stat(p.runtime); err != nil {
 			t.Errorf("prepare did not write the runtime config: %v", err)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Error("the gateway did not run after prepare")
+		}
+	})
+
+	t.Run("prepare is bounded in time", func(t *testing.T) {
+		// The unit counts as started when the launcher starts, so the start
+		// timeout does not cover prepare; the launcher must bound it.
+		if text := read(t, launcher); !strings.Contains(text, "/bin/timeout ") {
+			t.Errorf("the launcher does not bound prepare:\n%s", text)
 		}
 	})
 }
@@ -944,12 +981,31 @@ func TestPrepareBuildRecord(t *testing.T) {
 			if !strings.Contains(out, "backups/devbox-") {
 				t.Errorf("the refusal should name the backup to restore: %s", out)
 			}
+			if !strings.Contains(out, "remove") || !strings.Contains(out, "-wal") {
+				t.Errorf("the restore steps must say to remove the live -wal and -shm first: %s", out)
+			}
 			// Allowed with the option.
 			if out, status := p.run(tc.second, "AHP_GATEWAY_ALLOW_DOWNGRADE=1"); status != 0 {
 				t.Errorf("refused even with allowDowngrade:\n%s", out)
 			}
 		})
 	}
+
+	t.Run("the refusal names the backup made for the version being started", func(t *testing.T) {
+		p := withDatabase(t)
+		p.mustRun(forkH1) // backup labelled unknown
+		p.mustRun(forkH2) // backup labelled 0.2.2-h.1: what h.1 can read
+		rebuilt := forkH2
+		rebuilt[2] = "/nix/store/ffffffffffffffffffffffffffffffff-ahp-acp-gateway-0.2.2-h.2"
+		p.mustRun(rebuilt) // newest backup, labelled 0.2.2-h.2
+		out, status := p.run(forkH1)
+		if status != 78 {
+			t.Fatalf("exit %d:\n%s", status, out)
+		}
+		if !strings.Contains(out, "-0.2.2-h.1 ") && !strings.Contains(out, "-0.2.2-h.1,") {
+			t.Errorf("want the backup labelled 0.2.2-h.1, got: %s", out)
+		}
+	})
 
 	t.Run("five newest backups are kept, partial copies are cleared", func(t *testing.T) {
 		p := withDatabase(t)
