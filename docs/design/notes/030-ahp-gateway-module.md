@@ -127,7 +127,8 @@ checked against the running process at start.
   reads the built-in provider ids from the package's default config at build
   time. A built-in that is not in `providers` is disabled. A provider whose id
   equals a built-in's is written as one entry that replaces the built-in's
-  program, arguments and environment in full, so no `npx --yes` launcher stays
+  program and arguments (the gateway merges `env` key by key, so a built-in's
+  own environment stays unless set again), so no `npx --yes` launcher stays
   enabled, including in a build that adds a built-in. Keeping the built-in id
   matters: a session stores the id of its provider, and the public release
   refuses a prompt for a session whose provider id it does not know. Sessions
@@ -171,8 +172,7 @@ Environment=HOME=… SHELL=… PATH=… XDG_RUNTIME_DIR=… NIX_PATH=…
 Environment=AHP_GATEWAY_STATE_DIR=<stateDir>
 Environment=AHP_GATEWAY_CLOSURE=<store path that references package, providers, config>
 UnsetEnvironment=CLAUDECODE
-ExecStartPre=<prepare>
-ExecStart=<node> <package>/…/cli.js --config /run/ahp-gateway/config.json
+ExecStart=<launcher: prepare, bounded by a timeout, then exec node <package>/…/cli.js --config /run/ahp-gateway/config.json>
 ExecStartPost=<wait until ready, and check it is ours and closed>
 Restart=on-failure
 RestartSec=2
@@ -200,6 +200,11 @@ NixOS options on the unit: `restartIfChanged = false`.
   are created under a tight umask in prepare, and the database is protected by
   the 0700 state dir.
 - **Prepare** runs as the user, never root, and does not open the database.
+  It runs inside the launcher that is the unit's main process, not in
+  `ExecStartPre`: systemd honours `RestartPreventExitStatus` for the main
+  process only, and a refusal (exit 78) must not be retried. The unit counts
+  as started when the launcher starts, so the launcher bounds prepare's time
+  itself.
   1. Refuse if anything is listening on the port, or if any process of this
      user has the database file open (a scan of `/proc/*/fd`). The second
      check catches a gateway on another port, and one still in its start-up
