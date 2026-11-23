@@ -256,7 +256,7 @@ in
       }
     ];
 
-    services.ahp-gateway.generated = { inherit baseConfig closure launcher; };
+    services.ahp-gateway.generated = { inherit baseConfig closure launcher commands; };
 
     environment.etc.${clientConfig}.text = builtins.toJSON {
       managedBy = "system";

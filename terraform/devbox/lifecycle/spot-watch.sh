@@ -77,7 +77,10 @@ session_token() {
 read_item() {
   for attempt in 1 2; do
     token="$(session_token)" || { echo 000; return; }
-    code="$(curl -s --max-time 2 -o "$2" -w '%{http_code}' -H "X-aws-ec2-metadata-token: $token" "$imds/latest/meta-data/$1")" || code=000
+    case "$token" in *[!A-Za-z0-9_=+/-]*) rm -f "$state/token"; echo 000; return ;; esac
+    # The session token goes on standard input, not on the command line.
+    code="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" |
+      curl -s --max-time 2 -o "$2" -w '%{http_code}' -K - "$imds/latest/meta-data/$1")" || code=000
     if [ "$code" = 401 ] && [ "$attempt" = 1 ]; then
       rm -f "$state/token" "$state/token-expires"
       continue
@@ -94,7 +97,9 @@ key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
 summary() {
   out="$(sh "$lib/gateway-status.sh")"
   case $? in
-    0) printf '%s\n' "$out" | sed -n 2p | jq -r '"\(.sessions.total // "?") sessions, \(.turns.active - .turns.waitingForUser) turns running, \(.turns.waitingForUser) waiting"' 2>/dev/null ;;
+    # Numbers only: the answer's text never reaches a notice.
+    0) printf '%s\n' "$out" | sed -n 2p | jq -r '(.sessions.total | numbers // "?") as $s
+         | "\($s) sessions, \(.turns.active - .turns.waitingForUser) turns running, \(.turns.waitingForUser) waiting"' 2>/dev/null ;;
     2) echo "gateway not answering ($out)" ;;
     *) echo "no gateway" ;;
   esac
@@ -102,8 +107,12 @@ summary() {
 
 on_interruption() {
   body="$1"
-  action="$(jq -r '.action // empty' "$body" 2>/dev/null)"
-  at="$(jq -r '.time // empty' "$body" 2>/dev/null)"
+  # Only known actions and a plain UTC time: these values reach the log and
+  # the notice.
+  action="$(jq -r 'if (.action | type) == "string" then .action else empty end' "$body" 2>/dev/null)"
+  at="$(jq -r 'if (.time | type) == "string" then .time else empty end' "$body" 2>/dev/null)"
+  case "$action" in stop | hibernate | terminate) ;; *) action="" ;; esac
+  case "$at" in "" | *[!0-9TZ:.-]*) at="" ;; esac
   [ -n "$action" ] && [ -n "$at" ] || { problem="instance-action is not the expected JSON"; return; }
   dir="$state/notice-$(key "$action-$at")"
   mkdir -p "$dir"
@@ -111,6 +120,7 @@ on_interruption() {
   if [ ! -f "$dir/seen" ]; then
     at_epoch="$(date -u -d "$at" +%s 2>/dev/null)" || at_epoch=0
     echo "$at_epoch" >"$dir/time"
+    echo "$action" >"$dir/action"
     now="$(date +%s)"
     if [ "$at_epoch" -lt "$boot_time" ] || [ $((now - at_epoch)) -gt "$stale_after" ]; then
       touch "$dir/stale" "$dir/seen"
@@ -122,13 +132,19 @@ on_interruption() {
   fi
   [ -f "$dir/stale" ] && return
 
+  # Each step has its own marker, so a watcher restarted between steps redoes
+  # only what is not marked. The notice runs alongside the stop.
+  [ -f "$dir/stopped" ] && [ -f "$dir/noticed" ] && return
+  sessions="$(summary)"
+  if [ ! -f "$dir/noticed" ]; then
+    (sh "$lib/notify.sh" "spot interruption: $action at $at; $sessions. Stopping the gateway so its turns can be continued." &&
+      touch "$dir/noticed") &
+  fi
   if [ ! -f "$dir/stopped" ]; then
-    sessions="$(summary)"
-    if [ ! -f "$dir/noticed" ]; then
-      (sh "$lib/notify.sh" "spot interruption: $action at $at; $sessions. Stopping the gateway so its turns can be continued." &&
-        touch "$dir/noticed") &
-    fi
     if systemctl is-active --quiet "$unit"; then
+      # Written before the stop: a watcher that dies before recording the
+      # result still knows the gateway is its to start again.
+      touch "$dir/stopping"
       started="$(date +%s)"
       if timeout "$stop_timeout" systemctl stop "$unit"; then
         log "gateway stopped in $(($(date +%s) - started))s ($sessions)"
@@ -136,11 +152,13 @@ on_interruption() {
       else
         log "gateway did not stop within ${stop_timeout}s"
       fi
+    elif [ -f "$dir/stopping" ]; then
+      echo ours >"$dir/stopped"
     else
       echo "not running" >"$dir/stopped"
     fi
-    wait
   fi
+  wait
 }
 
 # check_withdrawn: a gateway this watcher stopped is started again when the
@@ -154,15 +172,23 @@ check_withdrawn() {
     case "$at_epoch" in "" | *[!0-9]*) continue ;; esac
     if [ "$(date +%s)" -ge $((at_epoch + withdrawn_after)) ]; then
       touch "$dir/done"
-      log "interruption did not happen; starting the gateway again"
+      # A hibernated instance resumes with /run and the boot time intact:
+      # the interruption did happen, and nothing else starts the gateway.
+      if [ "$(cat "$dir/action" 2>/dev/null)" = hibernate ]; then
+        what="resumed after hibernation"
+      else
+        what="interruption did not happen"
+      fi
+      log "$what; starting the gateway again"
       systemctl start --no-block "$unit"
-      sh "$lib/notify.sh" "the spot interruption did not happen; the gateway is started again"
+      sh "$lib/notify.sh" "spot: $what; the gateway is started again"
     fi
   done
 }
 
 on_rebalance() {
-  at="$(jq -r '.noticeTime // empty' "$1" 2>/dev/null)"
+  at="$(jq -r 'if (.noticeTime | type) == "string" then .noticeTime else empty end' "$1" 2>/dev/null)"
+  case "$at" in *[!0-9TZ:.-]*) at="" ;; esac
   [ -n "$at" ] || { problem="rebalance recommendation is not the expected JSON"; return; }
   dir="$state/rebalance-$(key "$at")"
   [ -d "$dir" ] && return

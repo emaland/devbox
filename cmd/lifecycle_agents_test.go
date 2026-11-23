@@ -140,9 +140,26 @@ func TestDevboxAgentsResumeStatusReadsTheRunningGateway(t *testing.T) {
 	}
 }
 
+// wrapperAt writes a fake of the module's wrapper outside PATH and returns
+// its absolute path.
+func (b *lifecycleBox) wrapperAt(name string) string {
+	b.t.Helper()
+	dir := filepath.Join(b.root, "store", name, "bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.t.Fatal(err)
+	}
+	path := filepath.Join(dir, "ahp-acp-gateway")
+	script := "#!/bin/sh\n" + fakePrograms + `record ` + name + ` "$@"` + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		b.t.Fatal(err)
+	}
+	return path
+}
+
 func TestDevboxAgentsResumeOnOff(t *testing.T) {
 	b := newLifecycleBox(t)
-	b.fakeProgram("ahp-acp-gateway", `record ahp-acp-gateway "$@"`)
+	wrapper := b.wrapperAt("module-wrapper")
+	b.env = append(b.env, "DEVBOX_GATEWAY_COMMAND="+wrapper)
 	for _, value := range []string{"on", "off"} {
 		// Without the module saying the wrapper offers resume, the command
 		// is never run.
@@ -155,7 +172,7 @@ func TestDevboxAgentsResumeOnOff(t *testing.T) {
 	for _, value := range []string{"on", "off"} {
 		b.clearCalls()
 		out, status := b.run("devbox-agents.sh", "resume", value)
-		if status != 0 || strings.Join(b.calls(), "\n") != "ahp-acp-gateway resume "+value {
+		if status != 0 || strings.Join(b.calls(), "\n") != "module-wrapper resume "+value {
 			t.Fatalf("resume %s: exit %d %q calls %v", value, status, out, b.calls())
 		}
 	}
@@ -164,9 +181,27 @@ func TestDevboxAgentsResumeOnOff(t *testing.T) {
 	}
 }
 
-func TestDevboxAgentsResumeWithoutTheCommandOnPath(t *testing.T) {
+// Review finding: a copy of the gateway earlier on the user's PATH (a build
+// without subcommands would start a second server) is never run.
+func TestDevboxAgentsResumeIgnoresAGatewayOnPath(t *testing.T) {
 	b := newLifecycleBox(t)
-	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1", "DEVBOX_GATEWAY_COMMAND=no-such-gateway-command")
+	b.fakeProgram("ahp-acp-gateway", `record shadow "$@"`)
+	wrapper := b.wrapperAt("module-wrapper")
+	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1", "DEVBOX_GATEWAY_COMMAND="+wrapper)
+	if out, status := b.run("devbox-agents.sh", "resume", "on"); status != 0 || strings.Join(b.calls(), "\n") != "module-wrapper resume on" {
+		t.Fatalf("exit %d %q calls %v", status, out, b.calls())
+	}
+	// A bare name is refused even though one is on PATH.
+	b.clearCalls()
+	b.env = append(b.env, "DEVBOX_GATEWAY_COMMAND=ahp-acp-gateway")
+	if out, status := b.run("devbox-agents.sh", "resume", "on"); status != 4 || len(b.calls()) != 0 {
+		t.Fatalf("bare name: exit %d %q calls %v", status, out, b.calls())
+	}
+}
+
+func TestDevboxAgentsResumeWithoutTheCommand(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1", "DEVBOX_GATEWAY_COMMAND="+filepath.Join(b.root, "no-such-gateway-command"))
 	if out, status := b.run("devbox-agents.sh", "resume", "on"); status != 4 {
 		t.Fatalf("exit %d %q", status, out)
 	}

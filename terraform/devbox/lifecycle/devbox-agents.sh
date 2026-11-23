@@ -7,7 +7,7 @@
 #   devbox-agents stop-when-idle [cancel]
 #
 #   DEVBOX_LIFECYCLE_LIB         directory with gateway-status.sh
-#   DEVBOX_GATEWAY_COMMAND       the gateway module's wrapper (ahp-acp-gateway)
+#   DEVBOX_GATEWAY_COMMAND       absolute path of the gateway module's wrapper
 #   DEVBOX_GATEWAY_HAS_RESUME    1 when the wrapper offers `resume`
 #   DEVBOX_AUTOSTOP_STATE        auto-stop's marker directory
 #
@@ -17,7 +17,7 @@ set -u
 export LC_ALL=C
 
 lib="${DEVBOX_LIFECYCLE_LIB:?}"
-gateway_command="${DEVBOX_GATEWAY_COMMAND:-ahp-acp-gateway}"
+gateway_command="${DEVBOX_GATEWAY_COMMAND:-}"
 has_resume="${DEVBOX_GATEWAY_HAS_RESUME:-0}"
 autostop_state="${DEVBOX_AUTOSTOP_STATE:-/run/devbox-autostop}"
 
@@ -81,7 +81,14 @@ resume() {
       # Only the gateway's own command changes the switch. Never run the
       # wrapper for a subcommand it does not offer: for a build without
       # subcommands that would start a second server.
-      if [ "$has_resume" != 1 ] || ! command -v "$gateway_command" >/dev/null 2>&1; then
+      # Only the module's own wrapper, by absolute path: a copy of the
+      # gateway earlier on the user's PATH could be a build without
+      # subcommands.
+      case "$gateway_command" in
+        /*) ;;
+        *) gateway_command="" ;;
+      esac
+      if [ "$has_resume" != 1 ] || [ -z "$gateway_command" ] || [ ! -x "$gateway_command" ]; then
         echo "auto-resume: this gateway build does not offer the resume command" >&2
         exit 4
       fi

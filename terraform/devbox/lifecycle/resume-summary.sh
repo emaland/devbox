@@ -22,7 +22,7 @@ while :; do
   tries=$((tries - 1))
   json=""
   [ "$status" -eq 0 ] && json="$(printf '%s\n' "$out" | sed -n 2p)"
-  pending="$(printf '%s' "$json" | jq -r '.resume.pending // 0' 2>/dev/null)"
+  pending="$(printf '%s' "$json" | jq -r 'if (.resume | type) == "object" and (.resume.pending | type) == "number" then .resume.pending else 0 end' 2>/dev/null)"
   case "$status" in
     3) exit 0 ;;
     0) [ "${pending:-0}" = 0 ] && break ;;
@@ -34,11 +34,15 @@ done
 case "$status" in
   2) printf 'gateway: not answering (%s)\n' "$out" ;;
   0)
+    # Words reduced to letters and numbers to numbers: this line goes to the
+    # notification as it is.
     printf '%s' "$json" | jq -r '
+      def word: tostring | gsub("[^a-z_-]"; "") | if . == "" then "?" else . end;
+      def count: if type == "number" then . else 0 end;
       if (.resume | type) != "object" then "auto-resume: not reported by this gateway build"
       else .resume
-        | "auto-resume: \(.policy // "?") (\(.source // "?")): continued \(.resumedSinceStart // 0), failed \(.failed // 0), skipped \(.skipped // 0)"
-          + (if (.pending // 0) > 0 then ", still pending \(.pending)" else "" end)
+        | "auto-resume: \(.policy | word) (\(.source | word)): continued \(.resumedSinceStart | count), failed \(.failed | count), skipped \(.skipped | count)"
+          + (if (.pending | count) > 0 then ", still pending \(.pending)" else "" end)
       end'
     ;;
 esac

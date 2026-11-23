@@ -83,8 +83,19 @@ imds_token=""
 imds() {
   if [ -z "$imds_token" ]; then
     imds_token="$(curl -s --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$imds/latest/api/token")" || return 1
+    case "$imds_token" in "" | *[!A-Za-z0-9_=+/-]*) imds_token=""; return 1 ;; esac
   fi
-  curl -s -f --max-time 2 -H "X-aws-ec2-metadata-token: $imds_token" "$imds/latest/meta-data/$1"
+  # The session token goes on standard input, not on the command line.
+  printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$imds_token" |
+    curl -s -f --max-time 2 -K - "$imds/latest/meta-data/$1"
+}
+
+# spot_interruption_under_way: the spot watcher has a current notice.
+spot_interruption_under_way() {
+  for notice in "${DEVBOX_SPOT_STATE:-/run/devbox-spot-watch}"/notice-*; do
+    [ -f "$notice/seen" ] && [ ! -f "$notice/stale" ] && [ ! -f "$notice/done" ] && return 0
+  done
+  return 1
 }
 
 # stop_box <why> <notice>: notice, gateway, instance; in that order.
@@ -108,10 +119,22 @@ stop_box() {
     [ -n "$instance" ] && [ -n "$zone" ] &&
     aws ec2 stop-instances --region "${zone%?}" --instance-ids "$instance" >/dev/null && exit 0
 
-  log "stop-instances failed; the box stays up"
-  sh "$lib/notify.sh" "auto-stop: stop-instances failed; the box stays up"
-  # Work interrupted for a stop that did not happen is picked up again.
-  [ "$stopped_gateway" = yes ] && systemctl start --no-block "$unit"
+  # The next try is one full window (or cap) from now, not the next poll:
+  # every try stops the gateway, and each stop uses up the interrupted turns'
+  # one continuation. A requested stop is dropped; ask again.
+  echo "$now" >"$state/last-active"
+  [ -f "$state/busy-since" ] && echo "$now" >"$state/busy-since"
+  rm -f "$state/stop-when-idle"
+  log "stop-instances failed; the box stays up and tries again after a full window"
+  sh "$lib/notify.sh" "auto-stop: stop-instances failed; the box stays up and tries again after a full idle window"
+  if [ "$stopped_gateway" = yes ]; then
+    if spot_interruption_under_way; then
+      log "spot interruption under way; leaving the gateway stopped"
+    else
+      # Work interrupted for a stop that did not happen is picked up again.
+      systemctl start --no-block "$unit"
+    fi
+  fi
   exit 1
 }
 

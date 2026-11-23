@@ -31,6 +31,7 @@ let
     DEVBOX_GATEWAY_UNIT = "ahp-gateway.service";
     DEVBOX_GATEWAY_STOP_TIMEOUT = toString (gateway.stopTimeoutSec + 15);
     DEVBOX_AUTOSTOP_STATE = "/run/devbox-autostop";
+    DEVBOX_SPOT_STATE = "/run/devbox-spot-watch";
   };
 
   hasResume = gateway.enable && lib.elem "resume" gateway.managementCommands;
@@ -40,6 +41,9 @@ let
     export DEVBOX_LIFECYCLE_LIB=${scripts}
     export DEVBOX_AUTOSTOP_STATE=${environment.DEVBOX_AUTOSTOP_STATE}
     export DEVBOX_GATEWAY_HAS_RESUME=${if hasResume then "1" else "0"}
+    # By store path: a copy of the gateway earlier on the user's PATH is
+    # never the one run.
+    export DEVBOX_GATEWAY_COMMAND=${if hasResume then "${gateway.generated.commands}/bin/ahp-acp-gateway" else ""}
     exec ${pkgs.bash}/bin/sh ${scripts}/devbox-agents.sh "$@"
   '';
 
@@ -135,6 +139,9 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${pkgs.bash}/bin/sh ${scripts}/autostop.sh";
+        # A poll that hangs must not hold off every later one: the gateway
+        # stop (its timeout + 15 s), the notices and stop-instances fit.
+        TimeoutStartSec = gateway.stopTimeoutSec + 15 + 120;
       };
     };
 

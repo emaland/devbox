@@ -299,3 +299,65 @@ func TestSpotWatchLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Review finding: a watcher that died after stopping the gateway, before
+// recording it, lost track that the gateway was its to start again.
+func TestSpotWatchRemembersAStopThatWasNotRecorded(t *testing.T) {
+	b := newLifecycleBox(t)
+	at := fakeStart + 120
+	b.imds.setNotices(fmt.Sprintf(`{"action": "stop", "time": %q}`, isoTime(at)), "")
+	b.watchOnce()
+	dir := filepath.Join(b.root, "spot", "notice-stop_"+strings.NewReplacer("-", "_", ":", "_").Replace(isoTime(at)))
+	// As if the watcher died between the stop and writing `stopped`.
+	if err := os.Remove(filepath.Join(dir, "stopped")); err != nil {
+		t.Fatalf("no stopped marker to remove: %v", err)
+	}
+	b.watchOnce()
+	b.setNow(at + 300)
+	b.watchOnce()
+	if b.count(gatewayStart) != 1 {
+		t.Fatalf("the gateway it stopped is not started again: %v", b.calls())
+	}
+}
+
+// Review finding: a notice not yet posted is posted even when the stop is
+// already recorded.
+func TestSpotWatchPostsANoticeLeftOut(t *testing.T) {
+	b := newLifecycleBox(t)
+	at := fakeStart + 120
+	b.imds.setNotices(fmt.Sprintf(`{"action": "stop", "time": %q}`, isoTime(at)), "")
+	b.watchOnce()
+	dir := filepath.Join(b.root, "spot", "notice-stop_"+strings.NewReplacer("-", "_", ":", "_").Replace(isoTime(at)))
+	if err := os.Remove(filepath.Join(dir, "noticed")); err != nil {
+		t.Fatalf("no noticed marker: %v", err)
+	}
+	b.advance(5)
+	b.watchOnce()
+	if len(b.hook.posts()) != 2 {
+		t.Fatalf("posts %q", b.hook.posts())
+	}
+	b.advance(5)
+	b.watchOnce()
+	if len(b.hook.posts()) != 2 {
+		t.Fatalf("posted again: %q", b.hook.posts())
+	}
+}
+
+// Review finding: after a hibernation the restart is right but the words
+// "did not happen" were wrong.
+func TestSpotWatchAfterHibernation(t *testing.T) {
+	b := newLifecycleBox(t)
+	at := fakeStart + 120
+	b.imds.setNotices(fmt.Sprintf(`{"action": "hibernate", "time": %q}`, isoTime(at)), "")
+	b.watchOnce()
+	b.imds.setNotices("", "")
+	b.setNow(at + 3600)
+	b.watchOnce()
+	if b.count(gatewayStart) != 1 {
+		t.Fatalf("calls %v", b.calls())
+	}
+	posts := b.hook.posts()
+	if strings.Contains(posts[len(posts)-1], "did not happen") || !strings.Contains(posts[len(posts)-1], "hibernat") {
+		t.Fatalf("posts %q", posts)
+	}
+}

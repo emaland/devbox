@@ -235,7 +235,15 @@ func newLifecycleBox(t *testing.T) *lifecycleBox {
 
 	fakes := map[string]string{
 		"who": `cat "$FAKE_ROOT/who" 2>/dev/null; exit 0`,
-		"ss":  `record ss "$@"; cat "$FAKE_ROOT/ss" 2>/dev/null; exit 0`,
+		// The listener query (-l) answers with the fake gateway's port,
+		// owned by $FAKE_ROOT/listener-uid or else by this user.
+		"ss": `case "$*" in
+  *-Htlne*)
+    uid="$(cat "$FAKE_ROOT/listener-uid" 2>/dev/null || id -u)"
+    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:* uid:$uid ino:1 sk:1 cgroup:/x <->"
+    exit 0 ;;
+esac
+record ss "$@"; cat "$FAKE_ROOT/ss" 2>/dev/null; exit 0`,
 		// The clock is a file. A call that parses a given time (-d) is the
 		// real date's.
 		"date": fmt.Sprintf(`now="$(cat "$FAKE_ROOT/now")"
@@ -277,6 +285,7 @@ esac`,
 	b.env = append(os.Environ(),
 		"PATH="+b.bin+":"+os.Getenv("PATH"),
 		"FAKE_ROOT="+root,
+		"FAKE_PORT="+strconv.Itoa(b.gateway.port()),
 		"DEVBOX_LIFECYCLE_LIB="+filepath.Dir(lifecycleScript(t, "autostop.sh")),
 		"DEVBOX_LOG="+b.logFile,
 		"DEVBOX_AUTOSTOP_STATE="+b.state,

@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // Tests for terraform/devbox/lifecycle/autostop.sh: the decision table in
@@ -489,5 +492,211 @@ func TestAutostopAttachedClientDoesNotHoldOffTheCap(t *testing.T) {
 	b.autostop()
 	if !b.stopped() {
 		t.Fatal("cap not applied with a client attached")
+	}
+}
+
+// Review finding: with stop-instances failing, every later poll stopped the
+// gateway again, using up its turns' one continuation.
+func TestAutostopFailedInstanceStopIsNotRetriedEveryPoll(t *testing.T) {
+	for _, row := range []string{"cap", "idle", "requested"} {
+		t.Run(row, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.write("aws-exit", "255\n")
+			switch row {
+			case "cap":
+				b.write("autostop-busy-cap", "2h\n")
+				b.gateway.set(200, statusJSON(1, 0, 0))
+			case "requested":
+				b.requestStopWhenIdle()
+			}
+			b.autostopAllowFailure()
+			if row != "requested" {
+				b.advance(4 * hour)
+				b.autostopAllowFailure()
+			}
+			if b.count(gatewayStop) != 1 {
+				t.Fatalf("setup: gateway stops %d; calls %v", b.count(gatewayStop), b.calls())
+			}
+			posts := len(b.hook.posts())
+			for i := 0; i < 3; i++ {
+				b.advance(600)
+				b.autostopAllowFailure()
+			}
+			if b.count(gatewayStop) != 1 {
+				t.Fatalf("the gateway was stopped again after a failed stop-instances: %d stops; log:\n%s", b.count(gatewayStop), b.read(b.logFile))
+			}
+			if len(b.hook.posts()) != posts {
+				t.Fatalf("notices repeated: %q", b.hook.posts())
+			}
+			if row == "requested" {
+				if _, err := os.Stat(filepath.Join(b.state, "stop-when-idle")); !os.IsNotExist(err) {
+					t.Fatal("the request is still there after a failed stop")
+				}
+			}
+		})
+	}
+}
+
+// The next try comes after a full window or cap.
+func TestAutostopTriesAgainAfterAFullWindow(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.write("aws-exit", "255\n")
+	b.autostopAllowFailure()
+	b.advance(4 * hour)
+	b.autostopAllowFailure()
+	b.remove("aws-exit")
+	b.advance(4*hour - 600)
+	b.autostop()
+	if b.count(gatewayStop) != 1 {
+		t.Fatal("tried again before a full window")
+	}
+	b.advance(600)
+	b.autostop()
+	if b.count(gatewayStop) != 2 || !b.stopped() {
+		t.Fatalf("not tried again after a full window: %v", b.calls())
+	}
+}
+
+// Review finding: auto-stop must not start the gateway again while a spot
+// interruption is under way.
+func TestAutostopFailedInstanceStopLeavesTheGatewayDownDuringASpotNotice(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.write("aws-exit", "255\n")
+	b.autostopAllowFailure()
+	b.advance(4 * hour)
+	notice := filepath.Join(b.root, "spot", "notice-stop_x")
+	if err := os.MkdirAll(notice, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b.write("spot/notice-stop_x/seen", "")
+	b.write("spot/notice-stop_x/time", fmt.Sprintf("%d\n", fakeStart+4*hour+120))
+	b.autostopAllowFailure()
+	if b.count(gatewayStart) != 0 {
+		t.Fatalf("started the gateway during a spot interruption: %v", b.calls())
+	}
+	if !strings.Contains(b.read(b.logFile), "spot interruption under way") {
+		t.Fatalf("log:\n%s", b.read(b.logFile))
+	}
+}
+
+func (b *lifecycleBox) autostopAllowFailure() {
+	b.t.Helper()
+	out, _ := b.run("autostop.sh")
+	b.noTokenLeak(out)
+}
+
+// Review finding: a resume field that is not an object counts as nothing
+// pending, not as a broken answer.
+func TestGatewayStatusResumeNotAnObject(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.gateway.set(200, `{"ok": true, "turns": {"active": 1, "waitingForUser": 1}, "resume": "off"}`)
+	out, status := b.run("gateway-status.sh")
+	if status != 0 || !strings.HasPrefix(out, "waiting\n") {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+}
+
+// Review finding (R-SEC): the token goes only to a listener owned by the
+// token file's owner. Another user holding the port while the gateway is
+// down gets nothing.
+func TestGatewayStatusSendsTheTokenOnlyToTheGatewaysUser(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.write("listener-uid", fmt.Sprintf("%d\n", os.Getuid()+1))
+	out, status := b.run("gateway-status.sh")
+	if status != 2 || !strings.Contains(out, "not the gateway's user") {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if requests != 0 {
+		t.Fatal("the token was sent to a listener of another user")
+	}
+
+	b.remove("listener-uid")
+	b.write("no-listener", "")
+	if out, status := b.run("gateway-status.sh"); status != 2 || !strings.Contains(out, "nothing listening") {
+		t.Fatalf("no listener: exit %d output %q", status, out)
+	}
+}
+
+func TestGatewayStatusRefusesAnUnsafeTokenFile(t *testing.T) {
+	cases := map[string]func(b *lifecycleBox, token string){
+		"readable by others": func(b *lifecycleBox, token string) {
+			if err := os.Chmod(token, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a link": func(b *lifecycleBox, token string) {
+			real := filepath.Join(b.root, "elsewhere")
+			if err := os.Rename(token, real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, token); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a FIFO": func(b *lifecycleBox, token string) {
+			if err := os.Remove(token); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Mkfifo(token, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			setup(b, filepath.Join(b.root, "token"))
+			done := make(chan struct{})
+			var out string
+			var status int
+			go func() { out, status = b.run("gateway-status.sh"); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(20 * time.Second):
+				t.Fatal("gateway-status.sh hung on the token file")
+			}
+			if status != 2 || !strings.Contains(out, "token file unusable") {
+				t.Fatalf("exit %d output %q", status, out)
+			}
+		})
+	}
+}
+
+// R-SEC finding: the webhook file is read, never run, and a line meant to
+// inject into curl's config is refused.
+func TestNotifyWebhookFileParsing(t *testing.T) {
+	cases := map[string]string{
+		"command substitution": "SLACK_WEBHOOK_URL=$(touch {marker})\n",
+		"backticks":            "SLACK_WEBHOOK_URL=`touch {marker}`\n",
+		"quote into config":    "SLACK_WEBHOOK_URL=\"{url}\\\"\nupload-file = \\\"/etc/passwd\"\n",
+		// A URL user part: "127.0.0.1:1" before the @, the real host after.
+		"user part":            "SLACK_WEBHOOK_URL=http://127.0.0.1:1{at}elsewhere.invalid/hook\n",
+		"plain http elsewhere": "SLACK_WEBHOOK_URL=http://example.invalid/hook\n",
+		"a second statement":   "touch {marker}; SLACK_WEBHOOK_URL={url}; touch {marker}\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			marker := filepath.Join(b.root, "ran")
+			content = strings.NewReplacer("{marker}", marker, "{url}", b.hook.server.URL+"/hook", "{at}", "@").Replace(content)
+			b.write("webhook", content)
+			if out, status := b.run("notify.sh", "hello"); status != 0 {
+				t.Fatalf("exit %d %q", status, out)
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("the webhook file was run")
+			}
+			if posts := b.hook.posts(); len(posts) != 0 {
+				t.Fatalf("posted with an unusable address: %q", posts)
+			}
+		})
+	}
+	// The plain form still works.
+	b := newLifecycleBox(t)
+	if _, status := b.run("notify.sh", "hello"); status != 0 || len(b.hook.posts()) != 1 {
+		t.Fatalf("a good webhook line did not post: %q", b.hook.posts())
 	}
 }

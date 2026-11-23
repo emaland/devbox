@@ -80,8 +80,13 @@ pkgs.testers.runNixOSTest {
     def turns(active, waiting=0):
         machine.succeed(f"echo '{json.dumps({'active': active, 'waitingForUser': waiting})}' > {state}/turns.json")
 
-    def poll():
-        machine.succeed("systemctl start devbox-autostop.service")
+    def poll(stop_fails=False):
+        if stop_fails:
+            # The poll exits 1 when stop-instances fails (no credentials here).
+            status, _ = machine.execute("systemctl start devbox-autostop.service")
+            assert status != 0, "the poll that could not stop the instance reported success"
+        else:
+            machine.succeed("systemctl start devbox-autostop.service")
 
     machine.wait_for_unit("ahp-gateway.service")
     machine.wait_until_succeeds("curl -sf http://127.0.0.1:8765/healthz")
@@ -103,7 +108,7 @@ pkgs.testers.runNixOSTest {
         # starts the gateway again.
         turns(1, 1)
         machine.succeed("echo $(( $(date +%s) - 7200 )) > /run/devbox-autostop/last-active")
-        poll()
+        poll(stop_fails=True)
         machine.succeed("grep -q 'stopping: idle' /var/log/boot-history")
         machine.succeed("grep -q 'gateway stopped in' /var/log/boot-history")
         machine.succeed("grep -q 'stop-instances failed' /var/log/boot-history")

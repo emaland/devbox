@@ -24,9 +24,10 @@ case "$url" in
   https://* | http://127.0.0.1:*) ;;
   *) exit 0 ;;
 esac
-# A quote or backslash would change the curl config below.
+# A quote or backslash would change the curl config below. An @ would let
+# "http://127.0.0.1:x@elsewhere/" pass the loopback rule above.
 case "$url" in
-  *[\"\\]*) echo "notify: webhook address unusable" >&2; exit 0 ;;
+  *[\"\\@]*) echo "notify: webhook address unusable" >&2; exit 0 ;;
 esac
 
 host="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
