@@ -109,7 +109,10 @@ done
 # 5. Which build may open the database. The record names the last build that
 #    started. A change of build is backed up first; going back is refused.
 record="$state/devbox-build"
-backup_dir="$state/backups"
+# The gateway's own backups are files in backups/; its tools treat every
+# completed file there as theirs. Ours go in a directory of their own.
+gateway_backups="$state/backups"
+backup_dir="$gateway_backups/devbox"
 
 newer_version() { # newer_version A B: A sorts after B (sort -V order)
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
@@ -117,9 +120,9 @@ newer_version() { # newer_version A B: A sorts after B (sort -V order)
 
 backup() { # backup <label>
   [ -e "$database" ] || return 0
-  name="devbox-$(date -u +%Y%m%dT%H%M%S.%NZ)-$1"
+  name="$(date -u +%Y%m%dT%H%M%S.%NZ)-$1"
   mkdir -p "$backup_dir"
-  chmod 0700 "$backup_dir"
+  chmod 0700 "$gateway_backups" "$backup_dir"
   rm -rf "$backup_dir/$name.partial"
   mkdir "$backup_dir/$name.partial"
   for suffix in "" -wal -shm; do
@@ -131,16 +134,16 @@ backup() { # backup <label>
   echo "ahp-gateway: backed up the database to $backup_dir/$name"
   # Keep the newest five of ours, never the one just made (the clock can be
   # behind an older backup's name early in a boot). Others are left alone.
-  for old in "$backup_dir"/devbox-*.partial; do
+  for old in "$backup_dir"/*.partial; do
     [ -e "$old" ] && rm -rf "$old"
   done
   total=0
-  for old in "$backup_dir"/devbox-*; do
+  for old in "$backup_dir"/*; do
     [ -d "$old" ] && total=$((total + 1))
   done
   excess=$((total - 5))
   # The glob is sorted, oldest first.
-  for old in "$backup_dir"/devbox-*; do
+  for old in "$backup_dir"/*; do
     [ "$excess" -gt 0 ] || break
     [ -d "$old" ] || continue
     [ "$old" = "$backup_dir/$name" ] && continue
@@ -175,7 +178,7 @@ case "$change" in
       # newest of all.
       chosen=""
       newest=""
-      for candidate in "$backup_dir"/devbox-*; do
+      for candidate in "$backup_dir"/*; do
         [ -d "$candidate" ] || continue
         newest="$candidate"
         case "$candidate" in *-"$build_version") chosen="$candidate" ;; esac
@@ -198,7 +201,32 @@ if [ "$change" != none ]; then
   mv "$record.new" "$record"
 fi
 
-# 6. The runtime config: the base config plus the token, never on a command
+# 6. Retention of the gateway's own backups. The gateway never prunes them,
+#    and on this box the command that would (upgrade) is refused, so this is
+#    their only owner (note 021 on the gateway's hardened branch, section 2.5
+#    step 11). Counted: completed files named
+#    ahp-acp-gateway-<UTC time>-v<version>.db, made by upgrade or by the
+#    gateway's pre-migration step; the five newest by the time in the name
+#    are kept. Never counted or pruned: failed-*, .partial, directories,
+#    links, anything else. Safe here: the port is free and no process holds
+#    the database, so no gateway is writing a backup now.
+if [ -d "$gateway_backups" ]; then
+  total=0
+  for old in "$gateway_backups"/ahp-acp-gateway-*-v*.db; do
+    [ -f "$old" ] && [ ! -L "$old" ] && total=$((total + 1))
+  done
+  excess=$((total - 5))
+  # The glob is sorted, and the names sort by the time in them: oldest first.
+  for old in "$gateway_backups"/ahp-acp-gateway-*-v*.db; do
+    [ "$excess" -gt 0 ] || break
+    { [ -f "$old" ] && [ ! -L "$old" ]; } || continue
+    rm -f "$old"
+    echo "ahp-gateway: removed the old gateway backup $old (keeping the newest five)"
+    excess=$((excess - 1))
+  done
+fi
+
+# 7. The runtime config: the base config plus the token, never on a command
 #    line, written privately and renamed into place.
 (
   umask 077

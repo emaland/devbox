@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -603,9 +604,12 @@ func mode(t *testing.T, path string) os.FileMode {
 	return info.Mode().Perm()
 }
 
+// backups lists devbox's own backups, which live in backups/devbox/ so that
+// the gateway's own tools, which treat the files in backups/ as theirs, never
+// see them.
 func backups(t *testing.T, stateDir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(stateDir, "backups"))
+	entries, err := os.ReadDir(filepath.Join(stateDir, "backups", "devbox"))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -994,10 +998,20 @@ func TestPrepareBuildRecord(t *testing.T) {
 		p := withDatabase(t)
 		p.mustRun(forkH1)
 		got := backups(t, p.stateDir)
-		if len(got) != 1 || !strings.HasPrefix(got[0], "devbox-") || !strings.HasSuffix(got[0], "-unknown") {
+		if len(got) != 1 || !strings.HasSuffix(got[0], "-unknown") {
 			t.Fatalf("backups %v", got)
 		}
-		dir := filepath.Join(p.stateDir, "backups", got[0])
+		dir := filepath.Join(p.stateDir, "backups", "devbox", got[0])
+		// Nothing of ours at the top of backups/, where the gateway looks.
+		top, err := os.ReadDir(filepath.Join(p.stateDir, "backups"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range top {
+			if entry.Name() != "devbox" {
+				t.Errorf("devbox wrote %s at the top of backups/", entry.Name())
+			}
+		}
 		for _, suffix := range []string{"", "-wal", "-shm"} {
 			if read(t, filepath.Join(dir, "ahp-acp-gateway.db"+suffix)) != "data"+suffix {
 				t.Errorf("backup lacks ahp-acp-gateway.db%s", suffix)
@@ -1059,7 +1073,7 @@ func TestPrepareBuildRecord(t *testing.T) {
 					t.Error("the record was updated for a refused build")
 				}
 			}
-			if !strings.Contains(out, "backups/devbox-") {
+			if !strings.Contains(out, "backups/devbox/") {
 				t.Errorf("the refusal should name the backup to restore: %s", out)
 			}
 			if !strings.Contains(out, "remove") || !strings.Contains(out, "-wal") {
@@ -1094,7 +1108,7 @@ func TestPrepareBuildRecord(t *testing.T) {
 		for i := 1; i <= 7; i++ {
 			builds = append(builds, [3]string{"ahp-acp-gateway", fmt.Sprintf("0.2.%d", i), fmt.Sprintf("/nix/store/%032d-ahp-acp-gateway-0.2.%d", i, i)})
 		}
-		if err := os.MkdirAll(filepath.Join(p.stateDir, "backups", "devbox-00000000T000000Z-x.partial"), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(p.stateDir, "backups", "devbox", "00000000T000000Z-x.partial"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		other := filepath.Join(p.stateDir, "backups", "ahp-acp-gateway-20260101T000000Z-v0.2.2.db")
@@ -1109,9 +1123,7 @@ func TestPrepareBuildRecord(t *testing.T) {
 			if strings.HasSuffix(name, ".partial") {
 				t.Errorf("partial backup %s left behind", name)
 			}
-			if strings.HasPrefix(name, "devbox-") {
-				ours = append(ours, name)
-			}
+			ours = append(ours, name)
 		}
 		if len(ours) != 5 {
 			t.Errorf("kept %d of ours, want 5: %v", len(ours), ours)
@@ -1120,4 +1132,77 @@ func TestPrepareBuildRecord(t *testing.T) {
 			t.Error("a backup made by another tool was pruned")
 		}
 	})
+}
+
+// The gateway never prunes its own backups, and on the devbox the command
+// that would (upgrade) is refused, so the start-up check keeps them to the
+// newest five (note 021, section 2.5 step 11, on the gateway's hardened
+// branch).
+func TestPrepareKeepsTheGatewaysNewestFiveBackups(t *testing.T) {
+	p := newPrepareBox(t)
+	dir := filepath.Join(p.stateDir, "backups")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// Seven of the gateway's, written out of order.
+	var gateway []string
+	for _, minute := range []int{3, 1, 7, 2, 6, 4, 5} {
+		gateway = append(gateway, write(fmt.Sprintf("ahp-acp-gateway-20261123T10%02d00.000Z-v0.2.2-h.1.db", minute)))
+	}
+	// Never counted, never pruned.
+	keep := []string{
+		write("failed-20261123T090000.000Z-v0.2.2-h.2.db"),
+		write("failed-20261123T090000.000Z-v0.2.2-h.2.db-wal"),
+		write("ahp-acp-gateway-20261123T080000.000Z-v0.2.2.db.partial"),
+		write("notes.txt"),
+	}
+	oldDir := filepath.Join(dir, "ahp-acp-gateway-20261123T070000.000Z-v0.2.2.db")
+	if err := os.MkdirAll(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep = append(keep, oldDir)
+
+	p.mustRun(public022)
+
+	for _, path := range keep {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was removed; it must never be counted or pruned", filepath.Base(path))
+		}
+	}
+	var kept []string
+	for _, path := range gateway {
+		if _, err := os.Stat(path); err == nil {
+			kept = append(kept, filepath.Base(path))
+		}
+	}
+	sort.Strings(kept)
+	want := []string{
+		"ahp-acp-gateway-20261123T100300.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100400.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100500.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100600.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100700.000Z-v0.2.2-h.1.db",
+	}
+	if strings.Join(kept, " ") != strings.Join(want, " ") {
+		t.Errorf("kept %v, want the five newest %v", kept, want)
+	}
+
+	// Five or fewer: nothing to do, and a second start changes nothing.
+	p.mustRun(public022)
+	var again int
+	for _, path := range gateway {
+		if _, err := os.Stat(path); err == nil {
+			again++
+		}
+	}
+	if again != 5 {
+		t.Errorf("%d kept after a second start, want 5", again)
+	}
 }

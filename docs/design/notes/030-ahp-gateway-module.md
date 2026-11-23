@@ -232,7 +232,9 @@ NixOS options on the unit: `restartIfChanged = false`.
 
      A backup is a copy of the database file and its `-wal` and `-shm`
      companions to a temporary directory, renamed to
-     `<stateDir>/backups/devbox-<time>-<old version>/` when complete. Only
+     `<stateDir>/backups/devbox/<time>-<old version>/` when complete (in a
+     directory of its own: the gateway's tools treat the files in
+     `backups/` as theirs). Only
      complete directories with that prefix are pruned, to the newest five, and
      never the one just made. The record is written after the backup and
      before the build starts, so a build that fails its first start is still
