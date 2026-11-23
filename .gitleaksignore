@@ -3,3 +3,8 @@
 
 # Example header in a setup document; the owner confirmed on 2026-11-23 that it is not a real key.
 7744578228124b316bc3f669250254d6c3c5e797:PORT_LANGFUSE_SETUP.md:curl-auth-header:153
+
+# The Sec-WebSocket-Key header of the gateway readiness probe: a fixed,
+# protocol-required nonce, confirmed not a credential. Decided by ORCH on
+# INS-206 (2026-11-23), not by the owner. Later commits build it at run time.
+10e42d5d69d3dce755090a99777e2dbab1876520:terraform/devbox/ahp-gateway/ready.sh:generic-api-key:56
