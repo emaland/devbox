@@ -180,6 +180,7 @@ case "$change" in
       newest=""
       for candidate in "$backup_dir"/*; do
         [ -d "$candidate" ] || continue
+        case "$candidate" in *.partial) continue ;; esac
         newest="$candidate"
         case "$candidate" in *-"$build_version") chosen="$candidate" ;; esac
       done
@@ -205,24 +206,33 @@ fi
 #    and on this box the command that would (upgrade) is refused, so this is
 #    their only owner (note 021 on the gateway's hardened branch, section 2.5
 #    step 11). Counted: completed files named
-#    ahp-acp-gateway-<UTC time>-v<version>.db, made by upgrade or by the
-#    gateway's pre-migration step; the five newest by the time in the name
-#    are kept. Never counted or pruned: failed-*, .partial, directories,
-#    links, anything else. Safe here: the port is free and no process holds
-#    the database, so no gateway is writing a backup now.
+#    ahp-acp-gateway-<UTC time>-v<version>.db (the name starts with the
+#    time), made by upgrade or by the gateway's pre-migration step; the five
+#    newest by the time in the name are kept. The one written last is kept
+#    too, as the gateway's tooling keeps the one its install record names: a
+#    clock behind early in a boot can give it an old name. Never counted or
+#    pruned: failed-*, .partial, directories, links, names without a time,
+#    anything else. Safe here: the port is free and no process holds the
+#    database, so no gateway is writing a backup now.
 if [ -d "$gateway_backups" ]; then
+  pattern='ahp-acp-gateway-[0-9][0-9][0-9][0-9]*-v*.db'
+  last_written="$(find "$gateway_backups" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 1 | cut -d ' ' -f 2-)"
+  # Kept: the five newest by name, and the one written last if it is not
+  # among them. So the oldest (total - 5) by name are the candidates, and the
+  # one written last is skipped among them.
   total=0
-  for old in "$gateway_backups"/ahp-acp-gateway-*-v*.db; do
+  for old in "$gateway_backups"/$pattern; do
     [ -f "$old" ] && [ ! -L "$old" ] && total=$((total + 1))
   done
-  excess=$((total - 5))
+  candidates=$((total - 5))
   # The glob is sorted, and the names sort by the time in them: oldest first.
-  for old in "$gateway_backups"/ahp-acp-gateway-*-v*.db; do
-    [ "$excess" -gt 0 ] || break
+  for old in "$gateway_backups"/$pattern; do
+    [ "$candidates" -gt 0 ] || break
     { [ -f "$old" ] && [ ! -L "$old" ]; } || continue
+    candidates=$((candidates - 1))
+    [ "$old" = "$last_written" ] && continue
     rm -f "$old"
     echo "ahp-gateway: removed the old gateway backup $old (keeping the newest five)"
-    excess=$((excess - 1))
   done
 fi
 
