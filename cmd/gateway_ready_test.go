@@ -616,7 +616,7 @@ func transientUnit(t *testing.T, mode string, extra ...string) string {
 
 func unitProperties(t *testing.T, name string) map[string]string {
 	t.Helper()
-	out, err := exec.Command("systemctl", "--user", "show", "-p", "ActiveState,SubState,Result,NRestarts,ExecMainStatus,MainPID", name).Output()
+	out, err := exec.Command("systemctl", "--user", "show", "-p", "ActiveState,SubState,Result,NRestarts,ExecMainStatus,MainPID,ExecMainExitTimestampMonotonic", name).Output()
 	if err != nil {
 		t.Fatalf("systemctl show: %v", err)
 	}
@@ -659,8 +659,12 @@ func TestUnitBehaviour(t *testing.T) {
 	t.Run("exit 78 during the ready wait is not retried and does not wait for the deadline", func(t *testing.T) {
 		start := time.Now()
 		name := transientUnit(t, "exit78")
+		// --no-block: right after systemd-run the unit may not have started
+		// yet, and "inactive" then means "not yet", not "finished". Wait for
+		// the main process to have exited.
 		properties := waitFor(t, name, 30*time.Second, func(p map[string]string) bool {
-			return p["ActiveState"] == "failed" || p["ActiveState"] == "inactive"
+			exited := p["ExecMainExitTimestampMonotonic"] != "" && p["ExecMainExitTimestampMonotonic"] != "0"
+			return exited && (p["ActiveState"] == "failed" || p["ActiveState"] == "inactive")
 		})
 		if properties["NRestarts"] != "0" || properties["ExecMainStatus"] != "78" {
 			t.Errorf("unit: %v", properties)
