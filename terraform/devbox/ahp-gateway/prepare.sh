@@ -1,6 +1,7 @@
 #!/bin/sh
-# Runs as the gateway's user before every start of ahp-gateway.service
-# (ExecStartPre). It never opens the database. Everything it needs comes from
+# Runs as the gateway's user at every start of ahp-gateway.service, from the
+# launcher that is the unit's main process, before the gateway itself. It
+# never opens the database. Everything it needs comes from
 # the unit's environment:
 #
 #   AHP_GATEWAY_STATE_DIR       state dir: token, build record, backups
@@ -31,17 +32,28 @@ refuse() {
   exit 78
 }
 
+# Every check below fails closed: a missing tool is a refusal, not a pass.
+for tool in jq ss find realpath sort; do
+  command -v "$tool" >/dev/null 2>&1 || refuse "$tool is not available, so the start-up checks cannot run"
+done
+
 database="$(jq -er '.database.path' "$base")" || refuse "the base config names no database.path"
+# Processes hold the database by its real path.
+database_real="$(realpath -m "$database")"
 
 # 1. Nothing else may be serving or holding the database. The public release
 #    repairs "interrupted" turns before it binds its port, so a second gateway
 #    on the same database does damage before it fails.
-if [ -n "$(ss -Htln "sport = :$port" 2>/dev/null)" ]; then
+listening="$(ss -Htln "sport = :$port")" || refuse "could not list listening sockets with ss"
+if [ -n "$listening" ]; then
   refuse "port $port is already in use on this machine; is another gateway running? (ss -ltnp 'sport = :$port')"
 fi
-# One find over every process's open files (only this user's are readable),
-# not a readlink per file: a busy machine has thousands.
-holder="$(find /proc/[0-9]*/fd -maxdepth 1 \( -lname "$database" -o -lname "$database-wal" -o -lname "$database-shm" \) -print -quit 2>/dev/null || true)"
+# One find over every process's open files (only this user's are readable,
+# and the others' produce errors that are expected), not a readlink per file:
+# a busy machine has thousands. -lname takes a pattern, so the path's own
+# pattern characters are escaped.
+pattern="$(printf '%s' "$database_real" | sed 's/[][*?\\]/\\&/g')"
+holder="$(find /proc/[0-9]*/fd -maxdepth 1 \( -lname "$pattern" -o -lname "$pattern-wal" -o -lname "$pattern-shm" \) -print -quit 2>/dev/null || true)"
 if [ -n "$holder" ]; then
   pid="${holder#/proc/}"
   pid="${pid%%/*}"
@@ -53,8 +65,12 @@ mkdir -p "$state"
 chmod 0700 "$state"
 
 # 3. Token: created once, atomically, never replaced.
+if [ -L "$token_file" ] && [ ! -e "$token_file" ]; then
+  refuse "the token file $token_file is a link to nothing; remove it and a new one is made at the next start"
+fi
 if [ ! -e "$token_file" ]; then
   temporary="$token_file.new.$$"
+  rm -f "$temporary"
   (
     umask 077
     head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' >"$temporary"
@@ -65,10 +81,15 @@ if [ ! -e "$token_file" ]; then
   rm -f "$temporary"
 fi
 chmod 0600 "$token_file"
-token_length="$(tr -d '\n' <"$token_file" | wc -c)"
-if [ "$token_length" -lt 32 ]; then
+# One line of URL-safe characters, at least 32 of them.
+token_value="$(cat "$token_file")"
+case "$token_value" in
+  *[!A-Za-z0-9_-]*) refuse "the token file $token_file holds something other than one line of letters, digits, - and _; remove it and a new one is made at the next start" ;;
+esac
+if [ "${#token_value}" -lt 32 ]; then
   refuse "the token file $token_file is empty or too short; remove it and a new one is made at the next start"
 fi
+unset token_value
 
 # 4. Every enabled provider is a program in the Nix store: nothing is
 #    downloaded or looked up on PATH when a session starts.
@@ -103,7 +124,8 @@ backup() { # backup <label>
   done
   mv "$backup_dir/$name.partial" "$backup_dir/$name"
   echo "ahp-gateway: backed up the database to $backup_dir/$name"
-  # Keep the newest five of ours. Names sort by time; others are left alone.
+  # Keep the newest five of ours, never the one just made (the clock can be
+  # behind an older backup's name early in a boot). Others are left alone.
   for old in "$backup_dir"/devbox-*.partial; do
     [ -e "$old" ] && rm -rf "$old"
   done
@@ -116,6 +138,7 @@ backup() { # backup <label>
   for old in "$backup_dir"/devbox-*; do
     [ "$excess" -gt 0 ] || break
     [ -d "$old" ] || continue
+    [ "$old" = "$backup_dir/$name" ] && continue
     rm -rf "$old"
     excess=$((excess - 1))
   done
@@ -142,7 +165,16 @@ fi
 case "$change" in
   older)
     if [ "$allow_downgrade" != 1 ]; then
-      refuse "the database was last opened by $last_name $last_version; $build_name $build_version is older or a different build and may not read it. Restore the backup made before $last_version first ran, or set services.ahp-gateway.allowDowngrade"
+      newest=""
+      for candidate in "$backup_dir"/devbox-*; do
+        [ -d "$candidate" ] && newest="$candidate"
+      done
+      if [ -n "$newest" ]; then
+        restore="To go back, stop ahp-gateway.service, copy the files in $newest over $database and its -wal and -shm files, and delete $record"
+      else
+        restore="There is no backup in $backup_dir to go back to"
+      fi
+      refuse "the database was last opened by $last_name $last_version; $build_name $build_version is older or a different build and may not read it. $restore. Or set services.ahp-gateway.allowDowngrade"
     fi
     backup "$last_version"
     ;;

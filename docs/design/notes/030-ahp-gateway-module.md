@@ -127,7 +127,8 @@ checked against the running process at start.
   reads the built-in provider ids from the package's default config at build
   time. A built-in that is not in `providers` is disabled. A provider whose id
   equals a built-in's is written as one entry that replaces the built-in's
-  program, arguments and environment in full, so no `npx --yes` launcher stays
+  program and arguments (the gateway merges `env` key by key, so a built-in's
+  own environment stays unless set again), so no `npx --yes` launcher stays
   enabled, including in a build that adds a built-in. Keeping the built-in id
   matters: a session stores the id of its provider, and the public release
   refuses a prompt for a session whose provider id it does not know. Sessions

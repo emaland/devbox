@@ -7,6 +7,9 @@
 #
 # Not in this file yet: the readiness check, the failure notice. Until they
 # exist the template keeps `enable = false`.
+#
+# Values in `environment`, `settings` and providers' `env` are written to the
+# world-readable Nix store and unit file: no secrets there.
 { config, lib, pkgs, utils, ... }:
 
 let
@@ -80,9 +83,15 @@ let
     (lib.concatStringsSep "\n" ([ "${cfg.package}" "${baseConfig}" node ]
       ++ map (provider: provider.command) providerEntries));
 
-  prepare = pkgs.writeShellScript "ahp-gateway-prepare" ''
-    export PATH=${lib.makeBinPath [ pkgs.jq pkgs.iproute2 pkgs.coreutils pkgs.gnused ]}
-    exec ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh}
+  # The unit's main process: run the start-up checks, then become the
+  # gateway. Prepare runs here rather than in ExecStartPre because systemd
+  # honours RestartPreventExitStatus for the main process only; a refusal
+  # (exit 78) must not be retried. The tools' PATH is given to prepare alone,
+  # so the gateway and its agents keep the unit's PATH.
+  prepareTools = lib.makeBinPath (with pkgs; [ jq iproute2 coreutils findutils gnused ]);
+  launcher = pkgs.writeShellScript "ahp-gateway-launch" ''
+    PATH=${prepareTools} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
+    exec ${node} ${cli} --config ${runtimeConfig}
   '';
 
   startTimeout = cfg.readyTimeoutSec + 15;
@@ -177,10 +186,18 @@ in
       description = "Extra keys merged into the gateway config. Keys the module owns are refused.";
     };
     readyPath = mkOption { type = types.str; default = "/healthz"; };
-    noRetryExitStatus = mkOption { type = types.listOf types.int; default = [ ]; };
+    noRetryExitStatus = mkOption {
+      type = types.listOf types.int;
+      default = [ ];
+      description = "Exit statuses of the gateway that mean restarting will not help, besides 78, which is always included.";
+    };
     managementCommands = mkOption { type = types.listOf types.str; default = [ ]; };
     allowDowngrade = mkOption { type = types.bool; default = false; };
-    environment = mkOption { type = types.attrsOf types.str; default = { }; };
+    environment = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      description = "Extra variables for the gateway and its agents. Stored in the Nix store: no secrets.";
+    };
     extraPath = mkOption { type = types.listOf types.package; default = [ ]; };
     readyTimeoutSec = mkOption { type = types.ints.positive; default = 60; };
     stopTimeoutSec = mkOption { type = types.ints.positive; default = 45; };
@@ -215,9 +232,19 @@ in
         assertion = account.uid != null;
         message = "services.ahp-gateway: users.users.${cfg.user}.uid must be set.";
       }
+      {
+        # Without linger the user's runtime directory goes away at the last
+        # logout, under the running gateway and its agents.
+        assertion = account.linger or false;
+        message = "services.ahp-gateway: users.users.${cfg.user}.linger must be true.";
+      }
+      {
+        assertion = lib.all (name: builtins.match "[a-z][a-z0-9-]*" name != null) cfg.managementCommands;
+        message = "services.ahp-gateway.managementCommands must be plain subcommand names (lower-case letters, digits, -).";
+      }
     ];
 
-    services.ahp-gateway.generated = { inherit baseConfig closure; };
+    services.ahp-gateway.generated = { inherit baseConfig closure launcher; };
 
     environment.etc.${clientConfig}.text = builtins.toJSON {
       managedBy = "system";
@@ -269,16 +296,15 @@ in
         RuntimeDirectory = "ahp-gateway";
         RuntimeDirectoryMode = "0700";
         UnsetEnvironment = "CLAUDECODE";
-        ExecStartPre = "${prepare}";
-        ExecStart = "${node} ${cli} --config ${runtimeConfig}";
+        ExecStart = "${launcher}";
         Restart = "on-failure";
         RestartSec = 2;
         KillMode = "mixed";
         OOMPolicy = "continue";
         TimeoutStartSec = startTimeout;
         TimeoutStopSec = cfg.stopTimeoutSec;
-      } // lib.optionalAttrs (cfg.noRetryExitStatus != [ ]) {
-        RestartPreventExitStatus = map toString cfg.noRetryExitStatus;
+        # 78: the start-up checks refused; restarting will not help.
+        RestartPreventExitStatus = lib.unique ([ "78" ] ++ map toString cfg.noRetryExitStatus);
       };
     };
   };

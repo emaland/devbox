@@ -88,7 +88,7 @@ let
       imports = [ %s ];
       boot.isContainer = true;
       system.stateVersion = "24.11";
-      users.users.alice = { isNormalUser = true; uid = 1234; };
+      users.users.alice = { isNormalUser = true; uid = 1234; linger = true; };
       services.ahp-gateway = {
         enable = true;
         user = "alice";
@@ -210,11 +210,21 @@ func TestGatewayModuleUnit(t *testing.T) {
 	if _, set := service["UMask"]; set {
 		t.Error("no unit-wide UMask: agents create the user's own files")
 	}
-	if exec := fmt.Sprint(service["ExecStart"]); !strings.Contains(exec, "--config /run/ahp-gateway/config.json") || !strings.Contains(exec, "/bin/node ") {
-		t.Errorf("ExecStart %q", exec)
+	// Prepare runs inside the main process (a launcher that then execs the
+	// gateway): systemd honours RestartPreventExitStatus for the main
+	// process only, so a prepare step in ExecStartPre exiting 78 would be
+	// retried anyway.
+	if exec := fmt.Sprint(service["ExecStart"]); !strings.Contains(exec, "ahp-gateway-launch") {
+		t.Errorf("ExecStart %q, want the launcher", exec)
 	}
-	if pre := fmt.Sprint(service["ExecStartPre"]); !strings.Contains(pre, "prepare") {
-		t.Errorf("ExecStartPre %q", pre)
+	if pre, set := service["ExecStartPre"]; set {
+		t.Errorf("ExecStartPre %v: prepare must run in the main process", pre)
+	}
+	if got := fmt.Sprint(service["RestartPreventExitStatus"]); !strings.Contains(got, "78") {
+		t.Errorf("RestartPreventExitStatus %q: 78 always means restarting will not help", got)
+	}
+	if got := fmt.Sprint(service["Group"]); got != "users" {
+		t.Errorf("Group %q", got)
 	}
 
 	env := unit.Environment
@@ -247,8 +257,8 @@ func TestGatewayModuleUnit(t *testing.T) {
 
 func TestGatewayModuleOptionsReachTheUnit(t *testing.T) {
 	needNix(t)
-	unit := evalUnit(t, `{ port = 9911; stateDir = "/srv/gw"; readyTimeoutSec = 30; stopTimeoutSec = 20; noRetryExitStatus = [ 78 ]; environment.EXTRA_THING = "1"; }`)
-	if got := fmt.Sprint(unit.ServiceConfig["RestartPreventExitStatus"]); !strings.Contains(got, "78") {
+	unit := evalUnit(t, `{ port = 9911; stateDir = "/srv/gw"; readyTimeoutSec = 30; stopTimeoutSec = 20; noRetryExitStatus = [ 75 ]; environment.EXTRA_THING = "1"; }`)
+	if got := fmt.Sprint(unit.ServiceConfig["RestartPreventExitStatus"]); !strings.Contains(got, "78") || !strings.Contains(got, "75") {
 		t.Errorf("RestartPreventExitStatus %q", got)
 	}
 	if got := int(unit.ServiceConfig["TimeoutStopSec"].(float64)); got != 20 {
@@ -272,6 +282,8 @@ func TestGatewayModuleAssertions(t *testing.T) {
 		{"another module-owned key", `{ settings.auth.token = "x"; }`, "settings"},
 		{"a provider program that is not a store path", `{ providers.claude.command = lib.mkForce "npx"; }`, "store path"},
 		{"a state dir that is not absolute", `{ stateDir = "relative"; }`, "absolute"},
+		{"a management command that is a pattern", `{ managementCommands = [ "*" ]; }`, "managementCommands"},
+		{"an empty management command", `{ managementCommands = [ "" ]; }`, "managementCommands"},
 		{"the default case", `{ }`, ""},
 	}
 	// One evaluation for all cases: nixpkgs is imported once.
@@ -367,6 +379,20 @@ func TestGatewayModuleBaseConfig(t *testing.T) {
 	}
 	if len(providers) != 2 {
 		t.Errorf("providers %v: exactly the built-ins plus the configured ones", providers)
+	}
+
+	// The closure the unit carries names the package, the config and every
+	// provider program, so none of them is collected while the gateway runs.
+	out, err := exec.Command("nix-build", "--no-out-link", "-E",
+		"("+moduleExpression(t, "{}")+").config.services.ahp-gateway.generated.closure").Output()
+	if err != nil {
+		t.Fatalf("building the closure list: %v", err)
+	}
+	closure := read(t, strings.TrimSpace(string(out)))
+	for _, want := range []string{"-ahp-acp-gateway-0.2.2", "-ahp-gateway-config.json", "-coreutils-", "/bin/node"} {
+		if !strings.Contains(closure, want) {
+			t.Errorf("closure lacks %s:\n%s", want, closure)
+		}
 	}
 }
 
@@ -490,7 +516,12 @@ func (p prepareBox) db() string { return filepath.Join(p.stateDir, "ahp-acp-gate
 // name, version and store path. It returns output and exit status.
 func (p prepareBox) run(build [3]string, extraEnv ...string) (string, int) {
 	p.t.Helper()
-	command := exec.Command("sh", prepareScriptPath(p.t))
+	return p.runProgram([]string{"sh", prepareScriptPath(p.t)}, build, extraEnv...)
+}
+
+func (p prepareBox) runProgram(program []string, build [3]string, extraEnv ...string) (string, int) {
+	p.t.Helper()
+	command := exec.Command(program[0], program[1:]...)
 	command.Env = append(os.Environ(),
 		"AHP_GATEWAY_STATE_DIR="+p.stateDir,
 		"AHP_GATEWAY_PORT="+strconv.Itoa(p.port),
@@ -609,14 +640,49 @@ func TestPrepareRefusesAnEmptyOrShortToken(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(p.stateDir, "token"), []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if out, status := p.run(public022); status == 0 {
-				t.Errorf("started with token %q:\n%s", content, out)
+			if out, status := p.run(public022); status != 78 {
+				t.Errorf("token %q: exit %d, want 78:\n%s", content, status, out)
 			}
 			if _, err := os.Stat(p.runtime); err == nil {
 				t.Error("a runtime config was written")
 			}
 		})
 	}
+}
+
+func TestPrepareRefusesAMalformedToken(t *testing.T) {
+	valid := strings.Repeat("A", 43)
+	for name, content := range map[string]string{
+		"carriage return":   valid + "\r\n",
+		"inner space":       valid[:20] + " " + valid[20:] + "\n",
+		"second line":       valid + "\n" + valid + "\n",
+		"control character": valid + "\x01\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := newPrepareBox(t)
+			if err := os.MkdirAll(p.stateDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(p.stateDir, "token"), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if out, status := p.run(public022); status != 78 {
+				t.Errorf("exit %d, want 78:\n%s", status, out)
+			}
+		})
+	}
+	t.Run("a dangling link", func(t *testing.T) {
+		p := newPrepareBox(t)
+		if err := os.MkdirAll(p.stateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(p.stateDir, "nowhere"), filepath.Join(p.stateDir, "token")); err != nil {
+			t.Fatal(err)
+		}
+		if out, status := p.run(public022); status != 78 {
+			t.Errorf("exit %d, want 78:\n%s", status, out)
+		}
+	})
 }
 
 func TestPrepareWritesTheRuntimeConfig(t *testing.T) {
@@ -650,21 +716,18 @@ func TestPrepareRefusesWhenThePortIsInUse(t *testing.T) {
 	}
 	defer listener.Close()
 	out, status := p.run(public022)
-	if status == 0 {
-		t.Fatalf("started with the port in use:\n%s", out)
+	if status != 78 {
+		t.Fatalf("port in use: exit %d, want 78:\n%s", status, out)
 	}
 	if !strings.Contains(out, strconv.Itoa(p.port)) {
 		t.Errorf("the message should name the port: %s", out)
 	}
 }
 
-func TestPrepareRefusesWhenTheDatabaseIsOpen(t *testing.T) {
-	p := newPrepareBox(t)
-	p.mustRun(public022)
-	if err := os.WriteFile(p.db(), []byte("db"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	holder := exec.Command("sh", "-c", `exec 3<"$1"; echo ready; exec sleep 30`, "holder", p.db())
+// holdOpen starts a process that keeps path open, and waits until it has.
+func holdOpen(t *testing.T, path string) int {
+	t.Helper()
+	holder := exec.Command("sh", "-c", `exec 3<"$1"; echo ready; exec sleep 60`, "holder", path)
 	stdout, err := holder.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -677,14 +740,102 @@ func TestPrepareRefusesWhenTheDatabaseIsOpen(t *testing.T) {
 	if _, err := stdout.Read(buf); err != nil {
 		t.Fatal(err)
 	}
+	return holder.Process.Pid
+}
 
-	out, status := p.run(public022)
-	if status == 0 {
-		t.Fatalf("started while another process holds the database:\n%s", out)
+func TestPrepareRefusesWhenTheDatabaseIsOpen(t *testing.T) {
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		t.Run("database"+suffix, func(t *testing.T) {
+			p := newPrepareBox(t)
+			p.mustRun(public022)
+			if err := os.WriteFile(p.db()+suffix, []byte("db"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pid := holdOpen(t, p.db()+suffix)
+			out, status := p.run(public022)
+			if status != 78 {
+				t.Fatalf("another process holds the database: exit %d, want 78:\n%s", status, out)
+			}
+			if !strings.Contains(out, strconv.Itoa(pid)) {
+				t.Errorf("the message should name the process: %s", out)
+			}
+		})
 	}
-	if !strings.Contains(out, strconv.Itoa(holder.Process.Pid)) {
-		t.Errorf("the message should name the process: %s", out)
+
+	t.Run("through a linked state dir", func(t *testing.T) {
+		p := newPrepareBox(t)
+		p.mustRun(public022)
+		if err := os.WriteFile(p.db(), []byte("db"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The base config names the database through a link; the holder
+		// opened the real path.
+		link := filepath.Join(t.TempDir(), "state-link")
+		if err := os.Symlink(p.stateDir, link); err != nil {
+			t.Fatal(err)
+		}
+		linked := p
+		linked.stateDir = link
+		linked.writeBase(trueProgram(t))
+		pid := holdOpen(t, p.db())
+		out, status := linked.run(public022)
+		if status != 78 || !strings.Contains(out, strconv.Itoa(pid)) {
+			t.Errorf("exit %d, want 78 naming pid %d:\n%s", status, pid, out)
+		}
+	})
+}
+
+// The unit runs the launcher the module builds, with the PATH the module
+// gives it, not the test's PATH.
+func TestGatewayLauncherAsBuilt(t *testing.T) {
+	needNix(t)
+	out, err := exec.Command("nix-build", "--no-out-link", "-E",
+		"("+moduleExpression(t, "{}")+").config.services.ahp-gateway.generated.launcher").Output()
+	if err != nil {
+		var stderr string
+		if exit, ok := err.(*exec.ExitError); ok {
+			stderr = string(exit.Stderr)
+		}
+		t.Fatalf("building the launcher: %v\n%s", err, lastLines(stderr, 15))
 	}
+	launcher := strings.TrimSpace(string(out))
+	clean := []string{"PATH=/nonexistent"}
+
+	t.Run("the database held by another process is refused with 78", func(t *testing.T) {
+		p := newPrepareBox(t)
+		p.mustRun(public022)
+		if err := os.WriteFile(p.db(), []byte("db"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pid := holdOpen(t, p.db())
+		got, status := p.runProgram([]string{launcher}, public022, clean...)
+		if status != 78 || !strings.Contains(got, strconv.Itoa(pid)) {
+			t.Errorf("exit %d, want 78 naming pid %d:\n%s", status, pid, got)
+		}
+	})
+
+	t.Run("a busy port is refused with 78", func(t *testing.T) {
+		p := newPrepareBox(t)
+		listener, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p.port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		if got, status := p.runProgram([]string{launcher}, public022, clean...); status != 78 {
+			t.Errorf("exit %d, want 78:\n%s", status, got)
+		}
+	})
+
+	t.Run("a good start runs the gateway after prepare", func(t *testing.T) {
+		p := newPrepareBox(t)
+		got, status := p.runProgram([]string{launcher}, public022, clean...)
+		if status != 0 {
+			t.Fatalf("exit %d:\n%s", status, got)
+		}
+		if _, err := os.Stat(p.runtime); err != nil {
+			t.Errorf("prepare did not write the runtime config: %v", err)
+		}
+	})
 }
 
 func TestPrepareRefusesAProviderThatIsNotAStorePath(t *testing.T) {
@@ -692,8 +843,8 @@ func TestPrepareRefusesAProviderThatIsNotAStorePath(t *testing.T) {
 		t.Run(program, func(t *testing.T) {
 			p := newPrepareBox(t)
 			p.writeBase(program)
-			if out, status := p.run(public022); status == 0 {
-				t.Errorf("started with provider program %s:\n%s", program, out)
+			if out, status := p.run(public022); status != 78 {
+				t.Errorf("provider program %s: exit %d, want 78:\n%s", program, status, out)
 			}
 		})
 	}
@@ -779,8 +930,8 @@ func TestPrepareBuildRecord(t *testing.T) {
 			p := withDatabase(t)
 			p.mustRun(tc.first)
 			out, status := p.run(tc.second)
-			if status == 0 {
-				t.Fatalf("started:\n%s", out)
+			if status != 78 {
+				t.Fatalf("exit %d, want 78:\n%s", status, out)
 			}
 			if _, err := os.Stat(p.runtime); err == nil {
 				// The first run wrote one; it must not have been rewritten for
@@ -789,6 +940,9 @@ func TestPrepareBuildRecord(t *testing.T) {
 				if strings.Contains(record, tc.second[2]) {
 					t.Error("the record was updated for a refused build")
 				}
+			}
+			if !strings.Contains(out, "backups/devbox-") {
+				t.Errorf("the refusal should name the backup to restore: %s", out)
 			}
 			// Allowed with the option.
 			if out, status := p.run(tc.second, "AHP_GATEWAY_ALLOW_DOWNGRADE=1"); status != 0 {

@@ -179,6 +179,10 @@ your `local.nix`, because which agent to run is your choice:
 }
 ```
 
+The user needs a fixed `uid` and `linger = true` (the template's user has
+both). A provider that reuses a built-in id takes over that entry's program and
+arguments; any environment the built-in sets stays unless you set it again.
+
 What it does: listens on `127.0.0.1` only, always with a token
 (`<state dir>/token`, made on first start), with browser origins refused unless
 listed in `allowedOrigins`. Agents must be programs in the Nix store; every
