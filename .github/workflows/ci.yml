@@ -1,5 +1,12 @@
 name: CI
 
+# The same check as the local check of record: scripts/check.sh runs the
+# full-history secret scan, go vet and go test (the cmd tests start
+# LocalStack in Docker and never reach real AWS), Nix evaluation of the
+# template, and shellcheck. This repository is public, and so are these logs:
+# no step prints the environment, a secret or any machine's configuration,
+# and no secret is used.
+
 on:
   push:
     branches: [main]
@@ -13,15 +20,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go:
-    # Minimal check on the existing code. The cmd tests start LocalStack in
-    # Docker; they never reach real AWS.
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  check:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Full history: the secret scan reads every commit of every branch.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test ./...
+      # scripts/check.sh needs Nix with a nixpkgs channel: the template is
+      # evaluated against it, and gitleaks, jq and shellcheck come from it.
+      # The same release as the devbox runs.
+      - uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+        with:
+          nix_path: nixpkgs=channel:nixos-26.05
+      - name: Check
+        run: scripts/check.sh

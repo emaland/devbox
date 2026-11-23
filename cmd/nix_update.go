@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/spf13/cobra"
 
-	"github.com/emaland/devbox/internal/config"
+	"github.com/instantcocoa/devbox/internal/config"
 )
 
 // nixupStartMarker is echoed at the top of the remote apply script so the

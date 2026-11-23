@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	devboxconfig "github.com/emaland/devbox/internal/config"
+	devboxconfig "github.com/instantcocoa/devbox/internal/config"
 )
 
 func newConfigCmd() *cobra.Command {

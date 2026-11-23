@@ -13,8 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/spf13/cobra"
 
-	"github.com/emaland/devbox/internal/awsutil"
-	"github.com/emaland/devbox/internal/config"
+	"github.com/instantcocoa/devbox/internal/awsutil"
+	"github.com/instantcocoa/devbox/internal/config"
 )
 
 type volumeAttachment struct {

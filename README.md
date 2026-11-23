@@ -9,7 +9,7 @@ Running a dev workstation as a persistent EC2 spot instance is cheap, but managi
 ## Install
 
 ```bash
-go install github.com/emaland/devbox@latest
+go install github.com/instantcocoa/devbox@latest
 ```
 
 This puts the `devbox` binary in your `$GOPATH/bin` (or `$GOBIN`). Make sure that's on your `PATH`.
@@ -17,7 +17,7 @@ This puts the `devbox` binary in your `$GOPATH/bin` (or `$GOBIN`). Make sure tha
 ## Building from source
 
 ```bash
-git clone git@github.com:emaland/devbox.git
+git clone https://github.com/instantcocoa/devbox.git
 cd devbox
 go build -o devbox .
 

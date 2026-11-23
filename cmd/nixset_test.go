@@ -16,7 +16,7 @@ import (
 	"testing"
 	"testing/fstest"
 
-	"github.com/emaland/devbox/internal/config"
+	"github.com/instantcocoa/devbox/internal/config"
 )
 
 // realInstallScript is the script the CLI uploads and the box's restore
