@@ -602,6 +602,12 @@ func transientUnit(t *testing.T, mode string, extra ...string) string {
 		"--setenv=AHP_GATEWAY_READY_PATH=/healthz",
 		"--setenv=AHP_GATEWAY_READY_TIMEOUT=2",
 	}
+	// On a machine that caps heavy jobs in ahp-ci.slice, run the test unit
+	// there too: a unit started with systemd-run lands in the user manager's
+	// own slice otherwise, outside the cap the test itself runs under.
+	if exec.Command("systemctl", "--user", "cat", "ahp-ci.slice").Run() == nil {
+		args = append(args, "--slice=ahp-ci.slice")
+	}
 	args = append(args, extra...)
 	args = append(args, node, writeStubGateway(t))
 	if out, err := exec.Command("systemd-run", args...).CombinedOutput(); err != nil {
