@@ -14,10 +14,10 @@ How the code stays clear of them:
 
 - `terraform/configuration.nix` is a template. A value that belongs to one
   machine or account is a `@@MARKER@@` that the CLI fills in when it pushes the
-  config, or is read on the box from a file outside the repository. See
-  "Machine-specific values" in the README. Add a marker; never a literal.
-- Tests build key-shaped or id-shaped fixtures at run time from pieces, and use
-  `example.com` and the documentation address ranges.
+  config, or is read on the box from a file outside the repository. Add a
+  marker; never a literal.
+- Tests that need a key-shaped or id-shaped fixture build it at run time from
+  pieces, and use `example.com` and the documentation address ranges.
 
 A value that was committed and later removed is still in history. If that
 happens before you push, rewrite your commits. Do not push and fix forward.
@@ -27,11 +27,13 @@ happens before you push, rewrite your commits. Do not push and fix forward.
 **Before every push, read your own diff for the list above.** The two automated
 checks are backstops.
 
-1. **CI secret scan.** The `secrets` job in `.github/workflows/ci.yml` runs
-   [gitleaks](https://github.com/gitleaks/gitleaks) over the full history of
-   every branch on each push and pull request, and fails on any finding. It
-   prints the rule, commit, file and line, never the value. To run the same
-   scan locally:
+1. **CI secret scan.** `.github/workflows/secrets.yml` runs
+   [gitleaks](https://github.com/gitleaks/gitleaks) over the full history on
+   every push to any branch and on every pull request, and fails on any
+   finding. It prints the rule, commit, file and line, never the value. It
+   detects credentials only: it does not know about hostnames, addresses,
+   account ids, email addresses or ssh public keys. To run the same scan
+   locally:
 
    ```
    gitleaks git --redact=100 --log-opts="--all" .
@@ -40,7 +42,9 @@ checks are backstops.
    If it reports something in commits that are already pushed, stop and tell the
    repository owner, naming the commit, file and rule. Do not paste the value
    anywhere, and do not add an ignore entry yourself: only the owner decides
-   that a finding is acceptable.
+   that a finding is acceptable. A change to `.gitleaksignore`, a
+   `.gitleaks.toml`, an inline `gitleaks:allow` comment or the scan workflow
+   itself can silence the scan, so any such change needs the owner's review.
 
 2. **Local `pre-push` hook.** The owner's clones carry a `pre-push` hook that
    blocks a push whose commits add content from the list above, including
