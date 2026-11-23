@@ -151,7 +151,7 @@ hook inherits an interactive login shell's profile sourcing.
    Then verify the same way it was verified on macOS:
    ```bash
    curl -sf http://127.0.0.1:4111/health/liveliness   # "I'm alive!"
-   curl -s http://127.0.0.1:4111/spend/logs -H "x-api-key: sk-llm-proxy-local"  # [] is fine pre-traffic
+   curl -s http://127.0.0.1:4111/spend/logs -H "x-api-key: $LLM_PROXY_KEY"  # [] is fine pre-traffic
    ```
 
 4. **Test `claude-fw`/`claude-di`** (aliases already in `home.nix`,
