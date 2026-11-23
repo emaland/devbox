@@ -54,7 +54,13 @@ setting() {
 
 window="$(setting "$window_file" "${DEVBOX_AUTOSTOP_DEFAULT_WINDOW:-4h}")"
 cap="$(setting "$cap_file" "${DEVBOX_AUTOSTOP_DEFAULT_CAP:-12h}")"
-[ "$window" = off ] && exit 0
+# Row 1: off means nothing at all, except a stop the user asked for (row 10).
+window_off=no
+if [ "$window" = off ]; then
+  [ -f "$state/stop-when-idle" ] || exit 0
+  window_off=yes
+  window=0
+fi
 [ -n "$window" ] || window=$((4 * 3600))
 [ -n "$cap" ] || cap=$((12 * 3600))
 
@@ -177,6 +183,8 @@ if [ -f "$state/stop-when-idle" ]; then
       ;;
   esac
 fi
+# With auto-stop off, only the request above can stop the box.
+[ "$window_off" = yes ] && exit 0
 
 # Row 2: someone is here.
 if [ -n "$(who 2>/dev/null)" ] || [ -n "$(ss -tnH state established '( sport = :22 )' 2>/dev/null)" ]; then

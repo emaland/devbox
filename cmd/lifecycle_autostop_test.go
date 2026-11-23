@@ -13,6 +13,35 @@ import (
 // Tests for terraform/devbox/lifecycle/autostop.sh: the decision table in
 // design note 031, section 2.3.
 
+// Review finding (R-CODE, PR 11): with auto-stop off, a requested stop was
+// never checked, so `devbox down --when-idle` never stopped the box.
+func TestAutostopStopWhenIdleWithTheWindowOff(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.write("autostop-after", "off\n")
+	b.gateway.set(200, statusJSON(1, 0, 0))
+	b.requestStopWhenIdle()
+	b.autostop()
+	if b.stopped() {
+		t.Fatal("stopped while busy")
+	}
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	b.advance(600)
+	b.autostop()
+	if !b.stopped() {
+		t.Fatalf("a requested stop with auto-stop off never happened; log:\n%s", b.read(b.logFile))
+	}
+	// Without a request, off still means nothing at all, busy or not.
+	b = newLifecycleBox(t)
+	b.write("autostop-after", "off\n")
+	b.gateway.set(200, statusJSON(1, 0, 0))
+	b.autostop()
+	b.advance(100 * hour)
+	b.autostop()
+	if b.stopped() || len(b.logLines()) != 0 {
+		t.Fatalf("off without a request did something: %v", b.logLines())
+	}
+}
+
 const hour = 3600
 
 func (b *lifecycleBox) autostop() string {
