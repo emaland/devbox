@@ -59,6 +59,13 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		maxPrice = dcfg.DefaultMaxPrice
 	}
 
+	// Fail on a local config problem before launching anything: the config
+	// push at the end needs the template, the keys file and the zone id.
+	dcfg, err := preflightNixConfig(ctx, dcfg, defaultNixFile(), findHostedZoneID)
+	if err != nil {
+		return err
+	}
+
 	// Discover infrastructure
 	fmt.Println("Looking up infrastructure...")
 
