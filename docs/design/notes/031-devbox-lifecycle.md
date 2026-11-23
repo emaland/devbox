@@ -1,6 +1,8 @@
 # 031: Devbox lifecycle: auto-stop that sees agents, spot notices, clean stop, resume on boot
 
-Status: **accepted at design review, revision 3.** Revision 2 answered the
+Status: **accepted at design review, revision 4.** Revision 4 records what
+the code reviews of the implementation changed (sections 2.2, 2.3, 2.4, 2.6,
+2.8). Revision 2 answered the
 first review (every CLI stop path, stale spot notices, a requested stop while
 the gateway restarts, where `resume status` reads its source); revision 3
 takes the diff check's two remaining points (the unreachable rule in time,
@@ -93,6 +95,16 @@ the caller treats that as "not installed" and logs nothing.
   made and the result is "unreachable: token file unusable". It is given to
   curl as a config file on standard input (`-K -`), so it never appears on a
   command line, in the environment or in a log.
+- **Only to the gateway.** The token file must be a regular file, not a
+  link, mode 0600, as the gateway itself requires; it is read with a size
+  bound, so root cannot be pointed at another file, a FIFO or a device. The
+  token is sent only when the process listening on `127.0.0.1:<port>`
+  (`ss -tlne`) belongs to the token file's owner. While the gateway is down,
+  which is exactly when these checks run (after a spot stop, at boot, during
+  a restart), another local user could otherwise bind the port and collect
+  the token. Otherwise the result is "unreachable" with the reason.
+- Text from the answer never reaches a log line or a notice as it is: counts
+  must be numbers, and words are reduced to letters.
 - Results: `ok` with the JSON on standard output; `unreachable` with a reason
   (no answer, HTTP status, not JSON, no `turns` object). A build without a
   status endpoint, such as the public release, answers 404 and so counts as
@@ -160,8 +172,15 @@ starts being unreachable and again when the reason changes.
    timeout plus 15 s. Its result and duration are logged. A failure does not
    prevent step 3: the OS shutdown tries again.
 3. `aws ec2 stop-instances` on itself, as today. If it fails, the failure is
-   logged and noticed and the gateway is started again, so the box is not left
-   running with its work interrupted and nothing to continue it.
+   logged and noticed **once**, and the gateway is started again, so the box
+   is not left running with its work interrupted and nothing to continue it.
+   The next try is a full idle window (or cap) later: `last-active` and
+   `busy-since` restart and a requested stop is dropped. Trying again at the
+   next poll would stop the gateway every 10 minutes, and each stop uses up
+   the interrupted turns' one continuation. The gateway is not started again
+   while the spot watcher has a current interruption notice.
+4. The poll has a start timeout (the gateway's stop bound plus 15 s plus
+   120 s), so one that hangs cannot hold off every later poll.
 
 ### 2.4 Spot watcher (`spot-watch.sh`, `devbox-spot-watch.service`)
 
@@ -195,10 +214,23 @@ which would interrupt the continuations that just started and use up their
 one attempt. Hence the two time checks above; boot time is read from
 `/proc/stat` (`btime`).
 
-**State.** Per key, in `/run/devbox-spot-watch/`, three separate markers:
-`seen` (logged), `stopped` (written only after `systemctl stop` returned) and
-`noticed`. A watcher that dies between steps redoes only the steps not
-marked; `systemctl stop` is safe to repeat.
+**State.** Per key, in `/run/devbox-spot-watch/` (0700, root): `seen`
+(logged), `stopping` (written before `systemctl stop`), `stopped` (written
+after it returned: `ours`, or `not running` when the gateway was already
+down), and `noticed`. A watcher that dies between steps redoes only the steps
+not marked; `systemctl stop` is safe to repeat, and a `stopping` marker with
+the gateway already down still counts as `ours`, so the gateway is started
+again if the interruption does not happen. The notice is posted until
+`noticed` exists, independent of the stop.
+
+**After hibernation** the instance resumes with `/run` and the boot time
+intact, so the 5-minute rule starts the gateway again at once; the log and
+notice say "resumed after hibernation", not "did not happen".
+
+**Untrusted values.** Only `stop`, `hibernate` and `terminate` are accepted
+as an action, and a time only in the characters of an ISO UTC time; anything
+else is "not the expected JSON". The IMDS session token is checked the same
+way and goes to curl on standard input.
 
 ### 2.5 Every stop path stops the gateway first
 
@@ -250,10 +282,12 @@ ssh path:
   command that worked out the install default from that file would report
   `off` while the running gateway is on `continue`. DV-A and GW-R are told.
 - `devbox-agents resume on|off`: runs the gateway's own `resume` command
-  through the gateway module's wrapper. It writes nothing itself. When the
-  build or its wrapper does not offer `resume`, it says so and exits non-zero.
-  It never starts the bare gateway command, which for the public release
-  would start a second server.
+  through the gateway module's wrapper, named by its absolute store path
+  (`services.ahp-gateway.generated.commands`), never looked up on `PATH`,
+  where a copy of the gateway the user installed could come first. It writes
+  nothing itself. When the build or its wrapper does not offer `resume`, it
+  says so and exits non-zero. It never starts the bare gateway command, which
+  for the public release would start a second server.
 - `devbox-agents stop-when-idle [cancel]`: writes or removes
   `/run/devbox-autostop/stop-when-idle` with `sudo` (the box's user is in
   `wheel` with passwordless sudo, which the CLI already relies on), then runs
@@ -304,7 +338,10 @@ does not send a spurious "booted" post. It reports:
 | `spotWatch.enable` | `true` | The watcher |
 | `spotWatch.pollSeconds` | `5` | |
 | `resumeOnBoot` | `true` | The settings in 2.7 |
-| `user` | (required) | Account `devbox-agents` and its sudo rule are for |
+
+There is no `user` option and no sudo rule of the module's own: `devbox-agents
+stop-when-idle` uses `sudo`, which on this box's user is passwordless through
+`wheel`. A box whose user is not in `wheel` needs a rule for that one command.
 
 `configuration.nix` enables it and sets `webhookFile` to the same file the
 boot notification already reads.
