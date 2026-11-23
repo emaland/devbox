@@ -180,8 +180,8 @@ func TestGatewayModuleUnit(t *testing.T) {
 			t.Errorf("RequiresMountsFor %s lacks %s", mounts, want)
 		}
 	}
-	// Five never-ready starts must fit inside the window: each can take a
-	// start timeout for prepare, another for the ready wait, the stop
+	// Five never-ready starts must fit inside the window: each can take the
+	// whole start timeout (which covers prepare and the ready wait), the stop
 	// timeout and the restart delay.
 	start := int(unit.ServiceConfig["TimeoutStartSec"].(float64))
 	stop := int(unit.ServiceConfig["TimeoutStopSec"].(float64))
@@ -189,7 +189,7 @@ func TestGatewayModuleUnit(t *testing.T) {
 	if burst := int(unit.UnitConfig["StartLimitBurst"].(float64)); burst != 5 {
 		t.Errorf("StartLimitBurst %d", burst)
 	}
-	if need := 5 * (2*start + stop + 2); window <= need {
+	if need := 5 * (start + stop + 2); window <= need {
 		t.Errorf("StartLimitIntervalSec %d does not cover five failed starts (%d s)", window, need)
 	}
 
@@ -903,7 +903,8 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 	t.Run("a good start runs the gateway after prepare", func(t *testing.T) {
 		p := newPrepareBox(t)
 		marker := filepath.Join(t.TempDir(), "gateway-ran")
-		got, status := p.runProgram(unitCommand, public022, append(clean, "AHP_TEST_MARKER="+marker)...)
+		prepared := filepath.Join(t.TempDir(), "prepared")
+		got, status := p.runProgram(unitCommand, public022, append(clean, "AHP_TEST_MARKER="+marker, "AHP_GATEWAY_PREPARED_MARKER="+prepared)...)
 		if status != 0 {
 			t.Fatalf("exit %d:\n%s", status, got)
 		}
@@ -912,6 +913,9 @@ func TestGatewayLauncherAsBuilt(t *testing.T) {
 		}
 		if _, err := os.Stat(marker); err != nil {
 			t.Error("the gateway did not run after prepare")
+		}
+		if _, err := os.Stat(prepared); err != nil {
+			t.Error("the launcher did not mark prepare as finished")
 		}
 	})
 

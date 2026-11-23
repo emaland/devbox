@@ -5,8 +5,11 @@
 # the new build takes effect at the next restart or boot. The token is added
 # to the gateway's config at each start and never enters the Nix store.
 #
-# Not in this file yet: the readiness check, the failure notice. Until they
-# exist the template keeps `enable = false`.
+# The unit counts as started only after a readiness check: the ready path
+# answers, the listener is this unit's own and loopback only, and a
+# tokenless connection is refused. A failed unit, a unit that never started
+# (/home missing) and a slow crash loop are reported in the box's log and to
+# a webhook if one is configured.
 #
 # Values in `environment`, `settings` and providers' `env` are written to the
 # world-readable Nix store and unit file: no secrets there.
@@ -93,19 +96,40 @@ let
   # must not be retried. The tools' PATH is given to prepare alone, so the
   # gateway and its agents keep the unit's PATH.
   prepareTools = lib.makeBinPath (with pkgs; [ jq iproute2 coreutils findutils gnused ]);
-  # The unit counts as started as soon as the launcher starts, so the start
-  # timeout does not cover prepare (a large backup, say); the launcher bounds
-  # it itself. A timeout exits 124, which is retried.
+  # The launcher bounds prepare (a timeout exits 124, which is retried) and
+  # creates a marker when it has finished: systemd starts the readiness check
+  # as soon as the launcher starts, and that check starts its own deadline
+  # only from the marker.
   launcher = pkgs.writeShellScript "ahp-gateway-launch" ''
     if [ "$#" -eq 0 ]; then
       echo "ahp-gateway-launch: no command to run" >&2
       exit 64
     fi
-    PATH=${prepareTools} ${pkgs.coreutils}/bin/timeout ${toString startTimeout} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
+    marker="''${AHP_GATEWAY_PREPARED_MARKER:-}"
+    [ -z "$marker" ] || ${pkgs.coreutils}/bin/rm -f "$marker"
+    PATH=${prepareTools} ${pkgs.coreutils}/bin/timeout ${toString cfg.prepareTimeoutSec} ${pkgs.bash}/bin/sh ${../ahp-gateway/prepare.sh} || exit $?
+    [ -z "$marker" ] || : >"$marker"
     exec "$@"
   '';
 
-  startTimeout = cfg.readyTimeoutSec + 15;
+  # The whole start: prepare, then the wait for readiness, then a margin.
+  startTimeout = cfg.prepareTimeoutSec + cfg.readyTimeoutSec + 15;
+  preparedMarker = "/run/ahp-gateway/prepared";
+
+  ready = pkgs.writeShellScript "ahp-gateway-ready" ''
+    export PATH=${lib.makeBinPath (with pkgs; [ curl iproute2 coreutils gawk ])}
+    exec ${pkgs.bash}/bin/sh ${../ahp-gateway/ready.sh}
+  '';
+
+  notice = pkgs.writeShellScript "ahp-gateway-notice" ''
+    export PATH=${lib.makeBinPath (with pkgs; [ curl jq coreutils gnused ])}
+    exec ${pkgs.bash}/bin/sh ${../ahp-gateway/notice.sh} "$@"
+  '';
+
+  noticeEnvironment = {
+    AHP_NOTICE_LOG = cfg.failureNotice.logFile;
+    AHP_NOTICE_WEBHOOK_FILE = if cfg.failureNotice.webhookFile == null then "" else cfg.failureNotice.webhookFile;
+  };
 
   agentPath = lib.concatStringsSep ":" ([
     "${home}/.local/bin"
@@ -196,7 +220,28 @@ in
       default = { };
       description = "Extra keys merged into the gateway config. Keys the module owns are refused.";
     };
-    readyPath = mkOption { type = types.str; default = "/healthz"; };
+    readyPath = mkOption {
+      type = types.str;
+      default = "/healthz";
+      description = "HTTP path that answers 200 when the gateway is ready.";
+    };
+    failureNotice = {
+      logFile = mkOption {
+        type = types.str;
+        default = "/var/log/boot-history";
+        description = "File a line is appended to when the gateway fails or is not running.";
+      };
+      webhookFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Optional file with a SLACK_WEBHOOK_URL=... line. Read, never run.";
+      };
+      restartsBeforeNotice = mkOption {
+        type = types.ints.unsigned;
+        default = 3;
+        description = "Restarts between two hourly checks that count as a crash loop.";
+      };
+    };
     noRetryExitStatus = mkOption {
       type = types.listOf types.int;
       default = [ ];
@@ -210,7 +255,16 @@ in
       description = "Extra variables for the gateway and its agents. Stored in the Nix store: no secrets.";
     };
     extraPath = mkOption { type = types.listOf types.package; default = [ ]; };
-    readyTimeoutSec = mkOption { type = types.ints.positive; default = 60; };
+    readyTimeoutSec = mkOption {
+      type = types.ints.positive;
+      default = 60;
+      description = "Seconds the gateway has to become ready once the start-up checks have finished.";
+    };
+    prepareTimeoutSec = mkOption {
+      type = types.ints.positive;
+      default = 300;
+      description = "Seconds the start-up checks may take, a database backup included.";
+    };
     stopTimeoutSec = mkOption { type = types.ints.positive; default = 45; };
 
     generated = mkOption {
@@ -290,15 +344,21 @@ in
         AHP_GATEWAY_BUILD_VERSION = cfg.package.version or "unknown";
         AHP_GATEWAY_BUILD_PATH = "${cfg.package}";
         AHP_GATEWAY_ALLOW_DOWNGRADE = if cfg.allowDowngrade then "1" else "0";
+        AHP_GATEWAY_READY_PATH = cfg.readyPath;
+        AHP_GATEWAY_READY_TIMEOUT = toString cfg.readyTimeoutSec;
+        AHP_GATEWAY_PREPARED_MARKER = preparedMarker;
+        AHP_GATEWAY_PREPARE_TIMEOUT = toString cfg.prepareTimeoutSec;
       };
+
+      onFailure = [ "ahp-gateway-failed.service" ];
 
       unitConfig = {
         RequiresMountsFor = [ cfg.stateDir home ];
         StartLimitBurst = 5;
-        # Five starts that each spend a full start timeout in prepare (bounded
-        # by the launcher) and another waiting for readiness, then stop and
-        # wait, must fit inside the window, or the limit is never reached.
-        StartLimitIntervalSec = 6 * (2 * startTimeout + cfg.stopTimeoutSec + 2);
+        # Five starts that each spend the whole start timeout (prepare and the
+        # ready wait), then stop and wait, must fit inside the window, or the
+        # limit is never reached.
+        StartLimitIntervalSec = 6 * (startTimeout + cfg.stopTimeoutSec + 2);
       };
 
       serviceConfig = {
@@ -309,6 +369,7 @@ in
         RuntimeDirectoryMode = "0700";
         UnsetEnvironment = "CLAUDECODE";
         ExecStart = "${launcher} ${node} ${cli} --config ${runtimeConfig}";
+        ExecStartPost = "${ready}";
         Restart = "on-failure";
         RestartSec = 2;
         KillMode = "mixed";
@@ -317,6 +378,47 @@ in
         TimeoutStopSec = cfg.stopTimeoutSec;
         # 78: the start-up checks refused; restarting will not help.
         RestartPreventExitStatus = lib.unique ([ "78" ] ++ map toString cfg.noRetryExitStatus);
+      };
+    };
+
+    # Neither of these needs /home: "the gateway never started because /home
+    # never mounted" is one of the cases they report.
+    systemd.services.ahp-gateway-failed = {
+      description = "Report that the AHP gateway failed";
+      environment = noticeEnvironment;
+      serviceConfig = {
+        Type = "oneshot";
+        # A oneshot has no start timeout by default; a hung notice would
+        # block the next one.
+        TimeoutStartSec = 60;
+        ExecStart = "${notice} 'ahp-gateway.service failed; see journalctl -u ahp-gateway'";
+      };
+    };
+
+    systemd.services.ahp-gateway-check = {
+      description = "Check that the AHP gateway is running and not crash-looping";
+      path = [ config.systemd.package pkgs.coreutils pkgs.gnused ];
+      environment = noticeEnvironment // {
+        AHP_CHECK_UNIT = "ahp-gateway.service";
+        AHP_CHECK_STATE = "/run/ahp-gateway-check/restarts";
+        AHP_CHECK_RESTARTS = toString cfg.failureNotice.restartsBeforeNotice;
+        AHP_NOTICE_SCRIPT = "${notice}";
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RuntimeDirectory = "ahp-gateway-check";
+        RuntimeDirectoryPreserve = "yes";
+        TimeoutStartSec = 60;
+        ExecStart = "${pkgs.bash}/bin/sh ${../ahp-gateway/check.sh}";
+      };
+    };
+
+    systemd.timers.ahp-gateway-check = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "5min";
+        OnUnitActiveSec = "1h";
+        Unit = "ahp-gateway-check.service";
       };
     };
   };

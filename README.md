@@ -164,9 +164,11 @@ volume, and restored from there at boot after an instance replacement.
 `terraform/devbox/modules/ahp-gateway.nix` runs the
 [AHP gateway](https://github.com/formulahendry/ahp-acp-gateway) as the system
 service `ahp-gateway.service` (design note `docs/design/notes/030-ahp-gateway-module.md`).
-It is **off** in the template and **not ready to turn on yet**: the readiness
-check and the failure notice are still to come. When it is, it is turned on in
-your `local.nix`, because which agent to run is your choice:
+It is **off** in the template and is turned on in your `local.nix`, because
+which agent to run is your choice. Before turning it on for the first time, run
+the boot checklist in design note 030 section 5 once: what only a real boot
+shows (ordering against `/home`, a reboot, a switch with a running gateway)
+cannot be tested on a development machine.
 
 ```nix
 { pkgs, ... }: {
@@ -190,6 +192,13 @@ built-in launcher that downloads code is disabled. Before a different build
 first opens the database it is backed up to `<state dir>/backups/`, and an
 older build is refused. A config switch never restarts a running gateway; the
 new build takes effect at the next restart or boot.
+
+The unit counts as started only when the gateway answers, owns its port, listens
+on loopback only and refuses a connection without a token. If it fails, if it
+never starts (for example because `/home` did not mount), or if it keeps
+restarting, a line goes to `/var/log/boot-history`, and to a webhook if
+`services.ahp-gateway.failureNotice.webhookFile` names a file with a
+`SLACK_WEBHOOK_URL=` line. That file is read, never run.
 
 ### Machine-specific values
 
