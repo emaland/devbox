@@ -43,6 +43,9 @@ type fakeGateway struct {
 	authOK   int
 	authBad  int
 	server   *httptest.Server
+	// unitFile is the fake systemctl's unit state: once the gateway unit is
+	// stopped, the gateway stops answering, as the real one would.
+	unitFile string
 }
 
 func newFakeGateway(t *testing.T) *fakeGateway {
@@ -56,6 +59,12 @@ func newFakeGateway(t *testing.T) *fakeGateway {
 			fmt.Fprintf(&record, "%s: %s\n", name, strings.Join(values, ","))
 		}
 		g.requests = append(g.requests, record.String())
+		if g.unitFile != "" {
+			if state, err := os.ReadFile(g.unitFile); err == nil && strings.TrimSpace(string(state)) == "inactive" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
 		if r.URL.Path != "/status" {
 			http.NotFound(w, r)
 			return
@@ -163,11 +172,13 @@ func (m *fakeIMDS) tokensIssued() int {
 	return m.issued
 }
 
-// fakeWebhook records what is posted to it.
+// fakeWebhook records what is posted to it, and adds "webhook post" to the
+// fakes' call log, so a notice can be ordered against the other steps.
 type fakeWebhook struct {
-	mu     sync.Mutex
-	texts  []string
-	server *httptest.Server
+	mu        sync.Mutex
+	texts     []string
+	callsFile string
+	server    *httptest.Server
 }
 
 func newFakeWebhook(t *testing.T) *fakeWebhook {
@@ -179,6 +190,12 @@ func newFakeWebhook(t *testing.T) *fakeWebhook {
 		json.NewDecoder(r.Body).Decode(&payload)
 		h.mu.Lock()
 		h.texts = append(h.texts, payload.Text)
+		if h.callsFile != "" {
+			if f, err := os.OpenFile(h.callsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				f.WriteString("webhook post\n")
+				f.Close()
+			}
+		}
 		h.mu.Unlock()
 	}))
 	t.Cleanup(h.server.Close)
@@ -218,6 +235,10 @@ func newLifecycleBox(t *testing.T) *lifecycleBox {
 	if err != nil {
 		t.Skip("date not on PATH")
 	}
+	realCurl, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skip("curl not on PATH")
+	}
 	root := t.TempDir()
 	b := &lifecycleBox{
 		t:       t,
@@ -255,6 +276,11 @@ case "${1:-}" in
   *) exec %[1]s -d "@$now" "$@" ;;
 esac`, realDate),
 		"aws": `record aws "$@"; exit "$(cat "$FAKE_ROOT/aws-exit" 2>/dev/null || echo 0)"`,
+		// The real curl, with its arguments and environment recorded, so a
+		// token on its command line or in its environment is caught.
+		"curl": fmt.Sprintf(`printf '%%s\n' "$*" >>"$FAKE_ROOT/curl-argv"
+env >>"$FAKE_ROOT/curl-env"
+exec %s "$@"`, realCurl),
 		"systemctl": `record systemctl "$@"
 case "$1" in
   is-active) [ "$(cat "$FAKE_ROOT/gateway" 2>/dev/null)" = active ] ;;
@@ -280,6 +306,8 @@ esac`,
 	b.write("gateway-config.json", fmt.Sprintf(`{"managedBy": "system", "port": %d, "tokenFile": %q, "path": "/ahp"}`, b.gateway.port(), tokenFile))
 	b.write("webhook", "export SLACK_WEBHOOK_URL="+b.hook.server.URL+"/hook\n")
 	b.write("gateway", "active\n")
+	b.gateway.unitFile = filepath.Join(root, "gateway")
+	b.hook.callsFile = filepath.Join(root, "calls")
 	b.setNow(1_700_000_000)
 
 	b.env = append(os.Environ(),
@@ -381,6 +409,9 @@ func (b *lifecycleBox) noTokenLeak(output string) {
 		"log":     b.read(b.logFile),
 		"notices": strings.Join(b.hook.posts(), "\n"),
 		"output":  output,
+		// The real curl's command line and environment.
+		"curl command line": b.read(filepath.Join(b.root, "curl-argv")),
+		"curl environment":  b.read(filepath.Join(b.root, "curl-env")),
 	}
 	b.gateway.mu.Lock()
 	for _, request := range b.gateway.requests {

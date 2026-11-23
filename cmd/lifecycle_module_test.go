@@ -133,6 +133,76 @@ func TestLifecycleModuleUnits(t *testing.T) {
 	}
 }
 
+// R-TEST: the template's boot notification. Changing it must not post a
+// spurious "booted" at deploy, it must come after the gateway so the resume
+// line can report, and it must post through notify.sh, never by running the
+// secrets file.
+func TestTemplateBootNotification(t *testing.T) {
+	needNix(t)
+	template, err := filepath.Abs(filepath.Join("..", "terraform", "configuration.nix"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unit struct {
+		RestartIfChanged bool     `json:"restartIfChanged"`
+		After            []string `json:"after"`
+		Script           string   `json:"script"`
+		ScriptDrvs       []string `json:"scriptDrvs"`
+		Notify           string   `json:"notify"`
+		Lifecycle        bool     `json:"lifecycle"`
+	}
+	// --read-write-mode writes the derivations, so the script can be built.
+	expression := fmt.Sprintf(`let s = import <nixpkgs/nixos> { configuration = %s; };
+  u = s.config.systemd.services.devbox-slack-notify; in {
+  inherit (u) restartIfChanged after;
+  script = builtins.unsafeDiscardStringContext u.serviceConfig.ExecStart;
+  scriptDrvs = builtins.attrNames (builtins.getContext u.serviceConfig.ExecStart);
+  notify = builtins.unsafeDiscardStringContext "${s.config.services.devbox-lifecycle.generated.notify}";
+  lifecycle = s.config.services.devbox-lifecycle.enable;
+}`, template)
+	out, err := exec.Command("nix-instantiate", "--eval", "--strict", "--json", "--read-write-mode", "-E", expression).Output()
+	if err != nil {
+		var stderr string
+		if exit, ok := err.(*exec.ExitError); ok {
+			stderr = string(exit.Stderr)
+		}
+		t.Fatalf("evaluating the template: %v\n%s", err, lastLines(stderr, 15))
+	}
+	if err := json.Unmarshal(out, &unit); err != nil {
+		t.Fatal(err)
+	}
+	if unit.RestartIfChanged {
+		t.Error("devbox-slack-notify restarts on a config switch, which posts a spurious 'booted'")
+	}
+	if !contains(unit.After, "ahp-gateway.service") {
+		t.Errorf("devbox-slack-notify is not ordered after the gateway: %v", unit.After)
+	}
+	if !unit.Lifecycle {
+		t.Error("the template does not enable devbox-lifecycle")
+	}
+	if !strings.HasPrefix(unit.Script, "/nix/store/") {
+		t.Fatalf("ExecStart %q", unit.Script)
+	}
+	// Build the one small script (its derivation is in the string's
+	// context) and read it.
+	for _, drv := range unit.ScriptDrvs {
+		if out, err := exec.Command("nix-store", "--realise", drv).CombinedOutput(); err != nil {
+			t.Fatalf("realising %s: %v\n%s", drv, err, lastLines(string(out), 10))
+		}
+	}
+	data, err := os.ReadFile(unit.Script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if !strings.Contains(body, unit.Notify) {
+		t.Error("the boot notification does not post through notify.sh")
+	}
+	if strings.Contains(body, ". \"$SECRETS\"") || strings.Contains(body, "source ") {
+		t.Error("the boot notification runs the secrets file")
+	}
+}
+
 func contains(list []string, want string) bool {
 	for _, item := range list {
 		if item == want {
@@ -210,6 +280,11 @@ func TestLifecycleModuleStopTimeoutAssertion(t *testing.T) {
 	out, err := exec.Command("nix-instantiate", "--eval", "-E", expression).CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "stopTimeoutSec must be at most 60") {
 		t.Fatalf("a 61 s stop timeout was accepted:\n%s", lastLines(string(out), 10))
+	}
+	// The bound itself is allowed.
+	expression = "(" + lifecycleSystem(t, "{ stopTimeoutSec = 60; }", "{}") + ").config.system.build.toplevel.drvPath"
+	if out, err := exec.Command("nix-instantiate", "--eval", "-E", expression).CombinedOutput(); err != nil {
+		t.Fatalf("a 60 s stop timeout was refused:\n%s", lastLines(string(out), 10))
 	}
 	expression = "(" + lifecycleSystem(t, "{ stopTimeoutSec = 61; }", "{ spotWatch.enable = false; }") + ").config.system.build.toplevel.drvPath"
 	if out, err := exec.Command("nix-instantiate", "--eval", "-E", expression).CombinedOutput(); err != nil {

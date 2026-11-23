@@ -17,6 +17,28 @@ const fakeStart int64 = 1_700_000_000
 
 func isoTime(epoch int64) string { return time.Unix(epoch, 0).UTC().Format("2006-01-02T15:04:05Z") }
 
+// R-TEST: a notice from before this boot is stale even when it is less than
+// two minutes old (a quick reboot after the event).
+func TestSpotWatchNoticeFromBeforeAQuickReboot(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.write("proc-stat", fmt.Sprintf("cpu  1 2 3\nbtime %d\n", fakeStart-30))
+	b.imds.setNotices(fmt.Sprintf(`{"action": "stop", "time": %q}`, isoTime(fakeStart-60)), "")
+	b.watchOnce()
+	if b.count(gatewayStop) != 0 || b.logCount("stale interruption notice ignored") != 1 {
+		t.Fatalf("calls %v log:\n%s", b.calls(), b.read(b.logFile))
+	}
+}
+
+// R-TEST: the two-minute rule's edge: 90 s late is still acted on.
+func TestSpotWatchLateButNotStaleNotice(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.imds.setNotices(fmt.Sprintf(`{"action": "stop", "time": %q}`, isoTime(fakeStart-90)), "")
+	b.watchOnce()
+	if b.count(gatewayStop) != 1 {
+		t.Fatalf("a notice 90 s late was not acted on: %v; log:\n%s", b.calls(), b.read(b.logFile))
+	}
+}
+
 func (b *lifecycleBox) watchOnce() {
 	b.t.Helper()
 	out, status := b.run("spot-watch.sh", "--once")

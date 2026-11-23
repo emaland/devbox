@@ -58,25 +58,46 @@ func (b *lifecycleBox) autostop() string {
 // of a stop: notice, gateway stop, then the instance.
 func (b *lifecycleBox) stopped() bool {
 	b.t.Helper()
-	gatewayStop, instanceStop := -1, -1
-	for i, call := range b.calls() {
-		if call == "systemctl stop ahp-gateway.service" {
-			gatewayStop = i
+	// Each stop-instances closes one stop. Within it (since the previous
+	// one), the order must be: notice, gateway stop (when the gateway was
+	// running), then stop-instances.
+	calls := b.calls()
+	found := false
+	segment := 0
+	for k, call := range calls {
+		if !strings.HasPrefix(call, "aws ec2 stop-instances") {
+			continue
 		}
-		if strings.HasPrefix(call, "aws ec2 stop-instances") {
-			instanceStop = i
-			if call != "aws ec2 stop-instances --region test-region-1 --instance-ids i-0fake" {
-				b.t.Errorf("stop-instances called as %q", call)
+		found = true
+		if call != "aws ec2 stop-instances --region test-region-1 --instance-ids i-0fake" {
+			b.t.Errorf("stop-instances called as %q", call)
+		}
+		notice, gatewayStop := -1, -1
+		for i := segment; i < k; i++ {
+			switch calls[i] {
+			case "webhook post":
+				if notice < 0 {
+					notice = i
+				}
+			case "systemctl stop ahp-gateway.service":
+				gatewayStop = i
 			}
 		}
+		if notice < 0 {
+			b.t.Errorf("the box stopped without a notice: %v", calls[segment:k+1])
+		} else if gatewayStop >= 0 && gatewayStop < notice {
+			b.t.Errorf("the gateway was stopped before the notice: %v", calls[segment:k+1])
+		}
+		segment = k + 1
 	}
-	if instanceStop >= 0 && gatewayStop > instanceStop {
-		b.t.Errorf("the gateway was stopped after the instance: %v", b.calls())
+	// Auto-stop stops the gateway only on its way to stop-instances, so a
+	// gateway stop with no stop-instances after it came after the instance.
+	for i := segment; i < len(calls); i++ {
+		if calls[i] == "systemctl stop ahp-gateway.service" {
+			b.t.Errorf("the gateway was stopped after the instance: %v", calls)
+		}
 	}
-	if instanceStop >= 0 && len(b.hook.posts()) == 0 {
-		b.t.Error("the box stopped without a notice")
-	}
-	return instanceStop >= 0
+	return found
 }
 
 func (b *lifecycleBox) lastLog() string {
@@ -258,6 +279,10 @@ func TestAutostopBusyCapNeedsContinuousBusy(t *testing.T) {
 	for _, interruption := range []string{"waiting", "login"} {
 		t.Run(interruption, func(t *testing.T) {
 			b := newLifecycleBox(t)
+			// An idle window longer than the scenario, so only the cap can
+			// stop the box (a waiting poll after 11 h would otherwise be an
+			// idle stop).
+			b.write("autostop-after", "1d\n")
 			b.gateway.set(200, statusJSON(1, 0, 0))
 			b.autostop()
 			b.advance(11 * hour)
@@ -723,9 +748,14 @@ func TestNotifyWebhookFileParsing(t *testing.T) {
 			}
 		})
 	}
-	// The plain form still works.
+	// The plain form still works, and the rest of the file is not run.
 	b := newLifecycleBox(t)
+	marker := filepath.Join(b.root, "ran")
+	b.write("webhook", "touch "+marker+"\nexport SLACK_WEBHOOK_URL="+b.hook.server.URL+"/hook\n$(touch "+marker+")\n")
 	if _, status := b.run("notify.sh", "hello"); status != 0 || len(b.hook.posts()) != 1 {
 		t.Fatalf("a good webhook line did not post: %q", b.hook.posts())
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the webhook file was run")
 	}
 }
