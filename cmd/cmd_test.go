@@ -67,7 +67,7 @@ func TestMain(m *testing.M) {
 func runWithLocalStack(m *testing.M) int {
 	ctx := context.Background()
 
-	container, err := localstack.Run(ctx, "localstack/localstack:latest",
+	container, err := localstack.Run(ctx, "localstack/localstack:4.12",
 		testcontainers.WithEnv(map[string]string{
 			"SERVICES": "ec2,route53",
 		}),
