@@ -1,6 +1,6 @@
 # 030: AHP gateway as a NixOS module and boot service
 
-Status: **proposed, revision 4** after three design reviews. No code yet.
+Status: **accepted at the design gate, revision 5.** Revision 5 adds what the gate asked for and one correction found before coding.
 
 ## 1. Problem
 
@@ -50,32 +50,38 @@ terraform/
   `local.nix`. All come from one place: the directory of the main file when it
   is read from disk (also with `--file`), or the copy embedded in the binary.
   Never a mix.
-- **One switch point.** On the box the whole set, main file included, is
-  unpacked to a new directory `devbox.<stamp>`, and `devbox` is a symlink
-  switched to it in one rename. `/etc/nixos/configuration.nix` is a fixed
-  symlink to `devbox/configuration.nix`. There is no moment at which a new
-  main file sits beside an old tree. Old directories are removed afterwards.
+- **One switch point.** On the box a set is one directory,
+  `/etc/nixos/sets/<stamp>/`, laid out exactly like `terraform/` here: the main
+  file, the `devbox/` tree and `local.nix` when there is one.
+  `/etc/nixos/current` is a symlink to the set in use, switched in one rename,
+  and `/etc/nixos/configuration.nix` is a fixed symlink to
+  `current/configuration.nix`. Nix resolves a relative import against the real
+  directory of the importing file (checked), so the imports inside a set stay
+  inside that set. There is no moment at which a new main file sits beside an
+  old tree. Old sets are removed afterwards, keeping the previous one.
 - The saved copy under `~/.config/devbox/` is laid out and switched the same
-  way and includes `local.nix`. The boot-time restore service restores the
-  set when the saved `devbox` link names a complete directory that differs
-  from the one in `/etc/nixos`, and restores an old single-file saved copy as
-  it does today.
-- **A fresh root volume** (instance replacement, resize) has no `local.nix`
-  and has not run the restore service. The remote half of a push therefore
-  restores the saved `local.nix` itself, after `/home` is mounted and before
-  the switch, when none is being pushed and none is in `/etc/nixos`. The saved
-  set also records whether a `local.nix` is expected; if one is expected and
-  none can be found, the push stops before the switch and says so, instead of
-  building a system without the operator's settings.
+  way. The old saved path `~/.config/devbox/configuration.nix` becomes a
+  symlink into the saved set, so a system still running the old restore
+  service keeps working. The new restore service copies the saved set into
+  `/etc/nixos/sets/` and switches `current` when the saved set is complete and
+  differs from the one in use; it restores an old single-file saved copy as
+  today.
 - `local.nix` is the operator's own module, never in this repository, pushed
-  from the path in a new config key `nix_local_module`. With the key unset the
-  CLI leaves the box's copy alone and says whether one is there. It is for
-  package overrides and values that are not public. It is **not** for secrets:
-  it is world-readable on the box and its values end up in the Nix store.
+  from the path in a new config key `nix_local_module`. It is for package
+  overrides and values that are not public. It is **not** for secrets: it is
+  world-readable on the box and its values end up in the Nix store. Being part
+  of the set, it is switched and saved with it.
+- **When no `local.nix` is pushed** (the key is unset), the remote half of a
+  push carries the previous one forward into the new set: from the set in use,
+  or, on a fresh root volume after an instance replacement, from the saved
+  set once `/home` is mounted. The saved copy records whether a `local.nix`
+  is expected. If one is expected and none can be found, the push stops
+  before the switch and says so, instead of building a system without the
+  operator's settings.
 - **Older CLI binaries.** A binary from before this change pushes its own
   embedded single file, which has no gateway module: the switch would remove
-  the unit and stop the gateway. The box keeps `layout-version` in
-  `/etc/nixos/`; the remote half of a push refuses when the pushed set is older
+  the unit and stop the gateway. Each set carries `devbox/layout-version`; the
+  remote half of a push refuses when the pushed set is older
   than the box's, and a set with no `layout-version` counts as 0. Binaries
   that predate the check cannot be stopped this way; the migration
   instructions say to replace them first.
@@ -272,6 +278,14 @@ NixOS options on the unit: `restartIfChanged = false`.
   including a restart after a crash; step 5 of prepare makes that safe.
   `nix-update` reports when the running gateway is older than the installed
   one. Note that a switch does start a gateway that was stopped by hand.
+- **Moving a busy gateway to a new build.** Because a switch leaves the
+  running gateway alone, a generation switch is never the thing that
+  interrupts work. The restart that applies the new build is a separate,
+  explicit step, and it is refused while an agent is working unless forced; a
+  forced restart is an ordinary clean stop. That step belongs to the box's
+  lifecycle tooling, not to this module. A build that makes its own backup
+  before changing the database does so as well as prepare's; the two do not
+  share names, and each prunes only its own.
 - **Garbage collection.** The old process keeps running from store paths that
   only an older generation references, and this box collects garbage daily.
   Nix treats the paths in a live process's environment as roots, but not the
