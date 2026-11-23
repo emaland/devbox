@@ -67,6 +67,21 @@ func TestMain(m *testing.M) {
 func runWithLocalStack(m *testing.M) int {
 	ctx := context.Background()
 
+	// volumeMove builds its target-region client from the default credential
+	// chain. Give that chain dummy static values so the tests neither depend on
+	// nor sign with whatever credentials the machine happens to have.
+	for name, value := range map[string]string{
+		"AWS_ACCESS_KEY_ID":         "test",
+		"AWS_SECRET_ACCESS_KEY":     "test",
+		"AWS_SESSION_TOKEN":         "test",
+		"AWS_EC2_METADATA_DISABLED": "true",
+	} {
+		if err := os.Setenv(name, value); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to set %s: %v\n", name, err)
+			return 1
+		}
+	}
+
 	container, err := localstack.Run(ctx, "localstack/localstack:4.12",
 		testcontainers.WithEnv(map[string]string{
 			"SERVICES": "ec2,route53",
