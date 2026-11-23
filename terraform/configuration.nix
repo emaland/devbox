@@ -1,7 +1,11 @@
 { config, pkgs, lib, modulesPath, ... }:
 
 {
-  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
+  # ./local.nix is the operator's own module. It is never part of this
+  # repository: the devbox CLI pushes it beside this file when the operator has
+  # one (config key nix_local_module), and carries it forward otherwise.
+  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ]
+    ++ lib.optional (builtins.pathExists ./local.nix) ./local.nix;
 
   networking.hostName = "dev-workstation";
   networking.dhcpcd.extraConfig = "nohook hostname";
@@ -211,10 +215,14 @@
     openssl
   ];
 
-  # ── Sync configuration.nix from the persistent /home volume ────
-  # On instance replacement (resize, spawn) the root volume is new but
-  # /home survives, so this copies the saved config back to /etc/nixos
-  # for the next rebuild.
+  # ── Restore the config set from the persistent /home volume ────
+  # The config is delivered as a set: this file, the ./devbox tree and the
+  # operator's local.nix, kept together in /etc/nixos/sets/<stamp>/ with
+  # /etc/nixos/current naming the one in use (see devbox/install_set.sh).
+  # The devbox CLI mirrors the set to /home on every push. When the saved set
+  # differs from the one in use, this service copies it back for the next
+  # rebuild. A saved copy from before sets existed is a single file and is
+  # still restored as one.
   #
   # It deliberately does NOT run a nested `nixos-rebuild switch`: doing
   # so collided with boot- and switch-time activation (the nested switch
@@ -222,21 +230,35 @@
   # /home mount, missing users — and `nixos-rebuild` isn't even on a
   # service's PATH, so it exited 127). Activation is handled by the
   # devbox config push (spawn/resize) or a manual `nixos-rebuild`. This
-  # service only syncs the file and can never fail the boot.
+  # service only syncs files and can never fail the boot.
   systemd.services.devbox-restore-nixos-config = {
-    description = "Sync configuration.nix from the persistent volume";
+    description = "Sync the NixOS config set from the persistent volume";
     after       = [ "home.mount" ];
     before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" ];
     wantedBy    = [ "multi-user.target" ];
+    path        = [ pkgs.coreutils pkgs.findutils pkgs.diffutils pkgs.gnutar ];
     serviceConfig = {
       Type            = "oneshot";
       RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "devbox-restore-nixos-config" ''
-        SAVED="/home/emaland/.config/devbox/configuration.nix"
-        TARGET="/etc/nixos/configuration.nix"
-        if [ -r "$SAVED" ] && ! ${pkgs.diffutils}/bin/cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
+        SAVED_DIR="/home/emaland/.config/devbox"
+        CONFIG_DIR="/etc/nixos"
+        if [ -L "$SAVED_DIR/current" ] || [ -e "$SAVED_DIR/current" ]; then
+          ${pkgs.bash}/bin/sh ${./devbox/install_set.sh} restore "$CONFIG_DIR" "$SAVED_DIR" \
+            || echo "warning: could not restore the saved config set" >&2
+          exit 0
+        fi
+        # An old single-file saved copy. Only for a box that has never had a
+        # set: on one that has, configuration.nix is a link into the set in
+        # use, and copying over it would put an old main file beside a newer
+        # tree.
+        SAVED="$SAVED_DIR/configuration.nix"
+        TARGET="$CONFIG_DIR/configuration.nix"
+        if [ -L "$CONFIG_DIR/current" ] || [ -L "$TARGET" ]; then
+          echo "the saved copy is an old single file; keeping the config set in use"
+        elif [ -f "$SAVED" ] && [ ! -L "$SAVED" ] && ! cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
           echo "Syncing $TARGET from the persistent volume"
-          ${pkgs.coreutils}/bin/cp "$SAVED" "$TARGET" || true
+          cp "$SAVED" "$TARGET" || true
         else
           echo "configuration.nix already in sync (or no readable saved copy)"
         fi

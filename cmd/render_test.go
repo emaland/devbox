@@ -59,6 +59,21 @@ func writeTemplate(t *testing.T) string {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A main file is pushed together with the tree beside it; give the
+	// stand-in the real install script and a layout version.
+	tree := filepath.Join(filepath.Dir(path), "devbox")
+	if err := os.MkdirAll(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script, err := os.ReadFile(filepath.Join("..", "terraform", "devbox", "install_set.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"install_set.sh": script, "layout-version": []byte("1\n")} {
+		if err := os.WriteFile(filepath.Join(tree, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return path
 }
 

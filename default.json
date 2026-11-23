@@ -41,6 +41,10 @@
     // no extra keys.
     "authorized_keys_file": "~/.config/devbox/authorized_keys",
 
+    // Optional NixOS module of your own, pushed to the box as local.nix beside
+    // the config. Leave it out to keep whatever local.nix the box already has.
+    // "nix_local_module": "~/.config/devbox/local.nix",
+
     // The username to SSH as. NixOS defaults to "root" but many setups create
     // a custom user via user_data.
     "ssh_user": "emaland",

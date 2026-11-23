@@ -74,6 +74,7 @@ Example config:
 | `nixos_ami_pattern` | `nixos/24.11*` | Glob pattern for AMI name lookup |
 | `dns_zone_id` | (looked up) | Route 53 hosted zone id rendered into the box's boot-time DNS updater. Leave unset: `nix-update`, `spawn` and `resize` look it up from `dns_zone`. Set it only if the lookup is not possible |
 | `authorized_keys_file` | `~/.config/devbox/authorized_keys` | Local file of extra ssh public keys for the box, one per line (see "Machine-specific values" below) |
+| `nix_local_module` | (none) | A NixOS module of your own, pushed to the box as `local.nix` beside the config (see "How the config reaches the box" below) |
 
 ## Infrastructure setup
 
@@ -132,6 +133,31 @@ The Terraform directory also includes `configuration.nix`, which defines what ru
 - MOTD showing last 20 boot events on login
 - Lingering enabled for `emaland`, so home-manager's systemd `--user` units start at boot and survive logout (see "Required secrets" below)
 - System packages: git, curl, wget, htop, tmux, vim, jq, python3, emacs, gcc, make, awscli, home-manager
+
+### How the config reaches the box
+
+`configuration.nix` imports modules from `terraform/devbox/`, so the config is
+pushed as a **set**: the rendered main file, that tree, and your own
+`local.nix` when you have one. On the box each set is one directory under
+`/etc/nixos/sets/`; `/etc/nixos/current` names the set in use and
+`/etc/nixos/configuration.nix` is a link to `current/configuration.nix`.
+Switching sets is a single rename, so an interrupted push leaves the previous
+set in place. The set is mirrored to `~/.config/devbox/` on the persistent
+volume, and restored from there at boot after an instance replacement.
+
+- **`local.nix`** is for settings that are yours and not public: a package
+  override, extra services. Point `nix_local_module` at it. When it is unset,
+  a push keeps the `local.nix` already on the box (or in the saved copy, after
+  an instance replacement). Once a box has had one, a push that cannot find it
+  anywhere stops before switching instead of building a system without it.
+  It is not a place for secrets: it is readable by every user on the box and
+  its values end up in the Nix store. To stop using one, push an empty
+  module (`{ }`) as `local.nix`; a push never removes it on its own.
+- **Older CLI binaries.** A push carries a layout version. The box refuses a
+  set older than the one it runs, so an old binary cannot push a config that
+  lacks modules the box depends on. Binaries from before this check push a
+  single file; update them before using a box that runs sets.
+- `--file` must name a main file with a `devbox/` directory beside it.
 
 ### Machine-specific values
 
