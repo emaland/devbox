@@ -226,7 +226,7 @@
   systemd.services.devbox-restore-nixos-config = {
     description = "Sync configuration.nix from the persistent volume";
     after       = [ "home.mount" ];
-    before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" "devbox-claude.service" ];
+    before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" ];
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
       Type            = "oneshot";
@@ -646,78 +646,6 @@
           echo "Switching home-manager with local config"
           ${pkgs.home-manager}/bin/home-manager switch $OPT
         fi
-      '');
-    };
-  };
-
-  # ── Claude Code autostart ────────────────────────────────────────
-  # Starts a tmux session running Claude Code on boot.
-  # Attach with: tmux attach -t claude
-  systemd.services.devbox-claude = {
-    description = "Start Claude Code in tmux";
-    after       = [ "home.mount" "network-online.target" "devbox-home-manager.service" ];
-    wants       = [ "network-online.target" "devbox-home-manager.service" ];
-    wantedBy    = [ "multi-user.target" ];
-    serviceConfig = {
-      Type            = "oneshot";
-      RemainAfterExit = true;
-      User            = "emaland";
-      # oom_score_adj is inherited across fork(), so this covers the tmux
-      # server and everything it spawns under this cgroup (Claude Code
-      # included) without needing to target the node process directly.
-      OOMScoreAdjust  = -900;
-      ExecStart = toString (pkgs.writeShellScript "devbox-claude" ''
-        export HOME=/home/emaland
-        export PATH=${lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.curl pkgs.openssh pkgs.nodejs ]}:$HOME/.local/bin:/etc/profiles/per-user/emaland/bin:$PATH
-        # Interactive logins get TMUX_TMPDIR=$XDG_RUNTIME_DIR from home-manager's
-        # hm-session-vars.sh (sourced via /etc/profile.d). This script isn't a
-        # login shell so it must set the same value itself, or this server binds
-        # a different socket (/tmp/tmux-$UID) than `tmux attach` will look in.
-        export TMUX_TMPDIR="''${XDG_RUNTIME_DIR:-/run/user/$(${pkgs.coreutils}/bin/id -u)}"
-        PROJECT_DIR="$HOME/scratch/git/ions"
-
-        if [ ! -d "$PROJECT_DIR" ]; then
-          echo "Project directory $PROJECT_DIR does not exist, skipping"
-          exit 0
-        fi
-
-        # Start the tmux server so the user's tmux config loads — this is
-        # what re-arms tmux-continuum's periodic session saving.
-        ${pkgs.tmux}/bin/tmux start-server 2>/dev/null || true
-
-        # Restore the tmux sessions/windows/panes saved before the reboot.
-        # tmux-continuum's own auto-restore only triggers when a client
-        # attaches, so on a headless boot we invoke tmux-resurrect's restore
-        # explicitly. Check system config (/etc/tmux.conf, written by the
-        # programs.tmux NixOS module) then user config as a fallback.
-        RES_TMUX=""
-        for TMUX_CONF in /etc/tmux.conf "$HOME/.config/tmux/tmux.conf" "$HOME/.tmux.conf"; do
-          if [ -f "$TMUX_CONF" ]; then
-            RES_TMUX=$(${pkgs.gnugrep}/bin/grep -oE \
-              '/nix/store/[^ ]*resurrect[^ ]*/resurrect\.tmux' "$TMUX_CONF" | head -1)
-            [ -n "$RES_TMUX" ] && break
-          fi
-        done
-        if [ -n "$RES_TMUX" ]; then
-          RESTORE="$(dirname "$RES_TMUX")/scripts/restore.sh"
-          if [ -x "$RESTORE" ]; then
-            ${pkgs.tmux}/bin/tmux run-shell "$RESTORE"
-            sleep 3
-            echo "Restored saved tmux sessions"
-          fi
-        fi
-
-        # Ensure a dedicated claude session (recreate so it always resumes the
-        # latest conversation with --continue). Separate from restored sessions.
-        if [ ! -x "$HOME/.local/bin/claude" ]; then
-          echo "$HOME/.local/bin/claude not found or not executable, skipping"
-          exit 0
-        fi
-        ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
-        ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
-          "$HOME/.local/bin/claude --dangerously-skip-permissions --continue || $HOME/.local/bin/claude --dangerously-skip-permissions"
-
-        echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
       '');
     };
   };
