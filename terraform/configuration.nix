@@ -182,10 +182,17 @@
     # Extra authorized keys, in addition to the EC2 key-pair key that
     # devbox-fetch-ssh-key installs into ~/.ssh/authorized_keys each boot.
     # These are written to /etc/ssh/authorized_keys.d/emaland — a separate
-    # file sshd also checks — so the fetch service never clobbers them.
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAz5otg2dmDpJbCO75OlSZZPrP1vIRCv1sVNWeOovsMR emaland@ipad"
-    ];
+    # file sshd also checks — so the fetch service never clobbers them, and
+    # they keep working when /home fails to mount.
+    #
+    # The keys are not kept in this repo. The devbox CLI reads them from
+    # the operator's `authorized_keys_file` (default
+    # ~/.config/devbox/authorized_keys, one key per line) and renders them
+    # into the marker below, separated by "\n". An unrendered marker means
+    # no extra keys.
+    openssh.authorizedKeys.keys =
+      lib.filter (key: key != "" && !(lib.hasPrefix "@@" key))
+        (lib.splitString "\n" "@@EXTRA_AUTHORIZED_KEYS@@");
   };
 
   security.sudo.wheelNeedsPassword = false;
@@ -337,6 +344,17 @@
       # only changes on a real boot, where this runs fresh anyway.
       RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "update-route53" ''
+        ZONE_ID="@@DNS_ZONE_ID@@"
+        RECORD_NAME="@@DNS_RECORD_NAME@@"
+        # No zone or record configured (unset, or marker left unrendered) →
+        # skip rather than calling Route 53 with a bogus value.
+        case "$ZONE_ID" in
+          ""|@@*@@) echo "no DNS zone id configured; skipping Route 53 update"; exit 0 ;;
+        esac
+        case "$RECORD_NAME" in
+          ""|@@*@@) echo "no DNS record name configured; skipping Route 53 update"; exit 0 ;;
+        esac
+
         # Wait for IMDS credentials to become available (IAM role
         # propagation can lag behind network-online.target).
         for i in $(seq 1 12); do
@@ -358,9 +376,6 @@
         PUBLIC_IP=$(${pkgs.curl}/bin/curl -s \
           -H "X-aws-ec2-metadata-token: $TOKEN" \
           http://169.254.169.254/latest/meta-data/public-ipv4)
-
-        ZONE_ID="@@DNS_ZONE_ID@@"
-        RECORD_NAME="@@DNS_RECORD_NAME@@"
 
         ${pkgs.awscli2}/bin/aws route53 change-resource-record-sets \
           --hosted-zone-id "$ZONE_ID" \
@@ -728,13 +743,57 @@
   services.amazon-ssm-agent.enable = true;
 
   # ── Docker ────────────────────────────────────────────────────────
-  virtualisation.docker.enable = true;
+  # Docker keeps its data on the large persistent /home volume rather than
+  # the small root disk, so images and container volumes survive instance
+  # replacement and cannot fill /. Container logs are size-capped. A weekly
+  # prune removes unused images, stopped containers and build cache older
+  # than a week; named volumes are never pruned.
+  virtualisation.docker = {
+    enable = true;
+    daemon.settings = {
+      data-root  = "/home/docker";
+      log-driver = "json-file";
+      log-opts   = { max-size = "50m"; max-file = "3"; };
+    };
+    autoPrune = {
+      enable = true;
+      dates  = "weekly";
+      flags  = [ "--all" "--filter" "until=168h" ];
+    };
+  };
+  systemd.services.docker.unitConfig.RequiresMountsFor = [ "/home" ];
 
   # ── Nix settings ──────────────────────────────────────────────────
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
     trusted-users         = [ "root" "emaland" ];
+
+    # Disk-full guard. When free space on the store's disk drops below
+    # min-free during a build, the daemon collects garbage until max-free is
+    # available, so a heavy build day cannot fill the root disk between the
+    # daily GC runs.
+    min-free = 5 * 1024 * 1024 * 1024;   # 5 GiB
+    max-free = 15 * 1024 * 1024 * 1024;  # 15 GiB
+
+    # Hard-link identical files in the store as they are added.
+    auto-optimise-store = true;
+
+    # Build scratch space on the large persistent /home volume instead of the
+    # root disk. Packages that are not in the binary cache are compiled
+    # locally, and their unpacked sources and build caches are big enough to
+    # exhaust /.
+    build-dir = "/home/.nix-build";
   };
+
+  # build-dir must exist (root-owned, not world-writable) and /home must be
+  # mounted before the daemon starts a build.
+  systemd.tmpfiles.rules = [ "d /home/.nix-build 0755 root root -" ];
+  systemd.services.nix-daemon.unitConfig.RequiresMountsFor = [ "/home" ];
+
+  # Cap the system journal, which is otherwise unbounded.
+  services.journald.extraConfig = ''
+    SystemMaxUse=1G
+  '';
 
   # ── Nix garbage collection ─────────────────────────────────────
   nix.gc = {

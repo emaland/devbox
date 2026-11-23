@@ -72,6 +72,8 @@ Example config:
 | `spawn_name` | `dev-workstation-tmp` | Default Name tag for `spawn` |
 | `nixos_ami_owner` | `427812963091` | AWS account ID that owns the NixOS AMIs |
 | `nixos_ami_pattern` | `nixos/24.11*` | Glob pattern for AMI name lookup |
+| `dns_zone_id` | (looked up) | Route 53 hosted zone id rendered into the box's boot-time DNS updater. Leave unset: `nix-update`, `spawn` and `resize` look it up from `dns_zone`. Set it only if the lookup is not possible |
+| `authorized_keys_file` | `~/.config/devbox/authorized_keys` | Local file of extra ssh public keys for the box, one per line (see "Machine-specific values" below) |
 
 ## Infrastructure setup
 
@@ -118,7 +120,8 @@ The Terraform directory also includes `configuration.nix`, which defines what ru
 
 - SSH with pubkey auth only (root login prohibited)
 - Tailscale VPN with auto-connect on boot
-- Docker enabled
+- Docker enabled, with its data on the persistent `/home` volume, size-capped container logs and a weekly prune of unused images (volumes are never pruned)
+- Nix builds use scratch space on `/home`, the store is garbage-collected automatically when the root disk runs low, and the system journal is capped at 1 GiB
 - `/home` mounted from a persistent EBS volume (by label, so it works across instance types)
 - Boot-time DNS update via Route 53
 - Boot history logger — every boot appends instance metadata to `/var/log/boot-history`
@@ -129,6 +132,31 @@ The Terraform directory also includes `configuration.nix`, which defines what ru
 - MOTD showing last 20 boot events on login
 - Lingering enabled for `emaland`, so home-manager's systemd `--user` units start at boot and survive logout (see "Required secrets" below)
 - System packages: git, curl, wget, htop, tmux, vim, jq, python3, emacs, gcc, make, awscli, home-manager
+
+### Machine-specific values
+
+This repository is public, so `configuration.nix` is a template. Anything that
+identifies one person's machines or AWS account is a `@@MARKER@@` that the CLI
+fills in when it pushes the config (`nix-update`, `spawn`, `resize`). The
+rendered file exists only on the box.
+
+| Marker | Filled from | If not set |
+|--------|-------------|------------|
+| `@@DNS_ZONE_ID@@` | `dns_zone_id`, or looked up from `dns_zone` | The push stops with an error if the lookup fails |
+| `@@DNS_RECORD_NAME@@` | `dns_name` | The boot-time DNS update is skipped |
+| `@@TAILSCALE_AUTH_KEY@@` | `tailscale_auth_key` | Tailscale auto-connect is skipped |
+| `@@DATA_VOLUME_ID@@` | the attached data volume | The format-if-blank service is skipped |
+| `@@EXTRA_AUTHORIZED_KEYS@@` | the file named by `authorized_keys_file` | No extra keys; only the EC2 key pair can log in |
+
+Extra ssh public keys (a tablet, a second laptop) go in
+`~/.config/devbox/authorized_keys` on the machine you run `devbox` from, one
+`<type> <base64> [comment]` per line. Blank lines and `#` comments are ignored.
+Lines with options, or with a quote, backslash or dollar sign in the comment,
+are rejected. Do not add keys to `configuration.nix` itself.
+
+If a key used to be written directly in `configuration.nix`, put it in that file
+**before** the next `devbox nix-update`. Otherwise the update removes it from
+the box.
 
 ### Required secrets
 

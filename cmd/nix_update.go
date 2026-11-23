@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/spf13/cobra"
 
+	"github.com/emaland/devbox/internal/awsutil"
 	"github.com/emaland/devbox/internal/config"
 )
 
@@ -139,6 +141,15 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		"-i", keyPath,
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
+	}
+
+	// The hosted zone id is not built in; without an explicit dns_zone_id it is
+	// looked up from dns_zone before rendering.
+	dcfg, err := resolveDNSZoneID(ctx, dcfg, func(ctx context.Context, zone string) (string, error) {
+		return awsutil.FindHostedZone(ctx, route53.NewFromConfig(awsCfg), zone)
+	})
+	if err != nil {
+		return err
 	}
 
 	// Render the config (substitute @@MARKER@@ placeholders) to a temp file so
