@@ -181,8 +181,8 @@ func createTestInstance(t *testing.T, ctx context.Context) string {
 // uniqueName returns prefix plus a suffix that no earlier call has returned,
 // in this run or an earlier run against the same LocalStack. All tests share
 // one LocalStack, and `go test -count=2` runs every test twice against it, so
-// a fixed resource name collides with the first run's leftovers. The suffix is
-// lower-case letters and digits, valid in a DNS label and in AWS names.
+// a fixed resource name collides with the first run's leftovers. The result is
+// lower-case letters, digits and hyphens: valid in a DNS label and in AWS names.
 func uniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%x-%d", prefix, time.Now().UnixNano(), uniqueCounter.Add(1))
 }
@@ -647,7 +647,7 @@ func TestResizeInstance(t *testing.T) {
 	id := createTestInstance(t, ctx)
 
 	cfg := testDevboxConfig()
-	domain := "resize.test."
+	domain := uniqueName("resize") + ".test."
 	createTestHostedZone(t, ctx, domain)
 	cfg.DNSZone = domain
 	cfg.DNSName = "dev.resize.test"
