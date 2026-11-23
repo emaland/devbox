@@ -1,10 +1,12 @@
 # 031: Devbox lifecycle: auto-stop that sees agents, spot notices, clean stop, resume on boot
 
-Status: **proposed, revision 1.** Builds on note 030 (the gateway as a system
-unit). Covers auto-stop, the spot interruption watcher, the stop paths and
-resume on boot. The CLI commands that sit on top (`devbox agents`, `devbox
-stop` refusing while busy, `devbox tunnel`) are listed in section 2.6 only for
-what they need from the box.
+Status: **proposed, revision 2** (answers the first design review: every CLI
+stop path, stale spot notices, a requested stop while the gateway restarts,
+where `resume status` reads its source). Builds on note 030 (the gateway as a
+system unit). Covers auto-stop, the spot interruption watcher, the stop paths
+and resume on boot. The CLI commands that sit on top (`devbox agents`,
+`devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
+only for what they need from the box.
 
 ## 1. Problem
 
@@ -122,16 +124,26 @@ cap (`/etc/devbox/autostop-busy-cap`, default 12 h, `off` disables it),
 | 7 | No gateway installed | not activity | clear busy-since |
 | 8 | 5 to 7, window elapsed since last-active | **stop** (idle) | |
 | 9 | 5 to 7, window not elapsed | nothing | |
-| 10 | `stop-when-idle` requested (2.6), gateway not busy | **stop** (requested), logins ignored | |
+| 10 | `stop-when-idle` requested (2.6), and the gateway answered idle or waiting, or no gateway is installed, or it has been unreachable for 3 polls in a row | **stop** (requested), logins ignored | |
+
+Row 10 never stops on a single unreachable answer: right after boot, during
+start-up repair or a restart after a crash, the gateway cannot yet report the
+continuations it is about to start. Three polls (30 min) of unreachable is
+"the gateway is not coming back", and the box is not kept up for it.
 
 "Continuously busy" means busy at every poll: one poll that is not busy
-clears `busy-since`. A login clears it too, since the cap exists for boxes
-nobody is watching. A turn that waits for permission is not activity (row 5),
-so a box left with a question on screen stops after the idle window like
-before; the waiting turn survives the restart and asks again.
+clears `busy-since`. A login clears it too, and so does `clients > 0` in the
+status (an editor attached through a tunnel `who` does not show), since the
+cap exists for boxes nobody is watching; a client does not count as activity
+for the idle window. A turn that waits for permission is not activity
+(row 5), so a box left with a question on screen stops after the idle window
+like before. The waiting turn is continued at the next start, once and only
+within the gateway's maximum age for continuations; a second interruption, or
+a start more than that age later, leaves it as an interrupted turn the person
+continues by hand.
 
-**Logging.** `/var/log/boot-history` gets a line in the existing format,
-`<time> | auto-stop | <decision> | <detail>`, when the decision differs from
+**Logging.** `/var/log/boot-history` gets a line in the existing
+three-field format, `<time> | auto-stop | <decision>`, when the decision differs from
 the previous poll's (kept in `/run/devbox-autostop/last`) and on every stop.
 Logging every poll would write 144 lines a day and push the boot entries out
 of the 20 shown at login. An unreachable gateway is therefore logged when it
@@ -144,7 +156,9 @@ starts being unreachable and again when the reason changes.
 2. `systemctl stop ahp-gateway.service`, bounded by the unit's own stop
    timeout plus 15 s. Its result and duration are logged. A failure does not
    prevent step 3: the OS shutdown tries again.
-3. `aws ec2 stop-instances` on itself, as today.
+3. `aws ec2 stop-instances` on itself, as today. If it fails, the failure is
+   logged and noticed and the gateway is started again, so the box is not left
+   running with its work interrupted and nothing to continue it.
 
 ### 2.4 Spot watcher (`spot-watch.sh`, `devbox-spot-watch.service`)
 
@@ -156,30 +170,61 @@ The base address is an environment variable so tests can point it at a fake.
 | Metadata says | Action |
 |---|---|
 | `spot/instance-action` 404 and `events/recommendations/rebalance` 404 | nothing |
-| a new `instance-action` (key: action and time) | log; take a status snapshot; start the gateway stop; post the notice with the action, its time and the running sessions, concurrently with the stop; log the stop's result and duration |
+| a new `instance-action` (key: action and time) whose time is after this boot began and no more than 2 min in the past | log; take a status snapshot; start the gateway stop; post the notice with the action, its time, the session total and the running and waiting turn counts, concurrently with the stop; log the stop's result and duration |
+| an `instance-action` whose time is before this boot began, or more than 2 min in the past when first seen | stale: log once, do not stop |
 | a new rebalance recommendation (key: notice time) | log and post a notice; **do not stop** |
 | metadata unreachable or unexpected answer | log when it becomes unreachable and when it recovers; keep polling |
-| the notice disappears, the instance is still running 5 min after the notice time, and the watcher stopped the gateway | start the gateway again and log "notice withdrawn" |
+| the watcher stopped the gateway, and the instance is still running 5 min after the action time, whether or not the notice is still shown | start the gateway again, log and notice "interruption did not happen"; the key is done and never stops the gateway again |
+
+The same handling applies to `stop`, `hibernate` and `terminate`. A
+terminated spot instance does not come back, but its `/home` volume does, so
+a clean stop still matters.
 
 A rebalance recommendation does not mean the instance will be interrupted;
 it may come long before a notice or never be followed by one. Stopping the
 gateway on it would interrupt work for nothing, so only the interruption
 notice stops it.
 
-Seen keys are kept in `/run/devbox-spot-watch/`, so a restart of the watcher
-does not repeat a notice.
+**Stale notices.** EC2 says notices are best effort and documents at least
+one metadata item that stays after the event with a time in the past. A
+notice that outlives its event must not stop the gateway at the next boot,
+which would interrupt the continuations that just started and use up their
+one attempt. Hence the two time checks above; boot time is read from
+`/proc/stat` (`btime`).
 
-The notice for `terminate` is the same, but a terminated spot instance does
-not come back. That case is logged and noticed, nothing more.
+**State.** Per key, in `/run/devbox-spot-watch/`, three separate markers:
+`seen` (logged), `stopped` (written only after `systemctl stop` returned) and
+`noticed`. A watcher that dies between steps redoes only the steps not
+marked; `systemctl stop` is safe to repeat.
 
 ### 2.5 Every stop path stops the gateway first
 
 | Path | Who stops the gateway | Bound |
 |---|---|---|
 | Auto-stop (idle, cap, requested) | `autostop.sh`, before `stop-instances` | unit timeout + 15 s |
-| `devbox stop` | the CLI over ssh, `sudo systemctl stop ahp-gateway.service`, before `StopInstances` | same |
+| `devbox down` (alias `stop`), `restart`, `reboot`, `terminate`, and `resize` for the instance it replaces | the CLI, through one shared guard (below), before the EC2 call | same |
 | Spot interruption | the watcher, on the notice | 60 s budget (1.1) |
-| `shutdown`, reboot, console stop | systemd, in reverse dependency order | unit timeout 45 s |
+| `shutdown` on the box, console or API stop from elsewhere | systemd, in reverse dependency order | unit timeout 45 s |
+
+The instances `spawn` and `resize` stop right after launching them, to attach
+a volume, have run no agent and are not guarded.
+
+**The CLI guard**, for each instance named, before any EC2 call:
+
+1. Read the status over ssh (`devbox-agents status --json`). Busy: refuse and
+   print the running and waiting counts. Unreadable: refuse and say why.
+   `--force` goes ahead in both cases. With several instances, all are
+   checked before any is touched, and one refusal stops the whole command.
+2. Check that the EC2 call is allowed (`DryRun`), so a missing permission or
+   expired credentials fail before the gateway is stopped.
+3. Stop the gateway over ssh (`sudo systemctl stop ahp-gateway.service`,
+   bounded). If ssh fails here and `--force` was given, go on.
+4. Make the EC2 call. If it fails, start the gateway again over ssh.
+
+`--hard` is the EC2 force stop for a wedged instance: it skips steps 1 to 3.
+It replaces today's `--force` on `down` and `restart`, so the two commands
+agree; this is a change in a user-visible flag and is called out in the CLI
+pull request.
 
 In the last row the gateway is stopped before `/home` is unmounted because
 the gateway unit has `RequiresMountsFor=` on its state dir and the home
@@ -187,31 +232,31 @@ directory, which orders it after the mount when starting and so before it
 when stopping. The tests check the generated unit for this ordering; that a
 real shutdown honours it is unverified without a VM (section 4).
 
-`devbox stop --hard` keeps today's EC2 force stop for a wedged instance and
-skips the ssh step. The existing `--force` changes meaning (2.6).
-
 ### 2.6 What the CLI needs on the box
 
 `devbox-agents` is installed on `PATH` and runs as the user over the existing
 ssh path:
 
-- `devbox-agents status [--json]`: the status result, classification and
-  sessions; non-zero exit when the gateway is unreachable.
-- `devbox-agents resume on|off|status`: runs the gateway's own `resume`
-  command through the gateway module's wrapper. It writes nothing itself.
-  When the build or its wrapper does not offer `resume`, it says so and exits
-  non-zero. It never starts the bare gateway command, which for the public
-  release would start a second server.
+- `devbox-agents status [--json]`: the classification, the session total and
+  the turn counts from the status endpoint (it has no per-session list);
+  non-zero exit when the gateway is unreachable.
+- `devbox-agents resume status`: the `resume` object of the status endpoint,
+  which is the running gateway's effective value and its source. It does not
+  ask the gateway's command, because the gateway module's wrapper points that
+  command at the client config in `/etc`, which has no `resume` key; a
+  command that worked out the install default from that file would report
+  `off` while the running gateway is on `continue`. DV-A and GW-R are told.
+- `devbox-agents resume on|off`: runs the gateway's own `resume` command
+  through the gateway module's wrapper. It writes nothing itself. When the
+  build or its wrapper does not offer `resume`, it says so and exits non-zero.
+  It never starts the bare gateway command, which for the public release
+  would start a second server.
 - `devbox-agents stop-when-idle [cancel]`: writes or removes
-  `/run/devbox-autostop/stop-when-idle` through a root-owned helper allowed by
-  sudo, then runs one auto-stop poll at once.
+  `/run/devbox-autostop/stop-when-idle` with `sudo` (the box's user is in
+  `wheel` with passwordless sudo, which the CLI already relies on), then runs
+  one auto-stop poll at once.
 
-`devbox stop` refuses when the gateway is busy and prints what is running;
-`--force` stops anyway (gateway first, cleanly); `--when-idle` uses row 10.
-When the status cannot be read, it refuses and says so, and `--force` goes
-ahead. That replaces today's `--force` (EC2 force stop), which moves to
-`--hard`. This is a change in a user-visible flag and is called out in the
-CLI pull request.
+`devbox stop --when-idle` uses row 10.
 
 ### 2.7 Resume on boot
 
@@ -227,10 +272,15 @@ does not know `resume` ignores the key; whether resume is really available is
 read from `/status`, never from the config being accepted. The gateway module
 is not changed.
 
-The boot notification gains one line from `resume-summary.sh`. The boot
-notification already runs once per boot after the network; it now also runs
-after `ahp-gateway.service` and waits up to 180 s for `/status` to report no
-pending continuations, then reports:
+The boot notification (`devbox-slack-notify.service`) gains one line from
+`resume-summary.sh`. It already runs once per boot after the network; it now
+also runs after `ahp-gateway.service` (which, with the readiness check in the
+gateway module's open change, means after the gateway is ready or has
+failed) and waits up to 180 s for `/status` to report no pending
+continuations. Its post goes through `notify.sh`, so the user's secrets file
+is read for the one address it needs instead of being run as a shell script
+by root. The unit gets `restartIfChanged = false`, so deploying this change
+does not send a spurious "booted" post. It reports:
 
 | `/status` | Line |
 |---|---|
@@ -299,8 +349,10 @@ approval per run) is the only place the real EC2 timings can be seen.
 |---|---|---|
 | Every row of the auto-stop table, including the cap reached, the cap `off`, an unreachable gateway logged once and again when the reason changes, a bad token file | Go test runs `autostop.sh` with fakes for `who`, `ss`, `aws`, `systemctl`, `date` and a local HTTP server for `/status` | shell |
 | The token reaches the gateway only as the `Authorization` header and is in no argument, log line or notice | Same harness: the server checks the header, the fakes record their arguments | shell |
-| Stop order: notice, gateway stop, then `stop-instances`; a failed gateway stop still stops the instance | Fakes record the order | shell |
-| Watcher: no notice; stop notice (gateway stopped once, notice posted once, not repeated after a watcher restart); rebalance (notice, no stop); metadata unreachable (logged once) and recovering; token renewal on 401; withdrawn notice restarts the gateway | Go test runs `spot-watch.sh --once` repeatedly, and once in its loop, against a fake metadata server | shell |
+| Stop order: notice, gateway stop, then `stop-instances`; a failed gateway stop still stops the instance; a failed `stop-instances` starts the gateway again | Fakes record the order | shell |
+| Row 10: a requested stop does not happen on one or two unreachable polls and does on the third; a `clients > 0` poll clears the cap | Same harness | shell |
+| Watcher: no notice; stop notice (gateway stopped once, notice posted once, not repeated after a watcher restart, redone when the watcher died before `stopped` was written); rebalance (notice, no stop); a notice dated before boot or more than 2 min in the past (no stop); metadata unreachable (logged once) and recovering; token renewal on 401; still running 5 min after the action time, with the notice still shown, starts the gateway once | Go test runs `spot-watch.sh --once` repeatedly, and once in its loop, against a fake metadata server, with boot time and clock from fakes | shell |
+| CLI guard on `down`, `restart`, `reboot`, `terminate`, `resize`: refuses busy and unreadable, `--force` goes on, `--hard` skips ssh, a failed dry run stops before the gateway is touched, a failed EC2 call starts the gateway again, several ids are all checked first | Go tests with the ssh call and EC2 faked | Go |
 | Resume summary: each row of 2.7, and the wait ending while still pending | Go test with the HTTP server | shell |
 | `devbox-agents resume` never runs the bare gateway command | Go test with a fake wrapper that refuses | shell |
 | Module evaluates; the units and timers have the intended settings; `resume.onStart` reaches the gateway's config and a user value wins; the 60 s assertion fires | `nix-instantiate` and assertions on the evaluated config | evaluation |
@@ -317,6 +369,13 @@ locally, and run on a machine with KVM; continuing a real turn exactly once
 needs the gateway build that implements resume.
 
 ## 7. Open points
+
+0. The gateway module's open change adds its own failure notice
+   (`failureNotice.*`, `notice.sh`) with the same webhook-file reading. This
+   note keeps `notify.sh` as the one general poster; once both are merged,
+   the gateway's notice can call it and the two `webhookFile` options can
+   become one. The gateway's hourly check will also report a gateway the
+   watcher stopped deliberately; that is true and is left as is.
 
 1. The 5 min grace before restarting a gateway after a withdrawn notice is a
    guess; EC2 does not say whether a notice can be withdrawn.
