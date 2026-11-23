@@ -25,8 +25,9 @@ happens before you push, rewrite your commits. Do not push and fix forward.
 
 ## Checks
 
-There is no hosted CI. One command runs every check, on Linux with Nix
-installed (not verified on macOS):
+No hosted CI is relied on (the workflow under `.github/` is not the check of
+record). One command runs every check. It needs Linux with git, Go, Docker,
+and Nix with a nixpkgs channel; it is not verified on macOS:
 
 ```
 scripts/check.sh              # everything
@@ -38,11 +39,15 @@ scripts/check.sh go nix       # only the named checks
 | `secrets` | [gitleaks](https://github.com/gitleaks/gitleaks) over the full history of every branch |
 | `go` | `go vet ./...` and `go test ./... -count=1`. The `cmd` tests start LocalStack in Docker; they never reach real AWS |
 | `nix` | The NixOS template evaluates with its markers unrendered |
-| `shell` | `shellcheck` on every script embedded in the NixOS template |
+| `shell` | `shellcheck` on every script the NixOS template builds with `writeShellScript`. It fails if the template builds a script in a form it cannot extract |
 
-Run it before asking for a merge. Tools that are not on `PATH` are taken from
-nixpkgs. Its output is safe to paste: a secret finding prints the rule, commit,
-file and line, never the value.
+Run it before asking for a merge. gitleaks, jq and shellcheck are taken from
+nixpkgs when they are not on `PATH`.
+
+What is safe to paste: the summary lines at the end (`passed` or `FAILED`), and
+the secrets check's findings, which give the rule, commit, file and line and
+never the value or the commit's author. The output of the other checks can
+contain paths and names from your machine.
 
 **Before every push, read your own diff for the list above.** The automated
 checks are backstops.
@@ -67,5 +72,5 @@ checks are backstops.
    Only the owner may. If it blocks something you believe is fine, ask the
    owner, naming the commit, file and rule.
 
-Never paste the full log of a local run into this repository, a pull request
-or an issue: test logs can contain paths and names from the machine.
+Never paste the full output of a local run into this repository, a pull
+request or an issue.
