@@ -10,7 +10,7 @@
 #   go       go vet and go test (needs Docker for the LocalStack tests)
 #   nix      the NixOS template evaluates (markers left unrendered)
 #   shell    shellcheck on every script the NixOS template builds with
-#            writeShellScript
+#            writeShellScript, and on the scripts in terraform/devbox
 #
 # Needs: git, go, Docker, and Nix with a nixpkgs channel on NIX_PATH. gitleaks,
 # jq and shellcheck are taken from nixpkgs when they are not on PATH.
@@ -116,6 +116,7 @@ check_shell() {
   # and undo the Nix quoting, so shellcheck sees what bash will run:
   #   ''${x}        is a literal ${x}
   #   ${pkgs.foo}   is a store path; any fixed path will do
+  #   ${./file}     likewise
   # Limits: a Nix variable written as ${UPPERCASE} looks like a shell variable
   # and is not noticed. The profile.d snippets set with `.text` are not
   # covered; they are sourced by login shells, not run as scripts.
@@ -147,6 +148,7 @@ check_shell() {
       -e "s/''\\\$\{/\${/g" \
       -e 's#\$\{(pkgs|config|lib)\.[A-Za-z0-9_.-]+\}#/nix/store/placeholder#g' \
       -e 's#\$\{lib\.makeBinPath \[[^]]*\]\}#/nix/store/placeholder/bin#g' \
+      -e 's#\$\{\./[A-Za-z0-9_./-]+\}#/nix/store/placeholder#g' \
       "$file"
     if awk '/\$\{[a-z]+\.[A-Za-z]/ { found = 1 } END { exit !found }' "$file"; then
       echo "$(basename "$file"): a Nix interpolation this check does not understand is left in the script"
@@ -156,7 +158,14 @@ check_shell() {
 
   # SC1090: the scripts source a file that only exists on the box.
   with_tool shellcheck shellcheck shellcheck --shell=bash --severity=warning \
-    --exclude=SC1090 "$dir"/*.sh | sed "s#$dir/##"
+    --exclude=SC1090 "$dir"/*.sh | sed "s#$dir/##" || return 1
+
+  # Scripts shipped as files in the pushed tree run under plain sh on the box.
+  local shipped=()
+  mapfile -t shipped < <(find terraform/devbox -name '*.sh' | sort)
+  if [ "${#shipped[@]}" -gt 0 ]; then
+    with_tool shellcheck shellcheck shellcheck --shell=sh --severity=warning "${shipped[@]}"
+  fi
 }
 
 declare -A result

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -117,6 +118,26 @@ func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 	return pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root", volumeID)
 }
 
+// Where a push puts things on the box.
+const (
+	remoteConfigDir         = "/etc/nixos"
+	remoteSavedDir          = "/home/emaland/.config/devbox"
+	remoteSetTarName        = "devbox-set.tar"
+	remoteInstallScriptName = "devbox-install-set.sh"
+)
+
+// describeInstallFailure turns install_set.sh's exit status into words.
+func describeInstallFailure(status string) string {
+	switch status {
+	case "3":
+		return "this devbox CLI is older than the config on the box"
+	case "4":
+		return "the box expects an operator local.nix and none was found"
+	default:
+		return "install step exited " + status
+	}
+}
+
 func instancePublicIP(ctx context.Context, client *ec2.Client, instanceID string) (string, error) {
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
@@ -144,27 +165,31 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		"-o", "UserKnownHostsFile=/dev/null",
 	}
 
-	// Render the config (substitute @@MARKER@@ placeholders) to a temp file so
-	// the instance never receives literal markers. SCP the rendered file.
-	rendered, err := renderForPush(ctx, dcfg, nixFile, volumeID, findHostedZoneID)
+	// Render the config (substitute @@MARKER@@ placeholders) and pack it with
+	// the modules it imports, so the instance never receives literal markers
+	// or a main file without its tree. Upload the archive and the script that
+	// installs it.
+	packed, installSetScript, err := setForPush(ctx, dcfg, nixFile, volumeID, findHostedZoneID)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp("", "devbox-configuration-*.nix")
+	staging, err := os.MkdirTemp("", "devbox-push-*")
 	if err != nil {
-		return fmt.Errorf("creating temp config: %w", err)
+		return fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(rendered); err != nil {
-		tmp.Close()
-		return fmt.Errorf("writing temp config: %w", err)
+	defer os.RemoveAll(staging)
+	localTar := filepath.Join(staging, remoteSetTarName)
+	localScript := filepath.Join(staging, remoteInstallScriptName)
+	if err := os.WriteFile(localTar, packed, 0o600); err != nil {
+		return fmt.Errorf("writing the config set: %w", err)
 	}
-	tmp.Close()
+	if err := os.WriteFile(localScript, installSetScript, 0o700); err != nil {
+		return fmt.Errorf("writing the install script: %w", err)
+	}
 
-	// SCP the rendered file over
-	fmt.Printf("Uploading %s to %s (%s)...\n", nixFile, instanceID, ip)
+	fmt.Printf("Uploading %s and its modules to %s (%s)...\n", nixFile, instanceID, ip)
 	scpArgs := append([]string{}, sshOpts...)
-	scpArgs = append(scpArgs, tmp.Name(), sshTarget+":/tmp/configuration.nix")
+	scpArgs = append(scpArgs, localTar, localScript, sshTarget+":/tmp/")
 	scpCmd := exec.CommandContext(ctx, "scp", scpArgs...)
 	scpCmd.Stdout = os.Stdout
 	scpCmd.Stderr = os.Stderr
@@ -196,9 +221,12 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// This runs inside a systemd-run unit as root with a minimal PATH, so no
 	// sudo (unavailable there, and redundant) and set PATH explicitly so
 	// nixos-rebuild/cp/etc. resolve.
-	persist := `mkdir -p /home/emaland/.config/devbox; ` +
-		`cp /tmp/configuration.nix /home/emaland/.config/devbox/configuration.nix; ` +
-		`chown -R emaland:users /home/emaland/.config/devbox 2>/dev/null || true`
+	// The set is installed under /etc/nixos and mirrored to the saved copy by
+	// install_set.sh. `persist` is best effort: on a fresh box /home may not
+	// be the real volume yet.
+	installer := `sh /tmp/` + remoteInstallScriptName
+	persist := `mkdir -p ` + remoteSavedDir + `; ` +
+		installer + ` save ` + remoteConfigDir + ` ` + remoteSavedDir + ` emaland:users || true`
 	// Reuse a local Nix binary cache kept on the persistent /home volume so a
 	// fresh box (post resize/recover) substitutes prebuilt paths from local gp3
 	// disk instead of re-downloading the whole closure from cache.nixos.org.
@@ -220,8 +248,8 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// already satisfied) — that exposes the cache and avoids a second mount of the
 	// same device. If a cache is present, point the switch at it; the staged paths
 	// are unsigned, so require-sigs=false (our own volume).
-	cachePre := `if ! grep -qs " /home " /proc/mounts; then mount /dev/disk/by-label/home-data /home 2>/dev/null || true; fi; ` +
-		`OPT=""; if [ -d ` + cacheDir + ` ]; then OPT="--option extra-substituters file://` + cacheDir + ` --option extra-trusted-substituters file://` + cacheDir + ` --option require-sigs false"; echo "devbox: substituting from local nix cache ` + cacheDir + `"; fi`
+	mountHome := `if ! grep -qs " /home " /proc/mounts; then mount /dev/disk/by-label/home-data /home 2>/dev/null || true; fi`
+	cachePre := `OPT=""; if [ -d ` + cacheDir + ` ]; then OPT="--option extra-substituters file://` + cacheDir + ` --option extra-trusted-substituters file://` + cacheDir + ` --option require-sigs false"; echo "devbox: substituting from local nix cache ` + cacheDir + `"; fi`
 	// cachePost: repopulate the cache for the next fresh box. This runs AFTER the
 	// rc marker is written, so the client returns as soon as the switch is done —
 	// the first-time nix copy (~GBs) then finishes in the background inside the
@@ -237,17 +265,25 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	// the poller can show only the current run's log, not prior units' history.
 	// The rc marker is written before cachePost so the client isn't blocked on the
 	// slow first-time cache copy.
+	//
+	// /home is mounted first, because installing the set may need the saved
+	// copy on it (the operator's local.nix on a fresh root volume). If the set
+	// cannot be installed nothing is switched, and the marker file says so
+	// with an "install:" prefix, which the poller reports as a failure rather
+	// than as a rebuild warning.
 	applyScript := `echo ` + nixupStartMarker + `; ` +
 		`. /etc/set-environment 2>/dev/null || true; ` +
 		`export PATH=/run/wrappers/bin:/run/current-system/sw/bin:$PATH; ` +
 		`systemctl is-system-running --wait >/dev/null 2>&1 || true; ` +
-		`cp /tmp/configuration.nix /etc/nixos/configuration.nix; ` +
+		mountHome + `; ` +
+		`if ` + installer + ` install /tmp/` + remoteSetTarName + ` ` + remoteConfigDir + ` ` + remoteSavedDir + ` ` + newSetStamp(time.Now()) + `; then ` +
 		persist + `; ` +
 		cachePre + `; ` +
 		`nixos-rebuild switch $OPT; rc=$?; ` +
 		persist + `; ` +
 		`echo "$rc" | tee /tmp/devbox-nixup.rc >/dev/null; ` +
-		cachePost
+		cachePost + `; ` +
+		`else echo "install:$?" | tee /tmp/devbox-nixup.rc >/dev/null; fi`
 
 	// Run the switch as a transient systemd unit and poll for completion,
 	// instead of holding one long SSH channel open across the whole rebuild.
@@ -303,6 +339,9 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 				}
 			}
 			if rc := strings.TrimSpace(rcPart); rc != "" {
+				if status, failed := strings.CutPrefix(rc, "install:"); failed {
+					return fmt.Errorf("the config set was not installed on %s (%s); nothing was switched. The reason is in the output above", instanceID, describeInstallFailure(status))
+				}
 				if rc != "0" {
 					fmt.Printf("\nWarning: nixos-rebuild exited %s (usually service-activation warnings, not a build failure).\n", rc)
 				}

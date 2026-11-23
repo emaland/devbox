@@ -30,9 +30,13 @@ type DevboxConfig struct {
 	// line) rendered into the pushed NixOS config. The keys themselves are
 	// deliberately not part of this repo.
 	AuthorizedKeysFile string `json:"authorized_keys_file"`
-	DataVolumeName     string `json:"data_volume_name"`
-	DataVolumeSize     int    `json:"data_volume_size"`
-	UseSpot            bool   `json:"use_spot"`
+	// NixLocalModule is a local NixOS module of the operator's own, pushed to
+	// the box beside the config as local.nix. It is never part of this repo.
+	// Empty means none is pushed and the box keeps the one it has.
+	NixLocalModule string `json:"nix_local_module"`
+	DataVolumeName string `json:"data_volume_name"`
+	DataVolumeSize int    `json:"data_volume_size"`
+	UseSpot        bool   `json:"use_spot"`
 }
 
 // secretKeys are config keys whose values should be masked when displayed.
@@ -105,6 +109,11 @@ func (c DevboxConfig) ResolveSSHKeyPath() string {
 // expanded to the user's home directory.
 func (c DevboxConfig) ResolveAuthorizedKeysFile() string {
 	return expandHome(c.AuthorizedKeysFile)
+}
+
+// ResolveNixLocalModule returns NixLocalModule with a leading ~/ expanded.
+func (c DevboxConfig) ResolveNixLocalModule() string {
+	return expandHome(c.NixLocalModule)
 }
 
 func expandHome(path string) string {

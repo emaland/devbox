@@ -195,14 +195,47 @@ func renderForPush(ctx context.Context, dcfg config.DevboxConfig, nixFile, volum
 	return renderNixConfig(dcfg, nixFile, dataVolumeMarker(volumeID))
 }
 
+// setForPush renders the main file and packs it with its tree and the
+// operator's local.nix into the archive a push uploads. It also returns the
+// install script from that same tree.
+func setForPush(ctx context.Context, dcfg config.DevboxConfig, nixFile, volumeID string, find zoneFinder) (packed, installScript []byte, err error) {
+	source, err := readNixSource(nixFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	installScript, ok := source.tree[installSetScriptPath]
+	if !ok {
+		return nil, nil, fmt.Errorf("the config tree beside %s has no %s; it cannot be installed on the box", nixFile, installSetScriptPath)
+	}
+	rendered, err := renderForPush(ctx, dcfg, nixFile, volumeID, find)
+	if err != nil {
+		return nil, nil, err
+	}
+	localModule, err := readLocalModule(dcfg.ResolveNixLocalModule())
+	if err != nil {
+		return nil, nil, err
+	}
+	packed, err = buildSetTar(rendered, source.tree, localModule)
+	return packed, installScript, err
+}
+
 // preflightNixConfig checks, before any instance is created or changed,
 // everything a later config push needs from this machine: the template, the
 // extra keys file and the hosted zone id. It returns dcfg with the zone id
 // filled in, and says how many extra ssh keys the push will install, because
 // a push replaces the box's extra keys with exactly that set.
 func preflightNixConfig(ctx context.Context, dcfg config.DevboxConfig, nixFile string, find zoneFinder) (config.DevboxConfig, error) {
-	if _, err := readNixConfigSource(nixFile); err != nil {
+	if _, err := readNixSource(nixFile); err != nil {
 		return dcfg, err
+	}
+	localModule := dcfg.ResolveNixLocalModule()
+	if _, err := readLocalModule(localModule); err != nil {
+		return dcfg, err
+	}
+	if localModule == "" {
+		fmt.Println("No nix_local_module configured: the box keeps the local.nix it has, if any.")
+	} else {
+		fmt.Printf("Operator module to install as local.nix: %s\n", localModule)
 	}
 	keysFile := dcfg.ResolveAuthorizedKeysFile()
 	keys, err := readAuthorizedKeys(keysFile)
