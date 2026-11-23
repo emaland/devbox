@@ -159,6 +159,34 @@ volume, and restored from there at boot after an instance replacement.
   single file; update them before using a box that runs sets.
 - `--file` must name a main file with a `devbox/` directory beside it.
 
+### AHP gateway service
+
+`terraform/devbox/modules/ahp-gateway.nix` runs the
+[AHP gateway](https://github.com/formulahendry/ahp-acp-gateway) as the system
+service `ahp-gateway.service` (design note `docs/design/notes/030-ahp-gateway-module.md`).
+It is **off** in the template and **not ready to turn on yet**: the readiness
+check and the failure notice are still to come. When it is, it is turned on in
+your `local.nix`, because which agent to run is your choice:
+
+```nix
+{ pkgs, ... }: {
+  services.ahp-gateway = {
+    enable = true;
+    user = "<you>";
+    # Keep the built-in id `claude`, so sessions made before keep working.
+    providers.claude = { command = "<store path of the agent adapter>"; args = [ ]; };
+  };
+}
+```
+
+What it does: listens on `127.0.0.1` only, always with a token
+(`<state dir>/token`, made on first start), with browser origins refused unless
+listed in `allowedOrigins`. Agents must be programs in the Nix store; every
+built-in launcher that downloads code is disabled. Before a different build
+first opens the database it is backed up to `<state dir>/backups/`, and an
+older build is refused. A config switch never restarts a running gateway; the
+new build takes effect at the next restart or boot.
+
 ### Machine-specific values
 
 This repository is public, so `configuration.nix` is a template. Anything that

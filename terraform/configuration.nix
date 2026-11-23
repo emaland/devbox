@@ -4,8 +4,14 @@
   # ./local.nix is the operator's own module. It is never part of this
   # repository: the devbox CLI pushes it beside this file when the operator has
   # one (config key nix_local_module), and carries it forward otherwise.
-  imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ]
-    ++ lib.optional (builtins.pathExists ./local.nix) ./local.nix;
+  #
+  # ./devbox/modules/ahp-gateway.nix runs the AHP gateway as a system service
+  # (services.ahp-gateway). It is off here; it is turned on, with the agent
+  # adapter to run, in local.nix.
+  imports = [
+    "${modulesPath}/virtualisation/amazon-image.nix"
+    ./devbox/modules/ahp-gateway.nix
+  ] ++ lib.optional (builtins.pathExists ./local.nix) ./local.nix;
 
   networking.hostName = "dev-workstation";
   networking.dhcpcd.extraConfig = "nohook hostname";
