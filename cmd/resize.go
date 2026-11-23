@@ -102,6 +102,13 @@ resumable state machine. If it's interrupted, re-run with --resume.
 }
 
 func resizeInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, instanceID, newType string) error {
+	// Fail on a local config problem before the swap starts: the config push
+	// near the end needs the template, the keys file and the zone id.
+	dcfg, err := preflightNixConfig(ctx, dcfg, defaultNixFile(), findHostedZoneID)
+	if err != nil {
+		return err
+	}
+
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
@@ -518,6 +525,11 @@ func driveResize(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Clie
 // resumeResize finds an interrupted resize (an instance still carrying the
 // resize-state tag) and continues it.
 func resumeResize(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client) error {
+	dcfg, err := preflightNixConfig(ctx, dcfg, defaultNixFile(), findHostedZoneID)
+	if err != nil {
+		return err
+	}
+
 	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
 			{Name: aws.String("tag-key"), Values: []string{resizeStateTag}},

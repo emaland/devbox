@@ -107,3 +107,47 @@ func TestDevboxConfigJSON(t *testing.T) {
 		t.Errorf("DNSName = %q, want %q", parsed.DNSName, cfg.DNSName)
 	}
 }
+
+func TestResolveAuthorizedKeysFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cases := map[string]string{
+		"~/x/keys":      filepath.Join(home, "x", "keys"),
+		"/abs/keys":     "/abs/keys",
+		"relative/keys": "relative/keys",
+		"":              "",
+	}
+	for in, want := range cases {
+		if got := (DevboxConfig{AuthorizedKeysFile: in}).ResolveAuthorizedKeysFile(); got != want {
+			t.Errorf("ResolveAuthorizedKeysFile(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestAuthorizedKeysFileConfigKeyAndDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "~/.config/devbox/authorized_keys"; cfg.AuthorizedKeysFile != want {
+		t.Errorf("default AuthorizedKeysFile = %q, want %q", cfg.AuthorizedKeysFile, want)
+	}
+
+	dir := filepath.Join(home, ".config", "devbox")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "default.json"), []byte(`{"authorized_keys_file": "/elsewhere/keys"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthorizedKeysFile != "/elsewhere/keys" {
+		t.Errorf("authorized_keys_file from the config file = %q", cfg.AuthorizedKeysFile)
+	}
+}

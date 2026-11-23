@@ -182,10 +182,17 @@
     # Extra authorized keys, in addition to the EC2 key-pair key that
     # devbox-fetch-ssh-key installs into ~/.ssh/authorized_keys each boot.
     # These are written to /etc/ssh/authorized_keys.d/emaland — a separate
-    # file sshd also checks — so the fetch service never clobbers them.
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAz5otg2dmDpJbCO75OlSZZPrP1vIRCv1sVNWeOovsMR emaland@ipad"
-    ];
+    # file sshd also checks — so the fetch service never clobbers them, and
+    # they keep working when /home fails to mount.
+    #
+    # The keys are not kept in this repo. The devbox CLI reads them from
+    # the operator's `authorized_keys_file` (default
+    # ~/.config/devbox/authorized_keys, one key per line) and renders them
+    # into the marker below, separated by "\n". An unrendered marker means
+    # no extra keys.
+    openssh.authorizedKeys.keys =
+      lib.filter (key: key != "" && !(lib.hasPrefix "@@" key))
+        (lib.splitString "\n" "@@EXTRA_AUTHORIZED_KEYS@@");
   };
 
   security.sudo.wheelNeedsPassword = false;
@@ -219,7 +226,7 @@
   systemd.services.devbox-restore-nixos-config = {
     description = "Sync configuration.nix from the persistent volume";
     after       = [ "home.mount" ];
-    before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" "devbox-claude.service" ];
+    before      = [ "devbox-fetch-ssh-key.service" "update-route53.service" ];
     wantedBy    = [ "multi-user.target" ];
     serviceConfig = {
       Type            = "oneshot";
@@ -337,6 +344,17 @@
       # only changes on a real boot, where this runs fresh anyway.
       RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "update-route53" ''
+        ZONE_ID="@@DNS_ZONE_ID@@"
+        RECORD_NAME="@@DNS_RECORD_NAME@@"
+        # No zone or record configured (unset, or marker left unrendered) →
+        # skip rather than calling Route 53 with a bogus value.
+        case "$ZONE_ID" in
+          ""|@@*@@) echo "no DNS zone id configured; skipping Route 53 update"; exit 0 ;;
+        esac
+        case "$RECORD_NAME" in
+          ""|@@*@@) echo "no DNS record name configured; skipping Route 53 update"; exit 0 ;;
+        esac
+
         # Wait for IMDS credentials to become available (IAM role
         # propagation can lag behind network-online.target).
         for i in $(seq 1 12); do
@@ -358,9 +376,6 @@
         PUBLIC_IP=$(${pkgs.curl}/bin/curl -s \
           -H "X-aws-ec2-metadata-token: $TOKEN" \
           http://169.254.169.254/latest/meta-data/public-ipv4)
-
-        ZONE_ID="@@DNS_ZONE_ID@@"
-        RECORD_NAME="@@DNS_RECORD_NAME@@"
 
         ${pkgs.awscli2}/bin/aws route53 change-resource-record-sets \
           --hosted-zone-id "$ZONE_ID" \
@@ -635,78 +650,6 @@
     };
   };
 
-  # ── Claude Code autostart ────────────────────────────────────────
-  # Starts a tmux session running Claude Code on boot.
-  # Attach with: tmux attach -t claude
-  systemd.services.devbox-claude = {
-    description = "Start Claude Code in tmux";
-    after       = [ "home.mount" "network-online.target" "devbox-home-manager.service" ];
-    wants       = [ "network-online.target" "devbox-home-manager.service" ];
-    wantedBy    = [ "multi-user.target" ];
-    serviceConfig = {
-      Type            = "oneshot";
-      RemainAfterExit = true;
-      User            = "emaland";
-      # oom_score_adj is inherited across fork(), so this covers the tmux
-      # server and everything it spawns under this cgroup (Claude Code
-      # included) without needing to target the node process directly.
-      OOMScoreAdjust  = -900;
-      ExecStart = toString (pkgs.writeShellScript "devbox-claude" ''
-        export HOME=/home/emaland
-        export PATH=${lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.curl pkgs.openssh pkgs.nodejs ]}:$HOME/.local/bin:/etc/profiles/per-user/emaland/bin:$PATH
-        # Interactive logins get TMUX_TMPDIR=$XDG_RUNTIME_DIR from home-manager's
-        # hm-session-vars.sh (sourced via /etc/profile.d). This script isn't a
-        # login shell so it must set the same value itself, or this server binds
-        # a different socket (/tmp/tmux-$UID) than `tmux attach` will look in.
-        export TMUX_TMPDIR="''${XDG_RUNTIME_DIR:-/run/user/$(${pkgs.coreutils}/bin/id -u)}"
-        PROJECT_DIR="$HOME/scratch/git/ions"
-
-        if [ ! -d "$PROJECT_DIR" ]; then
-          echo "Project directory $PROJECT_DIR does not exist, skipping"
-          exit 0
-        fi
-
-        # Start the tmux server so the user's tmux config loads — this is
-        # what re-arms tmux-continuum's periodic session saving.
-        ${pkgs.tmux}/bin/tmux start-server 2>/dev/null || true
-
-        # Restore the tmux sessions/windows/panes saved before the reboot.
-        # tmux-continuum's own auto-restore only triggers when a client
-        # attaches, so on a headless boot we invoke tmux-resurrect's restore
-        # explicitly. Check system config (/etc/tmux.conf, written by the
-        # programs.tmux NixOS module) then user config as a fallback.
-        RES_TMUX=""
-        for TMUX_CONF in /etc/tmux.conf "$HOME/.config/tmux/tmux.conf" "$HOME/.tmux.conf"; do
-          if [ -f "$TMUX_CONF" ]; then
-            RES_TMUX=$(${pkgs.gnugrep}/bin/grep -oE \
-              '/nix/store/[^ ]*resurrect[^ ]*/resurrect\.tmux' "$TMUX_CONF" | head -1)
-            [ -n "$RES_TMUX" ] && break
-          fi
-        done
-        if [ -n "$RES_TMUX" ]; then
-          RESTORE="$(dirname "$RES_TMUX")/scripts/restore.sh"
-          if [ -x "$RESTORE" ]; then
-            ${pkgs.tmux}/bin/tmux run-shell "$RESTORE"
-            sleep 3
-            echo "Restored saved tmux sessions"
-          fi
-        fi
-
-        # Ensure a dedicated claude session (recreate so it always resumes the
-        # latest conversation with --continue). Separate from restored sessions.
-        if [ ! -x "$HOME/.local/bin/claude" ]; then
-          echo "$HOME/.local/bin/claude not found or not executable, skipping"
-          exit 0
-        fi
-        ${pkgs.tmux}/bin/tmux kill-session -t claude 2>/dev/null || true
-        ${pkgs.tmux}/bin/tmux new-session -d -s claude -c "$PROJECT_DIR" \
-          "$HOME/.local/bin/claude --dangerously-skip-permissions --continue || $HOME/.local/bin/claude --dangerously-skip-permissions"
-
-        echo "Claude Code started in tmux session 'claude' at $PROJECT_DIR"
-      '');
-    };
-  };
-
   # ── tmux with session save/restore ───────────────────────────────
   # resurrect saves sessions manually (prefix + Ctrl-s) and on shutdown.
   # continuum auto-saves every 15 minutes and auto-restores on server start.
@@ -728,13 +671,57 @@
   services.amazon-ssm-agent.enable = true;
 
   # ── Docker ────────────────────────────────────────────────────────
-  virtualisation.docker.enable = true;
+  # Docker keeps its data on the large persistent /home volume rather than
+  # the small root disk, so images and container volumes survive instance
+  # replacement and cannot fill /. Container logs are size-capped. A weekly
+  # prune removes unused images, stopped containers and build cache older
+  # than a week; named volumes are never pruned.
+  virtualisation.docker = {
+    enable = true;
+    daemon.settings = {
+      data-root  = "/home/docker";
+      log-driver = "json-file";
+      log-opts   = { max-size = "50m"; max-file = "3"; };
+    };
+    autoPrune = {
+      enable = true;
+      dates  = "weekly";
+      flags  = [ "--all" "--filter" "until=168h" ];
+    };
+  };
+  systemd.services.docker.unitConfig.RequiresMountsFor = [ "/home" ];
 
   # ── Nix settings ──────────────────────────────────────────────────
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
     trusted-users         = [ "root" "emaland" ];
+
+    # Disk-full guard. When free space on the store's disk drops below
+    # min-free during a build, the daemon collects garbage until max-free is
+    # available, so a heavy build day cannot fill the root disk between the
+    # daily GC runs.
+    min-free = 5 * 1024 * 1024 * 1024;   # 5 GiB
+    max-free = 15 * 1024 * 1024 * 1024;  # 15 GiB
+
+    # Hard-link identical files in the store as they are added.
+    auto-optimise-store = true;
+
+    # Build scratch space on the large persistent /home volume instead of the
+    # root disk. Packages that are not in the binary cache are compiled
+    # locally, and their unpacked sources and build caches are big enough to
+    # exhaust /.
+    build-dir = "/home/.nix-build";
   };
+
+  # build-dir must exist (root-owned, not world-writable) and /home must be
+  # mounted before the daemon starts a build.
+  systemd.tmpfiles.rules = [ "d /home/.nix-build 0755 root root -" ];
+  systemd.services.nix-daemon.unitConfig.RequiresMountsFor = [ "/home" ];
+
+  # Cap the system journal, which is otherwise unbounded.
+  services.journald.extraConfig = ''
+    SystemMaxUse=1G
+  '';
 
   # ── Nix garbage collection ─────────────────────────────────────
   nix.gc = {

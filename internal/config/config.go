@@ -26,9 +26,13 @@ type DevboxConfig struct {
 	NixOSAMIOwner    string `json:"nixos_ami_owner"`
 	NixOSAMIPattern  string `json:"nixos_ami_pattern"`
 	TailscaleAuthKey string `json:"tailscale_auth_key"`
-	DataVolumeName   string `json:"data_volume_name"`
-	DataVolumeSize   int    `json:"data_volume_size"`
-	UseSpot          bool   `json:"use_spot"`
+	// AuthorizedKeysFile is a local file of extra ssh public keys (one per
+	// line) rendered into the pushed NixOS config. The keys themselves are
+	// deliberately not part of this repo.
+	AuthorizedKeysFile string `json:"authorized_keys_file"`
+	DataVolumeName     string `json:"data_volume_name"`
+	DataVolumeSize     int    `json:"data_volume_size"`
+	UseSpot            bool   `json:"use_spot"`
 }
 
 // secretKeys are config keys whose values should be masked when displayed.
@@ -42,7 +46,6 @@ func DefaultConfig() DevboxConfig {
 	return DevboxConfig{
 		DNSName:         "dev.frob.io",
 		DNSZone:         "frob.io.",
-		DNSZoneID:       "Z09070421BNE0435R08B2",
 		SSHKeyName:      "dev-boxes",
 		SSHKeyPath:      "~/.ssh/dev-boxes.pem",
 		SSHUser:         "emaland",
@@ -54,9 +57,12 @@ func DefaultConfig() DevboxConfig {
 		SpawnName:       "dev-workstation-tmp",
 		NixOSAMIOwner:   "427812963091",
 		NixOSAMIPattern: "nixos/*",
-		DataVolumeName:  "dev-data-volume",
-		DataVolumeSize:  512,
-		UseSpot:         true,
+		// DNSZoneID has no default: it identifies one AWS account's hosted
+		// zone. When unset it is looked up from DNSZone at push time.
+		AuthorizedKeysFile: "~/.config/devbox/authorized_keys",
+		DataVolumeName:     "dev-data-volume",
+		DataVolumeSize:     512,
+		UseSpot:            true,
 	}
 }
 
@@ -92,13 +98,23 @@ func LoadConfig() (DevboxConfig, error) {
 }
 
 func (c DevboxConfig) ResolveSSHKeyPath() string {
-	if strings.HasPrefix(c.SSHKeyPath, "~/") {
+	return expandHome(c.SSHKeyPath)
+}
+
+// ResolveAuthorizedKeysFile returns AuthorizedKeysFile with a leading ~/
+// expanded to the user's home directory.
+func (c DevboxConfig) ResolveAuthorizedKeysFile() string {
+	return expandHome(c.AuthorizedKeysFile)
+}
+
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
 		if err == nil {
-			return filepath.Join(home, c.SSHKeyPath[2:])
+			return filepath.Join(home, path[2:])
 		}
 	}
-	return c.SSHKeyPath
+	return path
 }
 
 // Entry is a single config key/value pair plus where the value came from.

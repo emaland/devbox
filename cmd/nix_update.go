@@ -47,8 +47,11 @@ func newNixUpdateCmd() *cobra.Command {
 }
 
 func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID, nixFile string) error {
-	// Verify the config is available (disk or embedded) before we talk to AWS
-	if _, err := readNixConfigSource(nixFile); err != nil {
+	// Check everything the push needs from this machine (template, extra keys
+	// file, hosted zone id) before touching the box, so a local problem is
+	// reported once and is not mistaken for an ssh failure below.
+	dcfg, err := preflightNixConfig(ctx, dcfg, nixFile, findHostedZoneID)
+	if err != nil {
 		return err
 	}
 
@@ -143,7 +146,7 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 
 	// Render the config (substitute @@MARKER@@ placeholders) to a temp file so
 	// the instance never receives literal markers. SCP the rendered file.
-	rendered, err := renderNixConfig(dcfg, nixFile, dataVolumeMarker(volumeID))
+	rendered, err := renderForPush(ctx, dcfg, nixFile, volumeID, findHostedZoneID)
 	if err != nil {
 		return err
 	}

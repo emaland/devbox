@@ -101,8 +101,13 @@ devbox config path
 Config lives at `~/.config/devbox/default.json`. Keys: `dns_name`, `dns_zone`,
 `dns_zone_id`, `ssh_key_name`, `ssh_key_path`, `ssh_user`, `security_group`,
 `iam_profile`, `default_az`, `default_type`, `default_max_price`, `spawn_name`,
-`nixos_ami_owner`, `nixos_ami_pattern`, `tailscale_auth_key`, `data_volume_name`,
-`data_volume_size`. Any unset key uses a built-in default.
+`nixos_ami_owner`, `nixos_ami_pattern`, `tailscale_auth_key`,
+`authorized_keys_file`, `data_volume_name`, `data_volume_size`. Any unset key
+uses a built-in default, except `dns_zone_id`, which is looked up from
+`dns_zone` when unset.
+
+Extra ssh public keys for the box live in `~/.config/devbox/authorized_keys`
+(one per line), not in `configuration.nix`; `nix-update` renders them in.
 
 ## Setup / plumbing
 
