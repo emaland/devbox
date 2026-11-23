@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,6 +178,17 @@ func createTestInstance(t *testing.T, ctx context.Context) string {
 	return *result.Instances[0].InstanceId
 }
 
+// uniqueName returns prefix plus a suffix that no earlier call has returned,
+// in this run or an earlier run against the same LocalStack. All tests share
+// one LocalStack, and `go test -count=2` runs every test twice against it, so
+// a fixed resource name collides with the first run's leftovers. The result is
+// lower-case letters, digits and hyphens: valid in a DNS label and in AWS names.
+func uniqueName(prefix string) string {
+	return fmt.Sprintf("%s-%x-%d", prefix, time.Now().UnixNano(), uniqueCounter.Add(1))
+}
+
+var uniqueCounter atomic.Int64
+
 func testDevboxConfig() config.DevboxConfig {
 	return config.DevboxConfig{
 		DNSName:          "test.example.com",
@@ -327,7 +339,7 @@ func TestTerminateInstances(t *testing.T) {
 func TestFindHostedZone(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
-	domain := "findzone.test."
+	domain := uniqueName("findzone") + ".test."
 	expectedID := createTestHostedZone(t, ctx, domain)
 
 	gotID, err := awsutil.FindHostedZone(ctx, testR53Client, domain)
@@ -351,7 +363,7 @@ func TestFindHostedZoneNotFound(t *testing.T) {
 func TestUpdateDNS(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
-	domain := "updatedns.test."
+	domain := uniqueName("updatedns") + ".test."
 	zoneID := createTestHostedZone(t, ctx, domain)
 	id := createTestInstance(t, ctx)
 
@@ -490,7 +502,7 @@ func TestLookupSecurityGroup(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a security group.
-	sgName := "test-sg-lookup"
+	sgName := uniqueName("test-sg-lookup")
 	sgResult, err := testEC2Client.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
 		GroupName:   aws.String(sgName),
 		Description: aws.String("test security group"),
@@ -635,7 +647,7 @@ func TestResizeInstance(t *testing.T) {
 	id := createTestInstance(t, ctx)
 
 	cfg := testDevboxConfig()
-	domain := "resize.test."
+	domain := uniqueName("resize") + ".test."
 	createTestHostedZone(t, ctx, domain)
 	cfg.DNSZone = domain
 	cfg.DNSName = "dev.resize.test"
@@ -714,6 +726,7 @@ func TestVolumeCreateAndDestroy(t *testing.T) {
 func TestResolveVolumeByName(t *testing.T) {
 	skipIfNoDocker(t)
 	ctx := context.Background()
+	volumeName := uniqueName("resolve-by-name")
 	result, err := testEC2Client.CreateVolume(ctx, &ec2.CreateVolumeInput{
 		AvailabilityZone: aws.String("us-east-1a"),
 		Size:             aws.Int32(1),
@@ -721,7 +734,7 @@ func TestResolveVolumeByName(t *testing.T) {
 		TagSpecifications: []types.TagSpecification{
 			{
 				ResourceType: types.ResourceTypeVolume,
-				Tags:         []types.Tag{{Key: aws.String("Name"), Value: aws.String("resolve-by-name-unique")}},
+				Tags:         []types.Tag{{Key: aws.String("Name"), Value: aws.String(volumeName)}},
 			},
 		},
 	})
@@ -729,7 +742,7 @@ func TestResolveVolumeByName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := resolveVolume(ctx, testEC2Client, "resolve-by-name-unique")
+	got, err := resolveVolume(ctx, testEC2Client, volumeName)
 	if err != nil {
 		t.Fatalf("resolveVolume by name: %v", err)
 	}
