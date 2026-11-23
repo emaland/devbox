@@ -256,7 +256,7 @@
         TARGET="$CONFIG_DIR/configuration.nix"
         if [ -L "$CONFIG_DIR/current" ] || [ -L "$TARGET" ]; then
           echo "the saved copy is an old single file; keeping the config set in use"
-        elif [ -r "$SAVED" ] && ! cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
+        elif [ -f "$SAVED" ] && [ ! -L "$SAVED" ] && ! cmp -s "$SAVED" "$TARGET" 2>/dev/null; then
           echo "Syncing $TARGET from the persistent volume"
           cp "$SAVED" "$TARGET" || true
         else

@@ -16,21 +16,25 @@
 # current/configuration.nix, so a set is switched with a single rename and the
 # main file never sits beside a tree it does not belong to.
 #
-# The saved copy belongs to the user, and root reads it. Root therefore never
-# follows a link out of it: a saved set is copied with tar, which stores links
-# as links, and the copy is refused if it holds anything but plain files and
-# directories. The saved copy is written by its owner, never by root. What is
-# left: root changes directory into the saved copy's sets/ directory, so a
-# user who swaps that directory for a link at the right moment makes root
-# read a directory of their choosing. On this box the user can become root
-# anyway.
+# The saved copy belongs to the user, and root reads it. By design its content
+# becomes root's config (at restore, and when local.nix is carried forward):
+# whoever can edit it can change the system. What the script prevents is root
+# reading or writing *through* it: a saved set is copied with tar, which
+# stores links as links, and the copy is refused if it holds anything but
+# plain files and directories. The saved copy is written by its owner, never
+# by root. What is left: between its checks and the copy, root changes
+# directory into the saved copy, so a user who swaps a directory they own on
+# that path (the saved dir, its sets/, or a parent) for a link at the right
+# moment makes root read a directory of their choosing. On this box the user
+# can become root anyway.
 #
 # DEVBOX_SAVED_STATE tells `install` whether it can see the saved copy:
 # `mounted` (the default), `unmounted` (the persistent volume exists but is
 # not mounted, so what is under <saved dir> is not the real copy), or `none`
 # (a new blank volume: there is no saved copy anywhere).
 #
-# Exit status: 0 done; 3 the pushed set is older than the one in use; 4 the
+# Exit status: 0 done; 3 the set offered (pushed, or saved at restore) is
+# older than the one in use; 4 the
 # operator's local.nix may be expected but cannot be found, or the saved copy
 # is unusable; 1 anything else.
 set -eu
@@ -44,7 +48,7 @@ fail() {
 # valid_stamp <name>: names this script makes. Anything else is left alone.
 valid_stamp() {
   case "$1" in
-    "" | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+    "" | .* | -* | *[!A-Za-z0-9._-]*) return 1 ;;
   esac
   return 0
 }
@@ -100,26 +104,35 @@ switch_to() {
 
 # prune <dir>: keep the set in use and the newest other set; remove anything
 # half-written. Names this script did not make are left alone.
+#
+# sh has no local variables: the names here start with prune_ so that callers'
+# variables survive a call.
 prune() {
-  in_use="$(current_stamp "$1")" || return 0
-  newest_other=""
-  for path in "$1"/sets/*; do
-    [ -e "$path" ] || [ -L "$path" ] || continue
-    name="${path##*/}"
-    case "$name" in
+  prune_in_use="$(current_stamp "$1")" || return 0
+  prune_newest=""
+  for prune_path in "$1"/sets/*; do
+    [ -e "$prune_path" ] || [ -L "$prune_path" ] || continue
+    prune_name="${prune_path##*/}"
+    case "$prune_name" in
       *.partial)
-        rm -rf -- "$path"
+        rm -rf -- "$prune_path"
         continue
         ;;
     esac
-    valid_stamp "$name" || continue
-    [ "$name" = "$in_use" ] && continue
+    valid_stamp "$prune_name" || continue
+    [ "$prune_name" = "$prune_in_use" ] && continue
     # The glob is sorted, and stamps sort by time: each one replaces the last.
-    if [ -n "$newest_other" ]; then
-      rm -rf -- "$1/sets/$newest_other"
+    if [ -n "$prune_newest" ]; then
+      rm -rf -- "$1/sets/$prune_newest"
     fi
-    newest_other="$name"
+    prune_newest="$prune_name"
   done
+}
+
+# base_stamp <stamp>: the push time a set was made at, without the suffix a
+# save or restore adds.
+base_stamp() {
+  printf '%s\n' "${1%%.*}"
 }
 
 # import_saved <saved dir> <work dir>: copy the saved set in use into
@@ -129,8 +142,11 @@ import_saved() {
   [ -d "$1" ] && [ ! -L "$1" ] && [ -d "$1/sets" ] && [ ! -L "$1/sets" ] || return 1
   IMPORTED="$(current_stamp "$1")" || return 1
   mkdir "$2"
-  (cd "$1/sets" && tar -cf - -- "$IMPORTED") |
-    tar -xf - -C "$2" --no-same-owner --no-same-permissions || return 1
+  # Through a file, not a pipe: sh has no pipefail, and a copy that failed
+  # part-way could still look like a set.
+  (cd "$1/sets" && tar -cf - -- "$IMPORTED") >"$2.tar" || { rm -f "$2.tar"; return 1; }
+  tar -xf "$2.tar" -C "$2" --no-same-owner --no-same-permissions || { rm -f "$2.tar"; return 1; }
+  rm -f "$2.tar"
   check_set "$2/$IMPORTED"
 }
 
@@ -207,7 +223,7 @@ save_set() {
   mkdir -p "$saved/sets"
   name="$stamp"
   # A saved set of the same name with other content is not trusted: save
-  # beside it, and let prune remove it.
+  # beside it. prune removes it once two newer saves have followed.
   if [ -e "$saved/sets/$name" ] &&
     ! diff -r -q "$config/sets/$stamp" "$saved/sets/$name" >/dev/null 2>&1; then
     name="$stamp.saved.$(now)"
@@ -238,11 +254,23 @@ restore_set() {
     rm -rf "$work"
     fail "the saved config set under $saved is not usable (it must be a set this tool wrote, holding only files and directories); the config in use is unchanged"
   fi
-  if in_use="$(current_stamp "$config")" &&
-    diff -r -q "$work/$IMPORTED" "$config/sets/$in_use" >/dev/null 2>&1; then
-    rm -rf "$work"
-    echo "install_set: the config set in use already matches the saved one"
-    return 0
+  if in_use="$(current_stamp "$config")"; then
+    if diff -r -q "$work/$IMPORTED" "$config/sets/$in_use" >/dev/null 2>&1; then
+      rm -rf "$work"
+      echo "install_set: the config set in use already matches the saved one"
+      return 0
+    fi
+    # The saved copy can fall behind (a push while /home was not mounted, or a
+    # failed save). Never go back to it: a layout or push time older than the
+    # set in use is refused, and the set in use stays.
+    saved_layout="$(layout_of "$work/$IMPORTED")"
+    in_use_layout="$(layout_of "$config/sets/$in_use")"
+    saved_base="$(base_stamp "$IMPORTED")"
+    in_use_base="$(base_stamp "$in_use")"
+    if [ "$saved_layout" -lt "$in_use_layout" ] || expr "$saved_base" \< "$in_use_base" >/dev/null; then
+      rm -rf "$work"
+      fail "the saved config set $IMPORTED (layout $saved_layout) is older than the one in use, $in_use (layout $in_use_layout); keeping the one in use. Push again to bring the saved copy up to date" 3
+    fi
   fi
   # Never replace a set in place: a set of the same name gets a new name.
   name="$IMPORTED"
@@ -252,8 +280,8 @@ restore_set() {
   mv -T "$work/$IMPORTED" "$config/sets/$name"
   rm -rf "$work"
   switch_to "$config" "$name"
-  prune "$config" || true
   echo "install_set: restored config set $name from $saved"
+  prune "$config" || true
 }
 
 case "${1:-}" in

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -67,7 +68,10 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 	// No volume id here — `nix-update` targets a box whose volume is already
 	// formatted, so the format service no-ops on the unrendered marker.
 	err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, dcfg.SSHUser, "")
-	if err != nil && dcfg.SSHUser != "root" {
+	// A refusal by the box's install step is the same whoever logs in; only a
+	// failure to reach the box as the configured user is worth retrying.
+	var refused installRefusedError
+	if err != nil && dcfg.SSHUser != "root" && !errors.As(err, &refused) {
 		fmt.Println("Retrying as root (fresh instance)...")
 		err = pushNixConfigToHost(ctx, dcfg, ip, instanceID, nixFile, "root", "")
 	}
@@ -127,11 +131,16 @@ const (
 	remoteInstallScriptName = "devbox-install-set.sh"
 )
 
+// installRefusedError is a push the box's install step refused.
+type installRefusedError struct{ error }
+
+func (e installRefusedError) Unwrap() error { return e.error }
+
 // describeInstallFailure turns install_set.sh's exit status into words.
 func describeInstallFailure(status string) string {
 	switch status {
 	case "3":
-		return "this devbox CLI is older than the config on the box"
+		return "the pushed config is an older layout than the one on the box; update the devbox CLI"
 	case "4":
 		return "the operator's local.nix may be needed and could not be found, or the saved copy on /home is unusable or not mounted"
 	default:
@@ -171,7 +180,7 @@ func remoteApplyScript(uploadDir, stamp string) string {
 		`runuser -u emaland -- mkdir -p ` + remoteSavedDir + ` && ` +
 		`runuser -u emaland -- sh -s save ` + remoteConfigDir + ` ` + remoteSavedDir + ` <` + uploadDir + `/` + remoteInstallScriptName + ` ` +
 		`|| echo "devbox: warning: could not update the saved config set on /home"; ` +
-		`else echo "devbox: /home is not mounted; the saved config set was not updated"; fi`
+		`else echo "devbox: /home is not mounted yet, or the user does not exist yet; the saved config set was not updated"; fi`
 
 	// Reuse a local Nix binary cache kept on the persistent /home volume so a
 	// fresh box (post resize/recover) substitutes prebuilt paths from local gp3
@@ -277,6 +286,18 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 		return fmt.Errorf("unexpected upload directory from %s: %q", instanceID, remoteDir)
 	}
 
+	// The remote script removes the directory when it runs; if it never
+	// starts, remove it here.
+	launched := false
+	defer func() {
+		if launched {
+			return
+		}
+		cleanup := append([]string{}, sshOpts...)
+		cleanup = append(cleanup, sshTarget, `rm -rf `+remoteDir)
+		_ = exec.Command("ssh", cleanup...).Run()
+	}()
+
 	fmt.Printf("Uploading %s and its modules to %s (%s)...\n", nixFile, instanceID, ip)
 	scpArgs := append([]string{}, sshOpts...)
 	scpArgs = append(scpArgs, localTar, localScript, sshTarget+":"+remoteDir+"/")
@@ -306,6 +327,7 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 	if out, err := exec.CommandContext(ctx, "ssh", launchArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("starting remote nixos-rebuild: %w\n%s", err, out)
 	}
+	launched = true
 
 	fmt.Println("Running nixos-rebuild switch (this can take several minutes on a fresh box)...")
 	pollOpts := append([]string{}, sshOpts...)
@@ -344,7 +366,7 @@ func pushNixConfigToHost(ctx context.Context, dcfg config.DevboxConfig, ip, inst
 			}
 			if rc := strings.TrimSpace(rcPart); rc != "" {
 				if status, failed := strings.CutPrefix(rc, "install:"); failed {
-					return fmt.Errorf("the config set was not installed on %s (%s), and nixos-rebuild was not run. The reason is in the output above", instanceID, describeInstallFailure(status))
+					return installRefusedError{fmt.Errorf("the config set was not installed on %s (%s), and nixos-rebuild was not run. The reason is in the output above", instanceID, describeInstallFailure(status))}
 				}
 				if rc != "0" {
 					fmt.Printf("\nWarning: nixos-rebuild exited %s (usually service-activation warnings, not a build failure).\n", rc)

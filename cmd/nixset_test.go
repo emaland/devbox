@@ -926,3 +926,89 @@ func TestRemoteApplyScript(t *testing.T) {
 		t.Error("the apply script is single-quoted by the caller and must contain no single quote")
 	}
 }
+
+func TestRestoreNeverGoesBackToAnOlderSet(t *testing.T) {
+	older := func(t *testing.T, newerStamp, newerLayout string) box {
+		b := newBox(t)
+		b.mustPush("20260101T000000Z", "saved, older\n", "1", nil)
+		b.mustSave()
+		// A newer push whose save step did not happen (/home not mounted, or
+		// the save failed).
+		b.mustPush(newerStamp, "in use, newer\n", newerLayout, nil)
+		return b
+	}
+	for _, tc := range []struct{ name, stamp, layout string }{
+		{"older layout", "20260110T000000Z", "2"},
+		{"older stamp, same layout", "20260110T000000Z", "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := older(t, tc.stamp, tc.layout)
+			out, status := b.run("restore", b.config, b.saved)
+			if status == 0 {
+				t.Errorf("restore went back to an older set:\n%s", out)
+			}
+			if got := read(t, filepath.Join(b.config, "configuration.nix")); got != "in use, newer\n" {
+				t.Errorf("in use after restore: %q", got)
+			}
+		})
+	}
+}
+
+func TestRestoreKeepsTheReplacedSetUnderItsName(t *testing.T) {
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "saved\n", "1", nil)
+	b.mustSave()
+	inUse := filepath.Join(b.config, "sets", "20260101T000000Z", "configuration.nix")
+	if err := os.WriteFile(inUse, []byte("hand edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, status := b.run("restore", b.config, b.saved)
+	if status != 0 {
+		t.Fatalf("exit %d:\n%s", status, out)
+	}
+	target, err := os.Readlink(filepath.Join(b.config, "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target == "sets/20260101T000000Z" {
+		t.Error("the restored set took the name of the set it replaced")
+	}
+	if got := read(t, inUse); got != "hand edit\n" {
+		t.Errorf("the replaced set was changed in place: %q", got)
+	}
+	if got := read(t, filepath.Join(b.config, "configuration.nix")); got != "saved\n" {
+		t.Errorf("in use: %q", got)
+	}
+	if !strings.Contains(out, "restored config set "+strings.TrimPrefix(target, "sets/")) {
+		t.Errorf("the log does not name the set now in use (%s):\n%s", target, out)
+	}
+}
+
+func TestRestoreFailsWhenTheSavedSetCannotBeReadCompletely(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read the file anyway")
+	}
+	b := newBox(t)
+	b.mustPush("20260101T000000Z", "in use\n", "1", nil)
+	b.mustSave()
+	b.fresh()
+	unreadable := filepath.Join(b.saved, "current", "devbox", "modules", "example.nix")
+	if err := os.Chmod(unreadable, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+	out, status := b.run("restore", b.config, b.saved)
+	if status == 0 {
+		t.Errorf("a set that could not be copied completely was restored:\n%s", out)
+	}
+	if exists(filepath.Join(b.config, "current")) {
+		t.Error("a set was switched to")
+	}
+}
+
+func TestInstallRejectsAStampStartingWithADash(t *testing.T) {
+	b := newBox(t)
+	if out, status := b.push("-x", "x\n", "1", nil); status == 0 {
+		t.Errorf("accepted:\n%s", out)
+	}
+}
