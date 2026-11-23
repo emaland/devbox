@@ -9,7 +9,11 @@
 #   AHP_CHECK_UNIT      the unit (default ahp-gateway.service)
 #   AHP_CHECK_STATE     file holding the restart count at the last look
 #   AHP_CHECK_RESTARTS  restarts since the last look that warrant a notice
-#   AHP_NOTICE_SCRIPT   the notice script
+#   AHP_NOTICE_SCRIPT   the notice program, run directly (no sh on this PATH)
+#
+# A gateway stopped by hand is reported too, every hour: stop this check's
+# timer as well (systemctl stop ahp-gateway-check.timer) for a deliberate
+# pause.
 set -u
 export LC_ALL=C
 
@@ -19,7 +23,7 @@ threshold="${AHP_CHECK_RESTARTS:-3}"
 notice="$AHP_NOTICE_SCRIPT"
 
 properties="$(systemctl show -p ActiveState,NRestarts "$unit")" || {
-  sh "$notice" "could not read the state of $unit"
+  "$notice" "could not read the state of $unit"
   exit 0
 }
 active="$(printf '%s\n' "$properties" | sed -n 's/^ActiveState=//p')"
@@ -33,12 +37,17 @@ case "$last" in "" | *[!0-9]*) last=0 ;; esac
 [ "$restarts" -lt "$last" ] && last=0
 printf '%s\n' "$restarts" >"$state"
 
-if [ "$active" != active ]; then
-  sh "$notice" "$unit is not running ($active); see journalctl -u $unit"
-  exit 0
-fi
+case "$active" in
+  active) ;;
+  # Still starting (a slow first backup, say): the start timeout decides.
+  activating | reloading) exit 0 ;;
+  *)
+    "$notice" "$unit is not running ($active); see journalctl -u $unit"
+    exit 0
+    ;;
+esac
 grown=$((restarts - last))
 if [ "$grown" -gt "$threshold" ]; then
-  sh "$notice" "$unit restarted $grown times since the last check; see journalctl -u $unit"
+  "$notice" "$unit restarted $grown times since the last check; see journalctl -u $unit"
 fi
 exit 0

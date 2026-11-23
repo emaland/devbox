@@ -90,7 +90,7 @@ func startStub(t *testing.T, mode string, port int) int {
 
 // runReady runs the readiness check as ExecStartPost would, with MAINPID set
 // to mainPID, and returns output, exit status and how long it took.
-func runReady(t *testing.T, port, mainPID int, timeout time.Duration) (string, int, time.Duration) {
+func runReady(t *testing.T, port, mainPID int, timeout time.Duration, extraEnv ...string) (string, int, time.Duration) {
 	t.Helper()
 	for _, tool := range []string{"sh", "curl", "ss"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -104,6 +104,7 @@ func runReady(t *testing.T, port, mainPID int, timeout time.Duration) (string, i
 		"AHP_GATEWAY_READY_PATH=/healthz",
 		"AHP_GATEWAY_READY_TIMEOUT="+strconv.Itoa(int(timeout.Seconds())),
 	)
+	command.Env = append(command.Env, extraEnv...)
 	start := time.Now()
 	out, err := command.CombinedOutput()
 	elapsed := time.Since(start)
@@ -151,6 +152,47 @@ func TestReadyCheck(t *testing.T) {
 		}
 		if !strings.Contains(out, "exited") {
 			t.Errorf("the message should say the gateway exited: %s", out)
+		}
+	})
+
+	t.Run("a slow prepare: the ready deadline starts when prepare has finished", func(t *testing.T) {
+		port := freePort(t)
+		marker := filepath.Join(t.TempDir(), "prepared")
+		// A launcher whose prepare takes longer than the ready timeout.
+		node := needNode(t)
+		launcher := exec.Command("sh", "-c", `sleep 4; : > "$1"; exec "$2" "$3"`, "launcher", marker, node, writeStubGateway(t))
+		launcher.Env = append(os.Environ(), "STUB_MODE=ok", "STUB_PORT="+strconv.Itoa(port))
+		if err := launcher.Start(); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() { _ = launcher.Wait(); close(done) }()
+		t.Cleanup(func() { _ = launcher.Process.Kill(); <-done })
+		out, status, _ := runReady(t, port, launcher.Process.Pid, 2*time.Second,
+			"AHP_GATEWAY_PREPARED_MARKER="+marker, "AHP_GATEWAY_PREPARE_TIMEOUT=30")
+		if status != 0 {
+			t.Errorf("a correct gateway behind a slow prepare was failed:\n%s", out)
+		}
+	})
+
+	t.Run("prepare never finishes: fails at prepare's own bound", func(t *testing.T) {
+		port := freePort(t)
+		marker := filepath.Join(t.TempDir(), "prepared")
+		sleeper := exec.Command("sleep", "60")
+		if err := sleeper.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sleeper.Process.Kill(); _ = sleeper.Wait() })
+		out, status, elapsed := runReady(t, port, sleeper.Process.Pid, 2*time.Second,
+			"AHP_GATEWAY_PREPARED_MARKER="+marker, "AHP_GATEWAY_PREPARE_TIMEOUT=3")
+		if status == 0 {
+			t.Fatalf("called ready:\n%s", out)
+		}
+		if elapsed < 3*time.Second || elapsed > 15*time.Second {
+			t.Errorf("took %s for a 3 s prepare bound", elapsed)
+		}
+		if !strings.Contains(out, "prepare") {
+			t.Errorf("the message should say prepare did not finish: %s", out)
 		}
 	})
 
@@ -312,21 +354,65 @@ func TestFailureNotice(t *testing.T) {
 func fakeSystemctl(t *testing.T, active string, restarts int) string {
 	t.Helper()
 	dir := t.TempDir()
-	script := fmt.Sprintf("#!/bin/sh\nprintf 'ActiveState=%s\\nNRestarts=%d\\n'\n", active, restarts)
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not on PATH")
+	}
+	shell, _ = filepath.EvalSymlinks(shell)
+	script := fmt.Sprintf("#!%s\nprintf 'ActiveState=%s\\nNRestarts=%d\\n'\n", shell, active, restarts)
 	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return dir
 }
 
+// storeBin returns the real directory of a program on PATH (in the Nix
+// store on this box), so a test can give a script a PATH with exactly the
+// programs the module gives it and nothing else, no sh in particular.
+func storeBin(t *testing.T, program string) string {
+	t.Helper()
+	path, err := exec.LookPath(program)
+	if err != nil {
+		t.Skipf("%s not on PATH", program)
+	}
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Dir(real)
+}
+
+// noticeWrapper is an executable stand-in for the module's notice wrapper:
+// it runs notice.sh with the tools it needs, whatever PATH it is called with.
+func noticeWrapper(t *testing.T) string {
+	t.Helper()
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not on PATH")
+	}
+	shell, _ = filepath.EvalSymlinks(shell)
+	wrapper := filepath.Join(t.TempDir(), "notice")
+	script := "#!" + shell + "\nPATH=" + os.Getenv("PATH") + " exec " + shell + " " + gatewayScript(t, "notice.sh") + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return wrapper
+}
+
 func runCheck(t *testing.T, systemctlDir, stateFile, log string) (string, int) {
 	t.Helper()
-	command := exec.Command("sh", gatewayScript(t, "check.sh"))
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not on PATH")
+	}
+	// The check unit's PATH: systemctl, coreutils and sed. No sh.
+	path := strings.Join([]string{systemctlDir, storeBin(t, "date"), storeBin(t, "sed")}, ":")
+	command := exec.Command(shell, gatewayScript(t, "check.sh"))
 	command.Env = append(os.Environ(),
-		"PATH="+systemctlDir+":"+os.Getenv("PATH"),
+		"PATH="+path,
 		"AHP_CHECK_STATE="+stateFile,
 		"AHP_CHECK_RESTARTS=3",
-		"AHP_NOTICE_SCRIPT="+gatewayScript(t, "notice.sh"),
+		"AHP_NOTICE_SCRIPT="+noticeWrapper(t),
 		"AHP_NOTICE_LOG="+log,
 		"AHP_NOTICE_WEBHOOK_FILE=",
 	)
@@ -362,6 +448,15 @@ func TestPeriodicCheck(t *testing.T) {
 		runCheck(t, fakeSystemctl(t, "failed", 0), filepath.Join(dir, "state"), log)
 		if logLines(t, log) != 1 || !strings.Contains(read(t, log), "not running") {
 			t.Errorf("log: %q", read(t, log))
+		}
+	})
+
+	t.Run("still starting: nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		log := filepath.Join(dir, "log")
+		runCheck(t, fakeSystemctl(t, "activating", 0), filepath.Join(dir, "state"), log)
+		if n := logLines(t, log); n != 0 {
+			t.Errorf("%d notices for a gateway that is still starting", n)
 		}
 	})
 
@@ -405,11 +500,13 @@ func TestGatewayModuleReadinessAndNotice(t *testing.T) {
 		FailedReq any               `json:"failedRequires"`
 		Check     map[string]any    `json:"check"`
 		CheckReq  any               `json:"checkRequires"`
+		Service   map[string]any    `json:"service"`
 		Timer     map[string]any    `json:"timer"`
 		TimerBy   []string          `json:"timerWantedBy"`
 	}
 	expression := "let s = " + moduleExpression(t, `{ readyPath = "/readyz"; readyTimeoutSec = 30; failureNotice.webhookFile = "/home/alice/.secrets"; }`) + `; c = s.config.systemd; in {
 		post = c.services.ahp-gateway.serviceConfig.ExecStartPost;
+		service = c.services.ahp-gateway.serviceConfig;
 		onFailure = c.services.ahp-gateway.onFailure;
 		env = c.services.ahp-gateway.environment;
 		failed = c.services.ahp-gateway-failed.serviceConfig;
@@ -437,6 +534,22 @@ func TestGatewayModuleReadinessAndNotice(t *testing.T) {
 	// exist for.
 	if got.FailedReq != nil || got.CheckReq != nil {
 		t.Errorf("the notice units must not need /home: %v %v", got.FailedReq, got.CheckReq)
+	}
+	// A notice that hangs (a huge or endless webhook file, a webhook that
+	// never answers) must not block the next one.
+	for name, unit := range map[string]map[string]any{"failed": got.Failed, "check": got.Check} {
+		if fmt.Sprint(unit["TimeoutStartSec"]) == "" || fmt.Sprint(unit["TimeoutStartSec"]) == "<nil>" {
+			t.Errorf("%s unit has no start timeout: %v", name, unit)
+		}
+	}
+	// The ready wait starts when prepare has finished, and the start timeout
+	// covers both.
+	if got.Env["AHP_GATEWAY_PREPARED_MARKER"] != "/run/ahp-gateway/prepared" || got.Env["AHP_GATEWAY_PREPARE_TIMEOUT"] == "" {
+		t.Errorf("prepare marker settings: %v", got.Env)
+	}
+	prepare, _ := strconv.Atoi(got.Env["AHP_GATEWAY_PREPARE_TIMEOUT"])
+	if start := int(got.Service["TimeoutStartSec"].(float64)); start < prepare+30 {
+		t.Errorf("TimeoutStartSec %d does not cover prepare (%d) plus the ready wait (30)", start, prepare)
 	}
 	if got.Timer["OnBootSec"] != "5min" || got.Timer["OnUnitActiveSec"] != "1h" {
 		t.Errorf("timer %v", got.Timer)
@@ -562,8 +675,8 @@ func TestUnitBehaviour(t *testing.T) {
 		properties := waitFor(t, name, 60*time.Second, func(p map[string]string) bool {
 			return p["ActiveState"] == "failed"
 		})
-		if properties["Result"] != "start-limit-hit" && properties["Result"] != "exit-code" && properties["Result"] != "protocol" {
-			t.Logf("result %s", properties["Result"])
+		if properties["Result"] != "start-limit-hit" {
+			t.Errorf("want result start-limit-hit, got %v", properties)
 		}
 		if n, _ := strconv.Atoi(properties["NRestarts"]); n < 2 {
 			t.Errorf("want retries up to the limit, got %v", properties)

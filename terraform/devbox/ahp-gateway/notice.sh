@@ -25,7 +25,9 @@ printf '%s | ahp-gateway | %s\n' "$stamp" "$reason" >>"$log" ||
 
 url=""
 if [ -n "$webhook_file" ] && [ -f "$webhook_file" ] && [ -r "$webhook_file" ]; then
-  url="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?SLACK_WEBHOOK_URL=[\"']?([^\"'[:space:]]*)[\"']?[[:space:]]*$/\\2/p" "$webhook_file" | tail -n 1)"
+  # Only the first 64 KiB: the file is the user's and could be anything, an
+  # endless one included.
+  url="$(head -c 65536 "$webhook_file" | sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?SLACK_WEBHOOK_URL=[\"']?([^\"'[:space:]]*)[\"']?[[:space:]]*$/\\2/p" | tail -n 1)"
 fi
 case "$url" in
   https://* | http://*) ;;
@@ -35,7 +37,7 @@ esac
 if [ -n "$url" ]; then
   payload="$(jq -n --arg text ":warning: *ahp-gateway* on \`$host\`: $reason" '{text: $text}')"
   printf 'url = "%s"\n' "$url" |
-    curl -s --max-time 10 -X POST -H 'Content-type: application/json' --data "$payload" -K - >/dev/null ||
+    curl -q -s --fail --max-time 10 -X POST -H 'Content-type: application/json' --data "$payload" -K - >/dev/null ||
     echo "ahp-gateway notice: the webhook post failed" >&2
 fi
 exit 0
