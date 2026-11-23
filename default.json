@@ -35,6 +35,12 @@
     // Used by `devbox ssh` and `devbox setup-dns`. Supports ~ for home directory.
     "ssh_key_path": "~/.ssh/dev-boxes.pem",
 
+    // Local file of extra ssh public keys to authorize on the box, one per
+    // line. The keys are rendered into the NixOS config when it is pushed;
+    // they are never stored in the devbox repository. A missing file means
+    // no extra keys.
+    "authorized_keys_file": "~/.config/devbox/authorized_keys",
+
     // The username to SSH as. NixOS defaults to "root" but many setups create
     // a custom user via user_data.
     "ssh_user": "emaland",
