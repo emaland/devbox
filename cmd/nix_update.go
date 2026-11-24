@@ -57,8 +57,7 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 	if err != nil {
 		return err
 	}
-
-	ip, err := instancePublicIP(ctx, client, instanceID)
+	dcfg, ip, err := pushTarget(ctx, client, instanceID, dcfg)
 	if err != nil {
 		return err
 	}
@@ -78,6 +77,19 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 	return err
 }
 
+// pushTarget is where a config push goes and what it carries: the
+// instance's public IP, and the config for that instance (without DNS for a
+// --no-dns clone, see dnsConfigFor). Every push gets its address here, so
+// none can skip the DNS check.
+func pushTarget(ctx context.Context, client *ec2.Client, instanceID string, dcfg config.DevboxConfig) (config.DevboxConfig, string, error) {
+	dcfg, err := dnsConfigFor(ctx, client, instanceID, dcfg)
+	if err != nil {
+		return dcfg, "", err
+	}
+	ip, err := instancePublicIP(ctx, client, instanceID)
+	return dcfg, ip, err
+}
+
 // pushNixConfig looks up a running instance's IP and pushes configuration.nix
 // via root SSH (for fresh instances where emaland keys aren't set up yet).
 func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceID, volumeID string) error {
@@ -86,7 +98,7 @@ func pushNixConfig(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		return err
 	}
 
-	ip, err := instancePublicIP(ctx, client, instanceID)
+	dcfg, ip, err := pushTarget(ctx, client, instanceID, dcfg)
 	if err != nil {
 		return err
 	}

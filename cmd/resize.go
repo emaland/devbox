@@ -325,13 +325,7 @@ func resizeSpotInstance(ctx context.Context, dcfg config.DevboxConfig, client *e
 
 	// Tags for the new instance: carry over non-aws tags, then add the resize
 	// plan so the swap can be resumed if interrupted.
-	tags := []types.Tag{}
-	for _, t := range inst.Tags {
-		if t.Key != nil && !strings.HasPrefix(*t.Key, "aws:") && !strings.HasPrefix(*t.Key, "devbox-resize-") {
-			tags = append(tags, t)
-		}
-	}
-	tags = append(tags,
+	tags := append(carriedTags(inst.Tags),
 		types.Tag{Key: aws.String(resizeStateTag), Value: aws.String("launched")},
 		types.Tag{Key: aws.String(resizeSourceTag), Value: aws.String(instanceID)},
 		types.Tag{Key: aws.String(resizeTypeTag), Value: aws.String(newType)},
@@ -775,4 +769,17 @@ func instanceExists(ctx context.Context, client *ec2.Client, id string) (bool, e
 		return false, nil
 	}
 	return true, nil
+}
+
+// carriedTags are the source instance's tags a resize puts on the new one:
+// all but aws:* and the resize plan's own. devbox-dns=off is among them, so
+// a --no-dns clone stays one.
+func carriedTags(tags []types.Tag) []types.Tag {
+	carried := []types.Tag{}
+	for _, t := range tags {
+		if t.Key != nil && !strings.HasPrefix(*t.Key, "aws:") && !strings.HasPrefix(*t.Key, "devbox-resize-") {
+			carried = append(carried, t)
+		}
+	}
+	return carried
 }

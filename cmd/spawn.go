@@ -24,13 +24,30 @@ func newSpawnCmd() *cobra.Command {
 		maxPrice     string
 		from         string
 		volumeID     string
+		noDNS        bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "spawn",
 		Short: "Spin up a new spot instance cloned from the primary",
+		Long: `Spin up a new spot instance cloned from the primary: it boots the
+primary's user_data, then gets the NixOS config pushed, DNS record included.
+
+With --no-dns the clone does not point the primary's DNS name at itself. It
+boots the minimal stub instead of the primary's user_data, its pushed config
+names no DNS record or zone, so its boot-time Route 53 update is skipped, and
+it is tagged devbox-dns=off, so dns, up, resize, nix-update and setup-dns
+write no DNS for it later. Use it for a short-lived second box next to the
+primary.
+
+Limits: the clone has the primary's instance profile, whose role may change
+records in the hosted zone, so a program on the clone could still do so
+itself (your local.nix is pushed to it unchanged). With --volume and a copy
+of the primary's data volume, the primary's saved config is restored on it
+until the first push succeeds. Removing the devbox-dns tag makes it an
+ordinary box again. It also joins the tailnet with the primary's host name.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID)
+			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID, noDNS)
 		},
 	}
 
@@ -40,11 +57,132 @@ func newSpawnCmd() *cobra.Command {
 	cmd.Flags().StringVar(&maxPrice, "max-price", "", "Spot max price $/hr (default from config)")
 	cmd.Flags().StringVar(&from, "from", "", "Instance ID to clone user_data from")
 	cmd.Flags().StringVar(&volumeID, "volume", "", "EBS data volume ID to attach as /dev/xvdf")
+	cmd.Flags().BoolVar(&noDNS, "no-dns", false, "Never take over the primary's DNS name: boot the stub user_data and push a config without a DNS record")
+	// --from clones a source's user_data, which can carry its DNS record.
+	cmd.MarkFlagsMutuallyExclusive("no-dns", "from")
 
 	return cmd
 }
 
-func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string) error {
+// withoutDNS is the config a --no-dns clone is pushed with: no record name
+// and no zone, so the box's Route 53 update finds its markers unrendered and
+// skips, and no hosted zone is looked up.
+func withoutDNS(dcfg config.DevboxConfig) config.DevboxConfig {
+	dcfg.DNSName = ""
+	dcfg.DNSZone = ""
+	dcfg.DNSZoneID = ""
+	return dcfg
+}
+
+// dnsTag marks an instance spawned with --no-dns, so every later command that
+// would write DNS for it (dns, up, resize, nix-update, setup-dns) does not.
+// resize carries it to the new instance with the other tags.
+const dnsTag = "devbox-dns"
+
+// spawnDNS is what --no-dns changes in a launch: the config pushed to the
+// clone, and the tags it is launched with.
+func spawnDNS(dcfg config.DevboxConfig, noDNS bool) (config.DevboxConfig, []types.Tag) {
+	if !noDNS {
+		return dcfg, nil
+	}
+	return withoutDNS(dcfg), []types.Tag{{Key: aws.String(dnsTag), Value: aws.String("off")}}
+}
+
+// launchTags are the tags spawn launches an instance with.
+func launchTags(name string, dnsTags []types.Tag) []types.Tag {
+	return append([]types.Tag{
+		{Key: aws.String("Name"), Value: aws.String(name)},
+		{Key: aws.String("devbox-managed"), Value: aws.String("true")},
+	}, dnsTags...)
+}
+
+// dnsOff reports whether an instance's tags mark it as spawned with --no-dns.
+func dnsOff(tags []types.Tag) bool {
+	for _, t := range tags {
+		if aws.ToString(t.Key) == dnsTag && aws.ToString(t.Value) == "off" {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsConfigFor is the config to push to an instance: without DNS for one
+// spawned with --no-dns. An instance that cannot be described is an error,
+// not a guess.
+func dnsConfigFor(ctx context.Context, client *ec2.Client, instanceID string, dcfg config.DevboxConfig) (config.DevboxConfig, error) {
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}})
+	if err != nil {
+		return dcfg, fmt.Errorf("describing instance %s: %w", instanceID, err)
+	}
+	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
+		return dcfg, fmt.Errorf("instance %s not found", instanceID)
+	}
+	if dnsOff(desc.Reservations[0].Instances[0].Tags) {
+		fmt.Printf("  %s was spawned with --no-dns: pushing a config without a DNS record\n", instanceID)
+		return withoutDNS(dcfg), nil
+	}
+	return dcfg, nil
+}
+
+// userDataSource is how spawn reads another instance's user_data.
+type userDataSource struct {
+	fetch  func(ctx context.Context, instanceID string) (string, error)
+	detect func(ctx context.Context) (string, error)
+}
+
+// chooseUserData picks what the new instance boots: the stub for --no-dns,
+// else the user_data of --from, of the one devbox instance found, or the stub
+// when there is none.
+func chooseUserData(ctx context.Context, src userDataSource, from string, noDNS bool) (string, error) {
+	if noDNS {
+		fmt.Println("  --no-dns: booting the minimal stub; full config pushed after launch")
+		return stubUserData(), nil
+	}
+	if from != "" {
+		fmt.Printf("  Cloning user_data from: %s\n", from)
+		return src.fetch(ctx, from)
+	}
+	sourceID, err := src.detect(ctx)
+	if err != nil {
+		// No source instance — boot a minimal stub (the full configuration.nix
+		// exceeds EC2's 16 KB user_data limit). The real config is pushed via
+		// SSH after launch (pushNixConfig).
+		fmt.Println("  No source instance — booting minimal stub; full config pushed after launch")
+		return stubUserData(), nil
+	}
+	fmt.Printf("  Cloning user_data from: %s\n", sourceID)
+	return src.fetch(ctx, sourceID)
+}
+
+// spawnRequest is what the spawn command asks for; empty fields take the
+// config's defaults.
+type spawnRequest struct {
+	instanceType, az, name, maxPrice, from string
+	noDNS                                  bool
+}
+
+// spawnLookups are the reads planSpawn makes. spawnInstance gives the real
+// ones; tests give fakes.
+type spawnLookups struct {
+	preflight     func(context.Context, config.DevboxConfig) (config.DevboxConfig, error)
+	ami           func(context.Context, config.DevboxConfig) (string, error)
+	securityGroup func(context.Context, config.DevboxConfig) (string, error)
+	subnet        func(ctx context.Context, az string) (string, error)
+	userData      userDataSource
+}
+
+// spawnPlan is everything spawnInstance decides before it launches: the
+// config the rest of the spawn uses (DNS cleared for --no-dns, checked by
+// preflight) and the launch request itself, with its user data and tags.
+type spawnPlan struct {
+	dcfg             config.DevboxConfig
+	instanceType, az string
+	runInput         *ec2.RunInstancesInput
+}
+
+func planSpawn(ctx context.Context, dcfg config.DevboxConfig, req spawnRequest, look spawnLookups) (spawnPlan, error) {
+	dcfg, dnsTags := spawnDNS(dcfg, req.noDNS)
+	instanceType, az, name, maxPrice := req.instanceType, req.az, req.name, req.maxPrice
 	// Apply config defaults for empty flags
 	if instanceType == "" {
 		instanceType = dcfg.DefaultType
@@ -61,90 +199,64 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 
 	// Fail on a local config problem before launching anything: the config
 	// push at the end needs the template, the keys file and the zone id.
-	dcfg, err := preflightNixConfig(ctx, dcfg, defaultNixFile(), findHostedZoneID)
+	dcfg, err := look.preflight(ctx, dcfg)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 
 	// Discover infrastructure
 	fmt.Println("Looking up infrastructure...")
 
-	amiID, err := lookupAMI(ctx, dcfg, client)
+	amiID, err := look.ami(ctx, dcfg)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 	fmt.Printf("  AMI: %s\n", amiID)
 
-	sgID, err := lookupSecurityGroup(ctx, dcfg, client)
+	sgID, err := look.securityGroup(ctx, dcfg)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 	fmt.Printf("  Security Group: %s\n", sgID)
 
-	subnetID, err := lookupSubnet(ctx, client, az)
+	subnetID, err := look.subnet(ctx, az)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 	fmt.Printf("  Subnet: %s\n", subnetID)
 
-	// Get user_data: clone from a source instance, or fall back to local configuration.nix
-	var userData string
-	if from != "" {
-		fmt.Printf("  Cloning user_data from: %s\n", from)
-		userData, err = awsutil.FetchUserData(ctx, client, from)
-		if err != nil {
-			return err
-		}
-	} else {
-		sourceID, detectErr := autoDetectSourceInstance(ctx, client)
-		if detectErr == nil {
-			fmt.Printf("  Cloning user_data from: %s\n", sourceID)
-			userData, err = awsutil.FetchUserData(ctx, client, sourceID)
-			if err != nil {
-				return err
-			}
-		} else {
-			// No source instance — boot a minimal stub (the full configuration.nix
-			// exceeds EC2's 16 KB user_data limit). The real config is pushed via
-			// SSH after launch (pushNixConfig below).
-			userData = stubUserData()
-			fmt.Println("  No source instance — booting minimal stub; full config pushed after launch")
-		}
+	userData, err := chooseUserData(ctx, look.userData, req.from, req.noDNS)
+	if err != nil {
+		return spawnPlan{}, err
 	}
 
-	// Launch the instance
-	fmt.Printf("Launching %s spot instance in %s...\n", instanceType, az)
-
 	runInput := &ec2.RunInstancesInput{
-		ImageId:      aws.String(amiID),
-		InstanceType: types.InstanceType(instanceType),
-		MinCount:     aws.Int32(1),
-		MaxCount:     aws.Int32(1),
-		KeyName:      aws.String(dcfg.SSHKeyName),
-		SubnetId:     aws.String(subnetID),
+		ImageId:          aws.String(amiID),
+		InstanceType:     types.InstanceType(instanceType),
+		MinCount:         aws.Int32(1),
+		MaxCount:         aws.Int32(1),
+		KeyName:          aws.String(dcfg.SSHKeyName),
+		SubnetId:         aws.String(subnetID),
 		SecurityGroupIds: []string{sgID},
 		IamInstanceProfile: &types.IamInstanceProfileSpecification{
 			Name: aws.String(dcfg.IAMProfile),
 		},
-		UserData:                            aws.String(userData),
-		InstanceInitiatedShutdownBehavior:   types.ShutdownBehaviorStop,
+		UserData:                          aws.String(userData),
+		InstanceInitiatedShutdownBehavior: types.ShutdownBehaviorStop,
 		BlockDeviceMappings: []types.BlockDeviceMapping{
 			{
 				DeviceName: aws.String("/dev/xvda"),
 				Ebs: &types.EbsBlockDevice{
-					VolumeSize:           aws.Int32(75),
-					VolumeType:           types.VolumeTypeGp3,
-					DeleteOnTermination:  aws.Bool(false),
+					VolumeSize:          aws.Int32(75),
+					VolumeType:          types.VolumeTypeGp3,
+					DeleteOnTermination: aws.Bool(false),
 				},
 			},
 		},
 		TagSpecifications: []types.TagSpecification{
 			{
 				ResourceType: types.ResourceTypeInstance,
-				Tags: []types.Tag{
-					{Key: aws.String("Name"), Value: aws.String(name)},
-					{Key: aws.String("devbox-managed"), Value: aws.String("true")},
-				},
+				Tags:         launchTags(name, dnsTags),
 			},
 		},
 	}
@@ -158,8 +270,36 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 			},
 		}
 	}
+	return spawnPlan{dcfg: dcfg, instanceType: instanceType, az: az, runInput: runInput}, nil
+}
 
-	result, err := client.RunInstances(ctx, runInput)
+func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string, noDNS bool) error {
+	plan, err := planSpawn(ctx, dcfg, spawnRequest{
+		instanceType: instanceType, az: az, name: name, maxPrice: maxPrice, from: from, noDNS: noDNS,
+	}, spawnLookups{
+		preflight: func(ctx context.Context, d config.DevboxConfig) (config.DevboxConfig, error) {
+			return preflightNixConfig(ctx, d, defaultNixFile(), findHostedZoneID)
+		},
+		ami: func(ctx context.Context, d config.DevboxConfig) (string, error) { return lookupAMI(ctx, d, client) },
+		securityGroup: func(ctx context.Context, d config.DevboxConfig) (string, error) {
+			return lookupSecurityGroup(ctx, d, client)
+		},
+		subnet: func(ctx context.Context, az string) (string, error) { return lookupSubnet(ctx, client, az) },
+		userData: userDataSource{
+			fetch:  func(ctx context.Context, id string) (string, error) { return awsutil.FetchUserData(ctx, client, id) },
+			detect: func(ctx context.Context) (string, error) { return autoDetectSourceInstance(ctx, client) },
+		},
+	})
+	if err != nil {
+		return err
+	}
+	// The rest of the spawn, the config push included, uses the planned config.
+	dcfg, instanceType, az = plan.dcfg, plan.instanceType, plan.az
+
+	// Launch the instance
+	fmt.Printf("Launching %s spot instance in %s...\n", instanceType, az)
+
+	result, err := client.RunInstances(ctx, plan.runInput)
 	if err != nil {
 		return fmt.Errorf("launching instance: %w", err)
 	}

@@ -630,7 +630,7 @@ func TestSpawnInstance(t *testing.T) {
 	}
 	cfg.SecurityGroup = "test-sg-spawn"
 
-	err = spawnInstance(ctx, cfg, testEC2Client, "t2.micro", "us-east-1a", "test-spawn", "0.50", sourceID, "")
+	err = spawnInstance(ctx, cfg, testEC2Client, "t2.micro", "us-east-1a", "test-spawn", "0.50", sourceID, "", false)
 	if err != nil {
 		// Spawn may fail at AMI lookup due to owner filter. That's a known LocalStack limitation.
 		if strings.Contains(err.Error(), "AMI") || strings.Contains(err.Error(), "user_data") {

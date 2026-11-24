@@ -52,6 +52,10 @@ func updateDNS(ctx context.Context, dcfg config.DevboxConfig, ec2client *ec2.Cli
 		return fmt.Errorf("instance %s not found", instanceID)
 	}
 	inst := desc.Reservations[0].Instances[0]
+	if dnsOff(inst.Tags) {
+		fmt.Printf("%s was spawned with --no-dns: not pointing %s at it\n", instanceID, dnsName)
+		return nil
+	}
 	if inst.PublicIpAddress == nil {
 		return fmt.Errorf("instance %s has no public IP", instanceID)
 	}
