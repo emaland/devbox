@@ -56,11 +56,14 @@ esac
 # are by path, and the owner could swap in a link to a file only root may
 # read between them and the read. The owner's rights are the owner's account
 # (uid and its primary gid), never the file's group, which need not be one
-# the owner is in. The reader gets no environment, no standard input and no
-# standard error, only the pipe back. The time limit, for a FIFO swapped in,
-# is root's and outside the drop, so the owner cannot stop it.
+# the owner is in ("+" makes id look the uid up as a number, never as a
+# name). The reader gets no environment, no standard input and no standard
+# error. Its output goes to a file root made, not to a pipe: the reader runs
+# as the owner, who could open a pipe of its through /proc and hold it, and
+# root would wait on it. The time limit, for a FIFO swapped in, is root's and
+# outside the drop, so the owner cannot stop it.
 if [ "$(id -u)" = 0 ]; then
-  owner_gid="$(id -g -- "$owner" 2>/dev/null)" || unreachable "token file unusable (owner has no account)"
+  owner_gid="$(id -g -- "+$owner" 2>/dev/null)" || unreachable "token file unusable (owner has no account)"
   case "$owner_gid" in "" | *[!0-9]*) unreachable "token file unusable (owner has no account)" ;; esac
   read_token() {
     timeout -k 1 3 setpriv --reuid="$owner" --regid="$owner_gid" --clear-groups \
@@ -69,7 +72,13 @@ if [ "$(id -u)" = 0 ]; then
 else
   read_token() { timeout -k 1 3 head -c 4096 -- "$token_file" </dev/null 2>/dev/null; }
 fi
-raw="$(read_token && printf x)" || unreachable "token file unusable"
+# Root's own files, 0600 from mktemp: the token copy and, later, the answer.
+copy="$(mktemp)" || unreachable "no temporary file"
+body="$(mktemp)" || { rm -f "$copy"; unreachable "no temporary file"; }
+trap 'rm -f "$copy" "$body"' EXIT
+read_token >"$copy" || unreachable "token file unusable"
+raw="$(head -c 4096 -- "$copy" && printf x)" || unreachable "token file unusable"
+rm -f "$copy"
 raw="${raw%x}"
 cr="$(printf '\r')"
 nl="
@@ -117,19 +126,20 @@ set +f
 # moment between this check and curl's connect. Closing that needs a peer
 # credential check, which TCP on loopback does not give.
 
-body="$(mktemp)" || unreachable "no temporary file"
-trap 'rm -f "$body"' EXIT
-
 code="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
-  curl -q -s --noproxy '*' --max-time 3 -o "$body" -w '%{http_code}' -K - "http://127.0.0.1:$port/status")"
+  curl -q -s --noproxy '*' --max-time 3 --max-filesize 65536 -o "$body" -w '%{http_code}' -K - "http://127.0.0.1:$port/status")"
 status=$?
 token=""
 [ "$status" -eq 0 ] || unreachable "no answer (curl exit $status)"
 [ "$code" = 200 ] || unreachable "HTTP $code"
+# The listener's owner writes the answer: bounded in size (curl stops past
+# 64 KiB, and this checks) and in parse time.
+[ "$(wc -c <"$body")" -le 65536 ] || unreachable "answer too large"
 
 # The busy rule is the gateway's own: a turn that is working and not waiting
 # for a person, or a continuation about to start.
-state="$(jq -r '
+# shellcheck disable=SC2016 # a jq program, not shell
+state="$(timeout -k 1 5 jq -r '
   if (.turns | type) != "object"
      or (.turns.active | type) != "number"
      or (.turns.waitingForUser | type) != "number"
@@ -145,4 +155,4 @@ state="$(jq -r '
 [ "$state" != malformed ] || unreachable "answer has no turn counts"
 
 printf '%s\n' "$state"
-jq -c . "$body"
+timeout -k 1 5 jq -c . "$body"

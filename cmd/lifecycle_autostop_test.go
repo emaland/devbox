@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -990,5 +991,47 @@ func TestGatewayStatusCurlIgnoresConfigAndProxies(t *testing.T) {
 	argv := b.read(filepath.Join(b.root, "curl-argv"))
 	if !strings.HasPrefix(argv, "-q ") {
 		t.Fatalf("curl not started with -q: %q", argv)
+	}
+}
+
+// R-SEC on PR 17, round 4: the reader runs as the token's owner, who may
+// open its output through /proc and hold it. Root must not wait on any
+// write end the owner can hold. Here a process left behind by the reader
+// keeps its output open for 20 s.
+func TestGatewayStatusDoesNotWaitOnTheReadersOutput(t *testing.T) {
+	b := newLifecycleBox(t)
+	realHead, err := exec.LookPath("head")
+	if err != nil {
+		t.Skip("head not on PATH")
+	}
+	b.fakeProgram("head", fmt.Sprintf(`case "$*" in
+  *"$FAKE_ROOT/token"*) (exec sleep 20) & echo $! >"$FAKE_ROOT/holder-pid" ;;
+esac
+exec %s "$@"`, realHead))
+	t.Cleanup(func() {
+		if pid, err := strconv.Atoi(strings.TrimSpace(b.read(filepath.Join(b.root, "holder-pid")))); err == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	started := time.Now()
+	out, status := b.run("gateway-status.sh")
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("waited %v on a write end the reader left open", elapsed.Round(time.Second))
+	}
+	if status != 0 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+}
+
+// R-SEC on PR 17, round 4: the listener's owner controls the answer. A huge
+// one is refused, not stored and parsed by root.
+func TestGatewayStatusRefusesAHugeAnswer(t *testing.T) {
+	b := newLifecycleBox(t)
+	padding := strings.Repeat("x", 1<<20)
+	b.gateway.set(200, `{"ok": true, "turns": {"active": 0, "waitingForUser": 0}, "padding": "`+padding+`"}`)
+	out, status := b.run("gateway-status.sh")
+	if status != 2 || strings.Contains(out, "xxxx") {
+		t.Fatalf("exit %d output %.200q", status, out)
 	}
 }

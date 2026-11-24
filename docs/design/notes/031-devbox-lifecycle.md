@@ -121,7 +121,10 @@ the caller treats that as "not installed" and logs nothing.
   `setpriv` under the owner's account (uid and its primary gid, never the
   file's group), with no environment, standard input or standard error, and
   under a 3 s limit held by root outside the drop, in case a FIFO is swapped
-  in. curl is started with `-q` and `--noproxy '*'`, so root's
+  in. Its output goes to a file root made, never to a pipe, because the
+  owner could open the reader's pipe through `/proc` and hold it, and root
+  would wait. The answer is written by the listener's owner too, so it is
+  capped at 64 KiB and parsed under a time limit. curl is started with `-q` and `--noproxy '*'`, so root's
   curl config and proxy settings cannot send the header elsewhere.
 - **Known limit.** The gateway could stop, and another user bind the port,
   in the moment between the listener check and curl's connect. Closing that
