@@ -165,10 +165,13 @@ volume, and restored from there at boot after an instance replacement.
 [AHP gateway](https://github.com/formulahendry/ahp-acp-gateway) as the system
 service `ahp-gateway.service` (design note `docs/design/notes/030-ahp-gateway-module.md`).
 It is **off** in the template and is turned on in your `local.nix`, because
-which agent to run is your choice. Before turning it on for the first time, run
-the boot checklist in design note 030 section 5 once: what only a real boot
-shows (ordering against `/home`, a reboot, a switch with a running gateway)
-cannot be tested on a development machine.
+which agent to run is your choice. **`docs/apply-gateway.md` has the steps**:
+moving from a gateway started by hand while keeping its sessions, giving the
+editors the token, the boot checklist, and how to undo it. Run the boot
+checklist (`terraform/devbox/ahp-gateway/boot-check.sh`, after a reboot) once
+before relying on the service: what only a real boot shows (ordering against
+`/home`, a reboot, a switch with a running gateway) cannot be tested on a
+development machine.
 
 ```nix
 { pkgs, ... }: {
