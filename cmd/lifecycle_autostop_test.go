@@ -902,18 +902,19 @@ func TestGatewayStatusReadsTheListenerByColumn(t *testing.T) {
 
 // R-SEC on PR 17, second round: the "?" placeholder for a listener that
 // matches no owner was expanded as a file name pattern, so a one-character
-// file in the working directory could turn it into the owner's uid. Seen
-// with a root-owned token file (owner 0) and a file named 0.
+// file in the working directory could turn it into the owner's uid: here
+// owner 7 and a file named 7. (R-TEST, round 5: the fake gives a usable mode
+// and owner, so the script reaches the listener loop.)
 func TestGatewayStatusPlaceholderIsNotAPattern(t *testing.T) {
 	b := newLifecycleBox(t)
 	realStat, err := exec.LookPath("stat")
 	if err != nil {
 		t.Skip("stat not on PATH")
 	}
-	// The token file looks root's.
-	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) echo 0 ;; *) exec %s "$@" ;; esac`, realStat))
+	// The token file looks like owner 7's.
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) echo "600 7" ;; *) exec %s "$@" ;; esac`, realStat))
 	b.workdir = t.TempDir()
-	if err := os.WriteFile(filepath.Join(b.workdir, "0"), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(b.workdir, "7"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	b.write("listener-lines", "LISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:1234 ino:1 sk:1 cgroup:/x <->\n")
@@ -1026,6 +1027,8 @@ exec %s "$@"`, realHead))
 
 // R-SEC on PR 17, round 4: the listener's owner controls the answer. A huge
 // one is refused, not stored and parsed by root.
+// curl's --max-filesize and the script's own size check are two layers: this
+// fails only when both are gone.
 func TestGatewayStatusRefusesAHugeAnswer(t *testing.T) {
 	b := newLifecycleBox(t)
 	padding := strings.Repeat("x", 1<<20)
@@ -1044,13 +1047,13 @@ func TestGatewayStatusRefusesARootOwnedTokenFile(t *testing.T) {
 	if err != nil {
 		t.Skip("stat not on PATH")
 	}
-	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) set -- "$@"; out="$(exec %s "$@")" || exit 1; echo "${out%% *} 0" ;; *) exec %s "$@" ;; esac`, realStat, realStat))
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) out="$(exec %s "$@")" || exit 1; echo "${out%% *} 0" ;; *) exec %s "$@" ;; esac`, realStat, realStat))
 	b.write("listener-uid", "0\n")
 	out, status := b.run("gateway-status.sh")
 	b.gateway.mu.Lock()
 	requests := len(b.gateway.requests)
 	b.gateway.mu.Unlock()
-	if status != 2 || requests != 0 || !strings.Contains(out, "token file unusable") {
+	if status != 2 || requests != 0 || !strings.Contains(out, "owned by root") {
 		t.Fatalf("exit %d, %d requests, output %q", status, requests, out)
 	}
 }
@@ -1061,6 +1064,15 @@ func TestGatewayStatusRefusesSeveralDocuments(t *testing.T) {
 	b := newLifecycleBox(t)
 	b.gateway.set(200, `{"ok": true} {"ok": true, "turns": {"active": 0, "waitingForUser": 0}}`)
 	if out, status := b.run("gateway-status.sh"); status != 2 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+}
+
+// R-TEST on PR 17, round 5: an empty answer is not an idle gateway.
+func TestGatewayStatusRefusesAnEmptyAnswer(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.gateway.set(200, "")
+	if out, status := b.run("gateway-status.sh"); status != 2 || !strings.Contains(out, "empty answer") {
 		t.Fatalf("exit %d output %q", status, out)
 	}
 }

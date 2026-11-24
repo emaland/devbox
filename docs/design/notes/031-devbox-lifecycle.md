@@ -7,8 +7,10 @@ first review (every CLI stop path, stale spot notices, a requested stop while
 the gateway restarts, where `resume status` reads its source); revision 3
 takes the diff check's two remaining points (the unreachable rule in time,
 and no cap exemption for attached clients). After revision 4, issue 14
-widened the token file check to the gateway's own rule, read `ss` by column
-and ended a spot notice 5 min after its action time (sections 2.2 and 2.3). Builds on note 030 (the gateway as a
+widened the token file check to the gateway's own rule, read `ss` by column,
+read the token as its owner, refused a root-owned token file and any answer
+that is not exactly one JSON document of at most 64 KiB, and ended a spot
+notice 5 min after its action time (sections 2.2 and 2.3). Builds on note 030 (the gateway as a
 system unit). Covers auto-stop, the spot interruption watcher, the stop paths
 and resume on boot. The CLI commands that sit on top (`devbox agents`,
 `devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
@@ -102,16 +104,18 @@ the caller treats that as "not installed" and logs nothing.
   on standard input (`-K -`), so it never appears on a command line, in the
   environment or in a log.
 - **Only to the gateway.** The token file must be a regular file, not a
-  link, with no group or other permission bits (0600 and 0400 both do), as
-  the gateway itself requires; it is read with a size bound, so root cannot
+  link, not owned by root (the gateway never runs as root), with no group or
+  other permission bits (0600 and 0400 both do), as the gateway itself
+  requires; it is read with a size bound, so root cannot
   be pointed at another file, a FIFO or a device. The token is sent only
   when every listener on the port (`ss -Htlne`) is on `127.0.0.1` and
   belongs to the token file's owner. `ss` is read by column, never by
   matching text anywhere on the line: the cgroup path at the end of each
   line is chosen by the socket's owner and may contain spaces, so a match
   anywhere could be given a false address or owner. Column 6 is `uid:N`, or
-  `ino:` for a socket owned by root, which counts as uid 0; anything else
-  matches no owner. While the gateway is down, which is exactly when these
+  `ino:` for a socket owned by root, which counts as uid 0 and so never
+  matches, as a root-owned token file is refused; anything else matches no
+  owner. While the gateway is down, which is exactly when these
   checks run (after a spot stop, at boot, during a restart), another local
   user could otherwise bind the port and collect the token. Otherwise the
   result is "unreachable" with the reason.
@@ -124,7 +128,8 @@ the caller treats that as "not installed" and logs nothing.
   in. Its output goes to a file root made, never to a pipe, because the
   owner could open the reader's pipe through `/proc` and hold it, and root
   would wait. The answer is written by the listener's owner too, so it is
-  capped at 64 KiB and parsed under a time limit. curl is started with `-q` and `--noproxy '*'`, so root's
+  capped at 64 KiB, parsed under a time limit, and refused unless it is
+  exactly one JSON document (an empty answer or several are "unreachable"). curl is started with `-q` and `--noproxy '*'`, so root's
   curl config and proxy settings cannot send the header elsewhere.
 - **Known limit.** The gateway could stop, and another user bind the port,
   in the moment between the listener check and curl's connect. Closing that

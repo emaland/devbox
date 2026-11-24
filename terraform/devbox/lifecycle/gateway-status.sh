@@ -104,7 +104,8 @@ esac
 # Read by column, never by matching text anywhere on the line: the cgroup path
 # at the end is chosen by the socket's owner and may hold spaces. Every
 # listener on the port must be on 127.0.0.1 and show its owner in column 6:
-# uid:N, or ino: straight away, which is how ss shows uid 0. Anything else is
+# uid:N, or ino: straight away, which is how ss shows uid 0 (and so never
+# matches, since a root-owned token file is refused above). Anything else is
 # "none", which matches no owner. (A word, not "?": the loop below splits the
 # list, and file name patterns are off for it.)
 listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null |
@@ -156,6 +157,8 @@ state="$(timeout -k 1 5 jq -r '
       elif .turns.active > 0 then "waiting"
       else "idle" end
   end' "$body" 2>/dev/null)" || unreachable "answer is not JSON"
+# jq reads an empty file as no documents and succeeds.
+[ -n "$state" ] || unreachable "empty answer"
 [ "$state" != malformed ] || unreachable "answer has no turn counts"
 json="$(timeout -k 1 5 jq -c . "$body" 2>/dev/null)" || unreachable "answer is not JSON"
 # One document only: several would give several states.
