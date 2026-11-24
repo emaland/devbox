@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -652,7 +653,7 @@ func TestResizeInstance(t *testing.T) {
 	cfg.DNSZone = domain
 	cfg.DNSName = "dev.resize.test"
 
-	if err := resizeInstance(ctx, cfg, testEC2Client, testR53Client, id, "t2.small"); err != nil {
+	if err := resizeInstance(ctx, cfg, testEC2Client, testR53Client, stopGuard{hard: true, out: io.Discard}, id, "t2.small"); err != nil {
 		t.Fatalf("resizeInstance: %v", err)
 	}
 

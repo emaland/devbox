@@ -189,9 +189,11 @@ What it does: listens on `127.0.0.1` only, always with a token
 (`<state dir>/token`, made on first start), with browser origins refused unless
 listed in `allowedOrigins`. Agents must be programs in the Nix store; every
 built-in launcher that downloads code is disabled. Before a different build
-first opens the database it is backed up to `<state dir>/backups/`, and an
-older build is refused. A config switch never restarts a running gateway; the
-new build takes effect at the next restart or boot.
+first opens the database it is backed up to `<state dir>/backups/devbox/`, and an
+older build is refused. The gateway's own backups in `<state dir>/backups/` are
+kept to the newest five at each start; `failed-*` copies are never removed. A
+config switch never restarts a running gateway; the new build takes effect at
+the next restart or boot.
 
 The unit counts as started only when the gateway answers, owns its port, listens
 on loopback only and refuses a connection without a token. If it fails, if it
@@ -283,7 +285,8 @@ Use `devbox --help` for a full list of commands, or `devbox <command> --help` fo
 devbox list
 devbox ls
 
-# Start / stop / terminate instances
+# Start / stop / terminate instances (stop and terminate are refused while an
+# agent is working; see "Unattended agent work")
 devbox start i-abc123
 devbox stop i-abc123
 devbox terminate i-abc123
@@ -301,7 +304,7 @@ devbox ssh i-abc123
 
 ### Auto-stop timer
 
-Instances auto-stop after 4 hours idle by default (the window resets whenever a session is active). You can change the window on a running instance:
+Instances auto-stop after 4 hours idle by default. The box counts as in use while someone is logged in (or has an inbound ssh connection) **or an agent on the AHP gateway is working**; see [Unattended agent work](#unattended-agent-work). You can change the window on a running instance:
 
 ```bash
 # Set auto-stop to 2 hours idle
@@ -311,11 +314,82 @@ devbox stop --after 2h i-abc123
 # Disable auto-stop
 devbox stop --after off
 
-# Immediate stop (unchanged)
+# Stop now, unless an agent is working
 devbox stop i-abc123
 ```
 
-When `--after` is used without an instance ID, devbox auto-detects the single running instance. The timer resets automatically on every boot.
+When `--after` is used without an instance ID, devbox auto-detects the single running instance. The window counts from each boot.
+
+### Unattended agent work
+
+With the AHP gateway enabled you can start a long agent task, disconnect, and walk away. Design note `docs/design/notes/031-devbox-lifecycle.md` has the details.
+
+- **Auto-stop waits for agents.** Every 10 minutes the box asks the gateway whether an agent is working. A working agent counts as activity. A turn that is **waiting for you** (a permission prompt) does not: that box stops after the idle window, and the turn asks again when it comes back.
+- **The busy cap.** A box that has been continuously busy for 12 hours with nobody logged in is stopped anyway, with a notice, in case an agent is stuck. Change it on the box in `/etc/devbox/autostop-busy-cap` (`8h`, `2d`, or `off`).
+- **Each decision is logged** in `/var/log/boot-history`, which you see at login. A line is written when the decision changes and on every stop.
+- **Stopping is clean.** Every stop the box or the CLI makes stops the gateway through systemd first, so it can record where each turn was.
+
+```bash
+devbox agents                    # sessions, turns running, turns waiting for you
+devbox status --agents           # the instance list with an AGENTS column
+devbox stop                      # refused while an agent is working; shows what is running
+devbox stop --when-idle          # stop once no agent is working (the box checks)
+devbox stop --force              # stop anyway; the gateway is still stopped cleanly
+devbox stop --hard               # EC2 force stop of a wedged box; no clean shutdown
+```
+
+`restart`, `reboot`, `resize` and `terminate` check the agents and stop the gateway the same way, and take `--force` too.
+
+> **Changed flag.** `devbox stop --force` and `devbox restart --force` used to mean an EC2 force stop. That is now `--hard`. `--force` now means "even if an agent is working".
+
+### What happens on a spot interruption
+
+AWS gives a spot instance a two-minute notice before it stops it. `devbox-spot-watch` checks for the notice every 5 seconds. When one arrives it:
+
+1. writes a line to `/var/log/boot-history`;
+2. sends a notification with the session and turn counts (to the same Slack webhook as the boot notification, if one is set);
+3. stops the gateway cleanly, which takes well under the two minutes.
+
+A rebalance recommendation (an early warning that may never be followed by an interruption) is logged and notified, but the gateway keeps running. If the interruption never happens, the gateway is started again five minutes after the announced time.
+
+The data volume survives. A persistent spot request starts the instance again when capacity returns. An auto-stopped box stays stopped until `devbox up`.
+
+### Auto-resume after a stop
+
+When the box comes back, the gateway continues, **once**, each turn that was interrupted by the stop. The agent is told the host restarted and to check whether its last command or edit finished. The boot notification says how many turns were continued. A turn that was waiting for your permission asks again.
+
+```bash
+devbox agents resume status     # on or off, and where the setting comes from
+devbox agents resume off        # stop continuing turns; also cancels any not yet started
+devbox agents resume on
+```
+
+Auto-resume is on by default on the devbox. The setting is kept on the box and survives reboots and config pushes. To make "off" the box's default instead, set `services.devbox-lifecycle.resumeOnBoot = false;` in your `local.nix`. `devbox agents resume` needs a gateway build that offers the `resume` command (listed in `services.ahp-gateway.managementCommands`). Otherwise it says the build does not offer it.
+
+### VS Code and Zed against the devbox
+
+The gateway listens only on the devbox's loopback. Reach it through an ssh port forward:
+
+```bash
+devbox tunnel                    # 127.0.0.1:18765 here → the gateway on the devbox
+devbox tunnel --port 19000
+```
+
+`devbox tunnel` copies the gateway's token to `~/.config/devbox/gateway-token` (mode 0600; it is never printed), then prints the editor settings and holds the forward open until Ctrl-C:
+
+- **VS Code:** add the devbox to `chat.remoteAgentHosts` with address `127.0.0.1:18765/ahp`. Put the content of the token file in `connectionToken`, and turn on `chat.remoteAgentHostsEnabled`. Open the Agents window and pick the devbox host.
+  - **If you use Settings Sync**, first add `chat.remoteAgentHosts` to `settings.sync.ignoredSettings`. Otherwise the token is uploaded with your settings to every machine you sign in on.
+- **Zed:** point the AHP bridge at `ws://127.0.0.1:18765/ahp`, with the token file `~/.config/devbox/gateway-token`.
+
+**Who can reach the tunnel.**
+- While the tunnel is up, every user and program on this machine can connect to `127.0.0.1:18765`. The token is the only barrier, and whoever has it can run agents on the devbox as you.
+- Do not run `devbox tunnel` on a shared machine.
+- Turn off your editor's auto-connect while no tunnel is up. Otherwise the editor sends the token to whatever holds that port at the time.
+- If the token on the devbox changes, run `devbox tunnel` again to copy it.
+
+The folders you open must exist on the devbox, because the agent runs there. Sessions belong to the gateway, not to the editor: close the editor or the tunnel mid-turn, and the turn keeps running.
+
+An open tunnel is an ssh connection, so the devbox counts as in use and does not auto-stop while it is open.
 
 ### DNS
 

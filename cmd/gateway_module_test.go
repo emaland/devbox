@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Tests for terraform/devbox/modules/ahp-gateway.nix and the scripts it runs.
@@ -603,9 +605,12 @@ func mode(t *testing.T, path string) os.FileMode {
 	return info.Mode().Perm()
 }
 
+// backups lists devbox's own backups, which live in backups/devbox/ so that
+// the gateway's own tools, which treat the files in backups/ as theirs, never
+// see them.
 func backups(t *testing.T, stateDir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(stateDir, "backups"))
+	entries, err := os.ReadDir(filepath.Join(stateDir, "backups", "devbox"))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -994,10 +999,20 @@ func TestPrepareBuildRecord(t *testing.T) {
 		p := withDatabase(t)
 		p.mustRun(forkH1)
 		got := backups(t, p.stateDir)
-		if len(got) != 1 || !strings.HasPrefix(got[0], "devbox-") || !strings.HasSuffix(got[0], "-unknown") {
+		if len(got) != 1 || !strings.HasSuffix(got[0], "-unknown") {
 			t.Fatalf("backups %v", got)
 		}
-		dir := filepath.Join(p.stateDir, "backups", got[0])
+		dir := filepath.Join(p.stateDir, "backups", "devbox", got[0])
+		// Nothing of ours at the top of backups/, where the gateway looks.
+		top, err := os.ReadDir(filepath.Join(p.stateDir, "backups"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range top {
+			if entry.Name() != "devbox" {
+				t.Errorf("devbox wrote %s at the top of backups/", entry.Name())
+			}
+		}
 		for _, suffix := range []string{"", "-wal", "-shm"} {
 			if read(t, filepath.Join(dir, "ahp-acp-gateway.db"+suffix)) != "data"+suffix {
 				t.Errorf("backup lacks ahp-acp-gateway.db%s", suffix)
@@ -1059,7 +1074,7 @@ func TestPrepareBuildRecord(t *testing.T) {
 					t.Error("the record was updated for a refused build")
 				}
 			}
-			if !strings.Contains(out, "backups/devbox-") {
+			if !strings.Contains(out, "backups/devbox/") {
 				t.Errorf("the refusal should name the backup to restore: %s", out)
 			}
 			if !strings.Contains(out, "remove") || !strings.Contains(out, "-wal") {
@@ -1094,7 +1109,7 @@ func TestPrepareBuildRecord(t *testing.T) {
 		for i := 1; i <= 7; i++ {
 			builds = append(builds, [3]string{"ahp-acp-gateway", fmt.Sprintf("0.2.%d", i), fmt.Sprintf("/nix/store/%032d-ahp-acp-gateway-0.2.%d", i, i)})
 		}
-		if err := os.MkdirAll(filepath.Join(p.stateDir, "backups", "devbox-00000000T000000Z-x.partial"), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(p.stateDir, "backups", "devbox", "00000000T000000Z-x.partial"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		other := filepath.Join(p.stateDir, "backups", "ahp-acp-gateway-20260101T000000Z-v0.2.2.db")
@@ -1109,9 +1124,7 @@ func TestPrepareBuildRecord(t *testing.T) {
 			if strings.HasSuffix(name, ".partial") {
 				t.Errorf("partial backup %s left behind", name)
 			}
-			if strings.HasPrefix(name, "devbox-") {
-				ours = append(ours, name)
-			}
+			ours = append(ours, name)
 		}
 		if len(ours) != 5 {
 			t.Errorf("kept %d of ours, want 5: %v", len(ours), ours)
@@ -1120,4 +1133,173 @@ func TestPrepareBuildRecord(t *testing.T) {
 			t.Error("a backup made by another tool was pruned")
 		}
 	})
+}
+
+// The gateway never prunes its own backups, and on the devbox the command
+// that would (upgrade) is refused, so the start-up check keeps them to the
+// newest five (note 021, section 2.5 step 11, on the gateway's hardened
+// branch).
+func TestPrepareKeepsTheGatewaysNewestFiveBackups(t *testing.T) {
+	p := newPrepareBox(t)
+	dir := filepath.Join(p.stateDir, "backups")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// Seven of the gateway's, written out of order.
+	var gateway []string
+	for _, minute := range []int{3, 1, 7, 2, 6, 4, 5} {
+		path := write(fmt.Sprintf("ahp-acp-gateway-20261123T10%02d00.000Z-v0.2.2-h.1.db", minute))
+		// Written when its name says, as real backups are: minutes apart.
+		when := time.Date(2026, 11, 23, 10, minute, 0, 0, time.UTC)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+		gateway = append(gateway, path)
+	}
+	// Never counted, never pruned.
+	keep := []string{
+		write("failed-20261123T090000.000Z-v0.2.2-h.2.db"),
+		write("failed-20261123T090000.000Z-v0.2.2-h.2.db-wal"),
+		write("ahp-acp-gateway-20261123T080000.000Z-v0.2.2.db.partial"),
+		write("notes.txt"),
+	}
+	oldDir := filepath.Join(dir, "ahp-acp-gateway-20261123T070000.000Z-v0.2.2.db")
+	if err := os.MkdirAll(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep = append(keep, oldDir)
+	// A link named to sort oldest, pointing at a file outside backups/: a
+	// dropped link check would delete it or count it.
+	outside := filepath.Join(t.TempDir(), "elsewhere.db")
+	if err := os.WriteFile(outside, []byte("not a backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "ahp-acp-gateway-20261123T060000.000Z-v0.2.2.db")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	keep = append(keep, link)
+	// A copy made by hand, with no time in its name. In byte order letters
+	// sort after digits, so if it were counted it would count as the newest
+	// and push out a real backup.
+	keep = append(keep, write("ahp-acp-gateway-manual-v0.2.2.db"))
+
+	p.mustRun(public022)
+
+	for _, path := range keep {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("%s was removed; it must never be counted or pruned", filepath.Base(path))
+		}
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Error("the file a link pointed at was removed")
+	}
+	var kept []string
+	for _, path := range gateway {
+		if _, err := os.Stat(path); err == nil {
+			kept = append(kept, filepath.Base(path))
+		}
+	}
+	sort.Strings(kept)
+	want := []string{
+		"ahp-acp-gateway-20261123T100300.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100400.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100500.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100600.000Z-v0.2.2-h.1.db",
+		"ahp-acp-gateway-20261123T100700.000Z-v0.2.2-h.1.db",
+	}
+	if strings.Join(kept, " ") != strings.Join(want, " ") {
+		t.Errorf("kept %v, want the five newest %v", kept, want)
+	}
+
+	// Five or fewer: nothing to do, and a second start changes nothing.
+	p.mustRun(public022)
+	var again int
+	for _, path := range gateway {
+		if _, err := os.Stat(path); err == nil {
+			again++
+		}
+	}
+	if again != 5 {
+		t.Errorf("%d kept after a second start, want 5", again)
+	}
+}
+
+// Early in a boot the clock can be behind, so the newest backup by name may
+// not be the one written last. The one written last (by modification time)
+// is never pruned, as the gateway's own tooling never prunes the backup its
+// install record names.
+func TestPrepareNeverPrunesTheGatewaysLastWrittenBackup(t *testing.T) {
+	p := newPrepareBox(t)
+	dir := filepath.Join(p.stateDir, "backups")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	for i := 1; i <= 6; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("ahp-acp-gateway-20261123T10%02d00.000Z-v0.2.2-h.1.db", i+1))
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, base.Add(time.Duration(i)*time.Minute), base.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Written last, but named oldest: the clock was behind when it was made.
+	lastWritten := filepath.Join(dir, "ahp-acp-gateway-20261123T100000.000Z-v0.2.2-h.2.db")
+	if err := os.WriteFile(lastWritten, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(lastWritten, base.Add(time.Hour), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	p.mustRun(public022)
+
+	if _, err := os.Stat(lastWritten); err != nil {
+		t.Error("the backup written last was pruned")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "ahp-acp-gateway-") {
+			count++
+		}
+	}
+	if count != 6 {
+		t.Errorf("%d gateway backups kept, want the newest five by name plus the one written last", count)
+	}
+}
+
+// The refusal names a backup to restore; a half-written copy is never it.
+func TestPrepareRefusalNeverNamesAPartialBackup(t *testing.T) {
+	p := newPrepareBox(t)
+	if err := os.MkdirAll(p.stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.db(), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.mustRun(forkH2) // a backup labelled unknown, and the record
+	partial := filepath.Join(p.stateDir, "backups", "devbox", "99999999T999999.999999999Z-0.2.2-h.1.partial")
+	if err := os.MkdirAll(partial, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	out, status := p.run(forkH1)
+	if status != 78 {
+		t.Fatalf("exit %d:\n%s", status, out)
+	}
+	if strings.Contains(out, ".partial") {
+		t.Errorf("the refusal names a half-written backup: %s", out)
+	}
 }

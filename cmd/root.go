@@ -84,6 +84,8 @@ func NewRootCmd() *cobra.Command {
 		newInfraCmd(),
 		newNixUpdateCmd(),
 		newConfigCmd(),
+		newAgentsCmd(),
+		newTunnelCmd(),
 	)
 	return root
 }

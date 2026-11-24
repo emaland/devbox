@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/spf13/cobra"
 
@@ -14,39 +16,75 @@ import (
 
 func newDownCmd() *cobra.Command {
 	var after string
-	var force bool
+	var force, hard, whenIdle bool
 
 	cmd := &cobra.Command{
 		Use:     "down [instance-id...]",
 		Aliases: []string{"stop"},
 		Short:   "Stop the devbox (preserves the data volume)",
-		Long: `Stop running spot instances immediately, or schedule an auto-stop timer.
-The data volume is preserved; bring the box back with 'devbox up'.
+		Long: `Stop running instances, or schedule an auto-stop timer. The data volume
+is preserved; bring the box back with 'devbox up'.
 
-  devbox down [id...]               Stop instances immediately
-  devbox down --force [id]          Force stop a wedged/unresponsive instance
-  devbox down --after 4h [id]       SSH in and set auto-stop timer to 4h
-  devbox down --after off [id]      SSH in and disable auto-stop timer`,
+Before stopping, the agents on the box are checked: if one is working, the
+stop is refused and what is running is shown. The gateway is then stopped
+cleanly, so interrupted turns can be continued at the next start.
+
+  devbox down [id...]               Stop, unless an agent is working
+  devbox down --force [id...]       Stop even if an agent is working (still cleanly)
+  devbox down --when-idle [id...]   Stop once no agent is working (checked on the box)
+  devbox down --hard [id]           EC2 force stop of a wedged instance (no clean shutdown)
+  devbox down --after 4h [id]       SSH in and set the idle window to 4h
+  devbox down --after off [id]      SSH in and disable auto-stop`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
 			if after != "" {
-				return scheduleStop(cmd.Context(), dcfg, ec2Client, after, args)
+				if !autostopDurationPattern.MatchString(after) {
+					return fmt.Errorf("--after %q: use a number with s, m, min, h or d (for example 90m or 4h), or off; the box ignores anything else", after)
+				}
+				return scheduleStop(ctx, dcfg, ec2Client, after, args)
 			}
 			if len(args) == 0 {
-				id, err := autoDetectRunningInstance(cmd.Context(), ec2Client)
+				id, err := autoDetectRunningInstance(ctx, ec2Client)
 				if err != nil {
 					return err
 				}
 				args = []string{id}
 			}
-			return stopInstancesForce(cmd.Context(), ec2Client, args, force)
+			if whenIdle {
+				return stopWhenIdle(ctx, args)
+			}
+			guard := stopGuard{force: force, hard: hard, out: os.Stdout}
+			return guard.run(ctx, args,
+				func(ctx context.Context) error {
+					_, err := ec2Client.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: args, DryRun: aws.Bool(true)})
+					return dryRunAllowed(err)
+				},
+				func(ctx context.Context) error { return stopInstancesForce(ctx, ec2Client, args, hard) })
 		},
 	}
 
 	cmd.Flags().StringVar(&after, "after", "", "schedule auto-stop after duration (e.g. 4h, 30m) or 'off' to disable")
-	cmd.Flags().BoolVar(&force, "force", false, "force stop without a clean OS shutdown (use for wedged/unresponsive instances)")
+	cmd.Flags().BoolVar(&force, "force", false, "stop even if an agent is working, or its status cannot be read (the gateway is still stopped cleanly first)")
+	cmd.Flags().BoolVar(&hard, "hard", false, "EC2 force stop without a clean OS shutdown, for a wedged instance; skips the agent check")
+	cmd.Flags().BoolVar(&whenIdle, "when-idle", false, "stop once no agent is working; the box itself checks every 10 minutes")
+	cmd.MarkFlagsMutuallyExclusive("when-idle", "force", "hard", "after")
 
 	return cmd
+}
+
+func stopWhenIdle(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		out, status, err := runRemote(ctx, id, "devbox-agents stop-when-idle")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: %s", id, out)
+		if err := remoteStatusError(id, status); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func stopInstances(ctx context.Context, client *ec2.Client, ids []string) error {
@@ -72,6 +110,16 @@ func stopInstancesForce(ctx context.Context, client *ec2.Client, ids []string, f
 		)
 	}
 	return nil
+}
+
+// autostopDurationPattern is the grammar autostop.sh accepts for its window
+// file; it falls back to its default for anything else.
+var autostopDurationPattern = regexp.MustCompile(`^(off|[0-9]+(s|m|min|h|d)?)$`)
+
+// autostopAfterCommand writes the idle window file on the box. The value is
+// quoted for the remote shell.
+func autostopAfterCommand(duration string) string {
+	return "sudo mkdir -p /etc/devbox && printf '%s\\n' " + shellQuote(duration) + " | sudo tee /etc/devbox/autostop-after >/dev/null"
 }
 
 func scheduleStop(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, duration string, args []string) error {
@@ -102,17 +150,11 @@ func scheduleStop(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cli
 	ip := *inst.PublicIpAddress
 	keyPath := dcfg.ResolveSSHKeyPath()
 
-	var remoteCmd string
+	// The auto-stop poll reads the file every time; nothing to restart.
+	remoteCmd := autostopAfterCommand(duration)
 	if duration == "off" {
-		remoteCmd = `sudo mkdir -p /etc/devbox
-echo "off" | sudo tee /etc/devbox/autostop-after > /dev/null
-sudo systemctl stop devbox-autostop-sched.timer 2>/dev/null || true`
 		fmt.Printf("Disabling auto-stop on %s (%s)...\n", instanceID, ip)
 	} else {
-		remoteCmd = fmt.Sprintf(`sudo mkdir -p /etc/devbox
-echo %q | sudo tee /etc/devbox/autostop-after > /dev/null
-sudo systemctl stop devbox-autostop-sched.timer 2>/dev/null || true
-sudo systemctl restart devbox-schedule-autostop.service`, duration)
 		fmt.Printf("Setting auto-stop to %s on %s (%s)...\n", duration, instanceID, ip)
 	}
 

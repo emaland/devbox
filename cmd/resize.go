@@ -55,7 +55,7 @@ type resizePlan struct {
 }
 
 func newResizeCmd() *cobra.Command {
-	var resume bool
+	var resume, force bool
 
 	cmd := &cobra.Command{
 		Use:   "resize [instance-id] <new-type>",
@@ -93,15 +93,17 @@ resumable state machine. If it's interrupted, re-run with --resume.
 			default:
 				return fmt.Errorf("usage: devbox resize [instance-id] <new-type>  (or --resume)")
 			}
-			return resizeInstance(ctx, dcfg, ec2Client, r53client, instanceID, newType)
+			return resizeInstance(ctx, dcfg, ec2Client, r53client, stopGuard{force: force, out: os.Stdout}, instanceID, newType)
 		},
 	}
 
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume an interrupted resize")
+	cmd.Flags().BoolVar(&force, "force", false, "resize even if an agent is working, or its status cannot be read (the gateway is still stopped cleanly first)")
+	cmd.MarkFlagsMutuallyExclusive("resume", "force")
 	return cmd
 }
 
-func resizeInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, instanceID, newType string) error {
+func resizeInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, r53client *route53.Client, guard stopGuard, instanceID, newType string) error {
 	// Fail on a local config problem before the swap starts: the config push
 	// near the end needs the template, the keys file and the zone id.
 	dcfg, err := preflightNixConfig(ctx, dcfg, defaultNixFile(), findHostedZoneID)
@@ -127,6 +129,34 @@ func resizeInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.C
 	if currentType == newType {
 		fmt.Println("Already the requested type, nothing to do.")
 		return nil
+	}
+
+	// Both paths start by stopping a running instance: do it here, through
+	// the guard, so a working agent refuses the resize and the gateway is
+	// stopped cleanly first. The paths below then see a stopped instance.
+	if state == types.InstanceStateNameRunning || state == types.InstanceStateNamePending {
+		ids := []string{instanceID}
+		err := guard.run(ctx, ids,
+			func(ctx context.Context) error {
+				_, err := client.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: ids, DryRun: aws.Bool(true)})
+				return dryRunAllowed(err)
+			},
+			func(ctx context.Context) error {
+				fmt.Printf("Stopping instance %s...\n", instanceID)
+				if _, err := client.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: ids}); err != nil {
+					return fmt.Errorf("stopping instance: %w", err)
+				}
+				if err := waitStopped(ctx, client, instanceID); err != nil {
+					return fmt.Errorf("waiting for instance to stop: %w", err)
+				}
+				fmt.Println("Instance stopped.")
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+		state = types.InstanceStateNameStopped
+		inst.State.Name = state
 	}
 
 	// Spot instances don't support ModifyInstanceAttribute for type changes,

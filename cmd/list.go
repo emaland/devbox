@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -21,17 +22,52 @@ import (
 type onDemandPriceCache map[string]string
 
 func newStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var agents bool
+	cmd := &cobra.Command{
 		Use:     "status",
 		Aliases: []string{"list", "ls"},
 		Short:   "Show the devbox: state, IP, attached volumes, and spot price",
+		Long: `Show the devbox: state, IP, attached volumes, and spot price.
+With --agents, also what the agents on each running box are doing (one ssh
+call per running box).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listInstances(cmd.Context(), ec2Client)
+			return listInstancesWith(cmd.Context(), ec2Client, agents)
 		},
+	}
+	cmd.Flags().BoolVar(&agents, "agents", false, "add an AGENTS column (asks each running box over ssh)")
+	return cmd
+}
+
+// agentsColumn is the AGENTS cell for one instance.
+func agentsColumn(ctx context.Context, inst types.Instance) string {
+	if inst.State == nil || inst.State.Name != types.InstanceStateNameRunning || inst.InstanceId == nil {
+		return "-"
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	s, err := readAgents(ctx, *inst.InstanceId)
+	if err != nil {
+		return "?"
+	}
+	switch s.State {
+	case "busy":
+		return fmt.Sprintf("busy (%d running, %d waiting)", s.Running, s.Waiting)
+	case "waiting":
+		return fmt.Sprintf("waiting for you (%d)", s.Waiting)
+	case "idle":
+		return "idle"
+	case "none":
+		return "no gateway"
+	default:
+		return "not answering"
 	}
 }
 
 func listInstances(ctx context.Context, client *ec2.Client) error {
+	return listInstancesWith(ctx, client, false)
+}
+
+func listInstancesWith(ctx context.Context, client *ec2.Client, withAgents bool) error {
 	input := &ec2.DescribeInstancesInput{
 		Filters: []types.Filter{
 			{
@@ -62,7 +98,11 @@ func listInstances(ctx context.Context, client *ec2.Client) error {
 	volNames := resolveAttachedVolumeNames(ctx, client, instances)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "INSTANCE ID\tNAME\tTYPE\tSTATE\tAZ\tPUBLIC IP\t$/hr\tVOLUMES")
+	header := "INSTANCE ID\tNAME\tTYPE\tSTATE\tAZ\tPUBLIC IP\t$/hr\tVOLUMES"
+	if withAgents {
+		header += "\tAGENTS"
+	}
+	fmt.Fprintln(w, header)
 
 	odCache := onDemandPriceCache{}
 	for _, inst := range instances {
@@ -85,7 +125,7 @@ func listInstances(ctx context.Context, client *ec2.Client) error {
 				price = p + " (on-demand)"
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
 			*inst.InstanceId,
 			name,
 			string(inst.InstanceType),
@@ -95,6 +135,10 @@ func listInstances(ctx context.Context, client *ec2.Client) error {
 			price,
 			describeAttachedVolumes(inst, volNames),
 		)
+		if withAgents {
+			row += "\t" + agentsColumn(ctx, inst)
+		}
+		fmt.Fprintln(w, row)
 	}
 	w.Flush()
 	return nil
