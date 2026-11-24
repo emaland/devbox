@@ -6,7 +6,9 @@ the code reviews of the implementation changed (sections 2.2, 2.3, 2.4, 2.6,
 first review (every CLI stop path, stale spot notices, a requested stop while
 the gateway restarts, where `resume status` reads its source); revision 3
 takes the diff check's two remaining points (the unreachable rule in time,
-and no cap exemption for attached clients). Builds on note 030 (the gateway as a
+and no cap exemption for attached clients). After revision 4, issue 14
+widened the token file check to the gateway's own rule and ended a spot
+notice 5 min after its action time (sections 2.2 and 2.3). Builds on note 030 (the gateway as a
 system unit). Covers auto-stop, the spot interruption watcher, the stop paths
 and resume on boot. The CLI commands that sit on top (`devbox agents`,
 `devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
@@ -91,15 +93,18 @@ the caller treats that as "not installed" and logs nothing.
 - One `GET http://127.0.0.1:<port>/status`, 3 s limit.
 - **The token** is read from the token file by root (auto-stop, watcher,
   boot notification) or by the user (`devbox-agents`). It must be one line of
-  printable ASCII with no quote or backslash; otherwise the request is not
+  printable ASCII with no quote or backslash; one trailing CRLF or LF is
+  dropped, as the gateway drops it. Otherwise the request is not
   made and the result is "unreachable: token file unusable". It is given to
   curl as a config file on standard input (`-K -`), so it never appears on a
   command line, in the environment or in a log.
 - **Only to the gateway.** The token file must be a regular file, not a
-  link, mode 0600, as the gateway itself requires; it is read with a size
-  bound, so root cannot be pointed at another file, a FIFO or a device. The
-  token is sent only when the process listening on `127.0.0.1:<port>`
-  (`ss -tlne`) belongs to the token file's owner. While the gateway is down,
+  link, with no group or other permission bits (0600 and 0400 both do), as
+  the gateway itself requires; it is read with a size bound, so root cannot
+  be pointed at another file, a FIFO or a device. The token is sent only
+  when the process listening on `127.0.0.1:<port>` (`ss -tlne`) belongs to
+  the token file's owner. `ss` prints no `uid:` for a socket owned by root,
+  so such a listener counts as uid 0, not as nothing listening. While the gateway is down,
   which is exactly when these checks run (after a spot stop, at boot, during
   a restart), another local user could otherwise bind the port and collect
   the token. Otherwise the result is "unreachable" with the reason.
@@ -178,7 +183,10 @@ starts being unreachable and again when the reason changes.
    `busy-since` restart and a requested stop is dropped. Trying again at the
    next poll would stop the gateway every 10 minutes, and each stop uses up
    the interrupted turns' one continuation. The gateway is not started again
-   while the spot watcher has a current interruption notice.
+   while the spot watcher has a current interruption notice: one that is
+   not stale, not done, and whose action time is less than 5 min ago (the
+   watcher's own limit, section 2.4). The time limit ends a notice that found
+   the gateway already down, which the watcher never marks done.
 4. The poll has a start timeout (the gateway's stop bound plus 15 s plus
    120 s), so one that hangs cannot hold off every later poll.
 

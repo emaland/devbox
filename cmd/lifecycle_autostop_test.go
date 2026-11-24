@@ -355,7 +355,8 @@ func TestAutostopUnusableTokenFile(t *testing.T) {
 		"two lines":  "abcdef\nghijkl\n",
 		"empty":      "",
 		"backslash":  `abc\def`,
-		"whitespace": "abc def\n",
+		"tab":        "abc\tdef\n",
+		"two CRs":    "abcdef\r\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newLifecycleBox(t)
@@ -757,5 +758,98 @@ func TestNotifyWebhookFileParsing(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("the webhook file was run")
+	}
+}
+
+// Issue 14, point 1: whatever token file the gateway accepts is accepted
+// here too. Otherwise every poll is "unreachable" and a busy agent no longer
+// keeps the box up.
+func TestGatewayStatusAcceptsWhatTheGatewayAccepts(t *testing.T) {
+	cases := map[string]func(b *lifecycleBox, token string){
+		"mode 0400": func(b *lifecycleBox, token string) {
+			if err := os.Chmod(token, 0o400); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"mode 0700": func(b *lifecycleBox, token string) {
+			if err := os.Chmod(token, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a CRLF line end": func(b *lifecycleBox, token string) {
+			b.write("token", lifecycleToken+"\r\n")
+		},
+		"no line end": func(b *lifecycleBox, token string) {
+			b.write("token", lifecycleToken)
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.gateway.set(200, statusJSON(1, 0, 0))
+			setup(b, filepath.Join(b.root, "token"))
+			out, status := b.run("gateway-status.sh")
+			if status != 0 || !strings.HasPrefix(out, "busy\n") {
+				t.Fatalf("exit %d output %q", status, out)
+			}
+		})
+	}
+	b := newLifecycleBox(t)
+	if err := os.Chmod(filepath.Join(b.root, "token"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, status := b.run("gateway-status.sh"); status != 2 || !strings.Contains(out, "token file unusable") {
+		t.Fatalf("group-readable: exit %d output %q", status, out)
+	}
+}
+
+// Issue 14, point 3: ss prints no uid: for a socket owned by root. Such a
+// listener is root's, not "nothing listening", and gets no token unless the
+// token file is root's too.
+func TestGatewayStatusSeesARootListener(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("the token file would be root's")
+	}
+	b := newLifecycleBox(t)
+	b.write("listener-uid", "0\n")
+	out, status := b.run("gateway-status.sh")
+	if status != 2 || !strings.Contains(out, "not the gateway's user") {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if requests != 0 {
+		t.Fatal("the token was sent to root's listener")
+	}
+}
+
+// Issue 14, point 2: a notice that found the gateway already down is never
+// marked done. It stops counting as an interruption under way 5 min after
+// its action time, so a failed stop after that starts the gateway again.
+func TestAutostopSpotNoticeEndsAfterItsActionTime(t *testing.T) {
+	for name, tc := range map[string]struct {
+		after   int64 // seconds from the action time to this poll
+		started int
+	}{
+		"within 5 min": {after: 299, started: 0},
+		"after 5 min":  {after: 301, started: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.write("aws-exit", "255\n")
+			b.autostopAllowFailure()
+			b.advance(4 * hour)
+			if err := os.MkdirAll(filepath.Join(b.root, "spot", "notice-stop_x"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			b.write("spot/notice-stop_x/seen", "")
+			b.write("spot/notice-stop_x/stopped", "not running\n")
+			b.write("spot/notice-stop_x/time", fmt.Sprintf("%d\n", fakeStart+4*hour-tc.after))
+			b.autostopAllowFailure()
+			if got := b.count(gatewayStart); got != tc.started {
+				t.Fatalf("gateway started %d times, want %d: %v", got, tc.started, b.calls())
+			}
+		})
 	}
 }

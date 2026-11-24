@@ -33,23 +33,37 @@ esac
 [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || unreachable "client config has no port"
 
 # A regular file, not a link (root runs this and must not be pointed at
-# another file, a FIFO or a device), private to its owner, as the gateway
-# itself requires.
+# another file, a FIFO or a device), with no group or other permission bits,
+# as the gateway itself requires.
 [ -n "$token_file" ] && [ -f "$token_file" ] && [ ! -L "$token_file" ] || unreachable "token file unusable"
-[ "$(stat -c %a "$token_file" 2>/dev/null)" = 600 ] || unreachable "token file unusable (not mode 0600)"
+mode="$(stat -c %a "$token_file" 2>/dev/null)"
+case "$mode" in
+  *[!0-7]* | "") unreachable "token file unusable" ;;
+  *00) ;;
+  *) unreachable "token file unusable (readable by group or others)" ;;
+esac
 owner="$(stat -c %u "$token_file" 2>/dev/null)" || unreachable "token file unusable"
-# One line, then only the characters a generated token uses. Anything else
-# (a quote or a backslash would change the curl config) is refused.
+# One line, with one CRLF or LF line end, as the gateway reads it. Then
+# printable ASCII only, and no quote or backslash, which would change the
+# curl config.
 [ "$(head -c 4096 "$token_file" | wc -l)" -le 1 ] || unreachable "token file unusable"
 token="$(head -c 4096 "$token_file")" || unreachable "token file unusable"
+cr="$(printf '\r')"
+token="${token%"$cr"}"
 case "$token" in
-  "" | *[!A-Za-z0-9._~+/=-]*) unreachable "token file unusable" ;;
+  "" | *[!\ -~]* | *\"* | *\\*) unreachable "token file unusable" ;;
 esac
 
 # Send the token only to the gateway: the process listening on the port must
 # belong to the token file's owner. While the gateway is down, another local
 # user could otherwise bind the port and collect the token.
-listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null | sed -n "s/.*[[:space:]]127\.0\.0\.1:${port}[[:space:]].*uid:\([0-9][0-9]*\).*/\1/p")"
+# ss prints no uid: for a socket owned by root, so such a line is uid 0.
+listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null | sed -n "
+/[[:space:]]127\.0\.0\.1:${port}[[:space:]]/ {
+  s/.*[[:space:]]uid:\([0-9][0-9]*\).*/\1/p
+  t
+  s/.*/0/p
+}")"
 [ -n "$listeners" ] || unreachable "nothing listening on 127.0.0.1:$port"
 for uid in $listeners; do
   [ "$uid" = "$owner" ] || unreachable "the listener on port $port is not the gateway's user"

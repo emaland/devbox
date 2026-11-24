@@ -261,7 +261,10 @@ func newLifecycleBox(t *testing.T) *lifecycleBox {
 		"ss": `case "$*" in
   *-Htlne*)
     uid="$(cat "$FAKE_ROOT/listener-uid" 2>/dev/null || id -u)"
-    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:* uid:$uid ino:1 sk:1 cgroup:/x <->"
+    # As the real ss does, no uid: for a socket owned by root.
+    owner=" uid:$uid"
+    [ "$uid" = 0 ] && owner=""
+    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:*$owner ino:1 sk:1 cgroup:/x <->"
     exit 0 ;;
 esac
 record ss "$@"; cat "$FAKE_ROOT/ss" 2>/dev/null; exit 0`,

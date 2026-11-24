@@ -97,9 +97,18 @@ imds() {
 }
 
 # spot_interruption_under_way: the spot watcher has a current notice.
+# A notice is current until it is done, or until 5 min after its action time
+# (the watcher's own limit), whichever is first: a notice that found the
+# gateway already down is never marked done. One without a readable time
+# stays current.
 spot_interruption_under_way() {
   for notice in "${DEVBOX_SPOT_STATE:-/run/devbox-spot-watch}"/notice-*; do
-    [ -f "$notice/seen" ] && [ ! -f "$notice/stale" ] && [ ! -f "$notice/done" ] && return 0
+    [ -f "$notice/seen" ] && [ ! -f "$notice/stale" ] && [ ! -f "$notice/done" ] || continue
+    at_epoch="$(cat "$notice/time" 2>/dev/null)"
+    case "$at_epoch" in
+      "" | *[!0-9]*) return 0 ;;
+    esac
+    [ "$(date +%s)" -lt $((at_epoch + 300)) ] && return 0
   done
   return 1
 }
