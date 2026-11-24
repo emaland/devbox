@@ -1,6 +1,10 @@
-# 031: Devbox lifecycle: auto-stop that sees agents, spot notices, clean stop, resume on boot
+# 031: Devbox lifecycle: auto-stop that sees agents, spot notices, clean stop, interrupted turns on boot
 
-Status: **accepted at design review, revision 4.** Revision 4 records what
+Status: **accepted at design review, revision 5.** Revision 5 follows D24:
+the gateway restores and notifies after a restart and never continues a
+turn by itself, and has no resume switch. The module sets no resume
+settings, `devbox-agents resume` is gone, and the boot line reports how many
+turns wait for a person (sections 2.3, 2.4, 2.6, 2.7, 2.8, 3, 4, 6). Revision 4 records what
 the code reviews of the implementation changed (sections 2.2, 2.3, 2.4, 2.6,
 2.8). Revision 2 answered the
 first review (every CLI stop path, stale spot notices, a requested stop while
@@ -8,7 +12,7 @@ the gateway restarts, where `resume status` reads its source); revision 3
 takes the diff check's two remaining points (the unreachable rule in time,
 and no cap exemption for attached clients). Builds on note 030 (the gateway as a
 system unit). Covers auto-stop, the spot interruption watcher, the stop paths
-and resume on boot. The CLI commands that sit on top (`devbox agents`,
+and what the box reports about interrupted turns at boot. The CLI commands that sit on top (`devbox agents`,
 `devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
 only for what they need from the box.
 
@@ -24,7 +28,9 @@ The box is meant for "start a long agent task and walk away". Today:
 - Nothing stops the gateway on purpose before the instance goes down. It is
   left to the OS shutdown, whose length EC2 does not state (section 1.1).
 - When the box comes back, interrupted turns stay interrupted unless someone
-  continues each one by hand.
+  continues each one by hand. D24 keeps that: the gateway restores each chat
+  and marks the turn, and a person presses Try Again. What this note adds is
+  that the box says how many turns wait.
 
 ### 1.1 How long does a stop give systemd? (DU1)
 
@@ -72,7 +78,7 @@ terraform/devbox/lifecycle/
   autostop.sh          one auto-stop decision
   spot-watch.sh        the watcher loop (and --once for tests)
   notify.sh            boot-history line plus optional webhook post
-  resume-summary.sh    the auto-resume line for the boot notification
+  resume-summary.sh    the interrupted-turns line for the boot notification
   devbox-agents.sh     the box-side command the CLI runs over ssh
 ```
 
@@ -141,8 +147,8 @@ cap (`/etc/devbox/autostop-busy-cap`, default 12 h, `off` disables it),
 | 10 | `stop-when-idle` requested (2.6), and the gateway answered idle or waiting, or no gateway is installed, or it has been unreachable without a break for 30 min | **stop** (requested), logins ignored | `unreachable-since` |
 
 Row 10 never stops on an unreachable answer alone: right after boot, during
-start-up repair or a restart after a crash, the gateway cannot yet report the
-continuations it is about to start. Thirty minutes unreachable is "the
+start-up repair or a restart after a crash, the gateway cannot yet report its
+turns. Thirty minutes unreachable is "the
 gateway is not coming back", and the box is not kept up for it. The rule is
 in time, not polls, because each request also runs a poll at once.
 
@@ -152,10 +158,8 @@ nobody is watching. An attached editor does not: a laptop left awake with a
 tunnel up must not keep a stuck agent running, and a tunnel over ssh already
 counts as a login. A turn that waits for permission is not activity
 (row 5), so a box left with a question on screen stops after the idle window
-like before. The waiting turn is continued at the next start, once and only
-within the gateway's maximum age for continuations; a second interruption, or
-a start more than that age later, leaves it as an interrupted turn the person
-continues by hand.
+like before. At the next start the waiting turn is shown as interrupted and
+waits for the person's Try Again or a new message (D24).
 
 **Logging.** `/var/log/boot-history` gets a line in the existing
 three-field format, `<time> | auto-stop | <decision>`, when the decision differs from
@@ -173,12 +177,12 @@ starts being unreachable and again when the reason changes.
    prevent step 3: the OS shutdown tries again.
 3. `aws ec2 stop-instances` on itself, as today. If it fails, the failure is
    logged and noticed **once**, and the gateway is started again, so the box
-   is not left running with its work interrupted and nothing to continue it.
-   The next try is a full idle window (or cap) later: `last-active` and
-   `busy-since` restart and a requested stop is dropped. Trying again at the
-   next poll would stop the gateway every 10 minutes, and each stop uses up
-   the interrupted turns' one continuation. The gateway is not started again
-   while the spot watcher has a current interruption notice.
+   is not left running with its agents stopped for nothing. The next try is
+   a full idle window (or cap) later: `last-active` and `busy-since` restart
+   and a requested stop is dropped. Trying again at the next poll would stop
+   the gateway every 10 minutes, and each stop interrupts whatever a person
+   has continued since. The gateway is not started again while the spot
+   watcher has a current interruption notice.
 4. The poll has a start timeout (the gateway's stop bound plus 15 s plus
    120 s), so one that hangs cannot hold off every later poll.
 
@@ -210,9 +214,8 @@ notice stops it.
 **Stale notices.** EC2 says notices are best effort and documents at least
 one metadata item that stays after the event with a time in the past. A
 notice that outlives its event must not stop the gateway at the next boot,
-which would interrupt the continuations that just started and use up their
-one attempt. Hence the two time checks above; boot time is read from
-`/proc/stat` (`btime`).
+which would interrupt turns a person had just continued. Hence the two time
+checks above; boot time is read from `/proc/stat` (`btime`).
 
 **State.** Per key, in `/run/devbox-spot-watch/` (0700, root): `seen`
 (logged), `stopping` (written before `systemctl stop`), `stopped` (written
@@ -275,19 +278,11 @@ ssh path:
 - `devbox-agents status [--json]`: the classification, the session total and
   the turn counts from the status endpoint (it has no per-session list);
   non-zero exit when the gateway is unreachable.
-- `devbox-agents resume status`: the `resume` object of the status endpoint,
-  which is the running gateway's effective value and its source. It does not
-  ask the gateway's command, because the gateway module's wrapper points that
-  command at the client config in `/etc`, which has no `resume` key; a
-  command that worked out the install default from that file would report
-  `off` while the running gateway is on `continue`. DV-A and GW-R are told.
-- `devbox-agents resume on|off`: runs the gateway's own `resume` command
-  through the gateway module's wrapper, named by its absolute store path
-  (`services.ahp-gateway.generated.commands`), never looked up on `PATH`,
-  where a copy of the gateway the user installed could come first. It writes
-  nothing itself. When the build or its wrapper does not offer `resume`, it
-  says so and exits non-zero. It never starts the bare gateway command, which
-  for the public release would start a second server.
+- There is no `devbox-agents resume`: D24 removed the gateway's resume
+  switch, so there is nothing to show or set. `devbox agents resume` on the
+  laptop says so, contacts nothing, and is not taken for an instance id.
+  `status` includes `interrupted`, the gateway's `resume.interrupted` (turns
+  that ended `host_restarted` and wait for a person).
 - `devbox-agents stop-when-idle [cancel]`: writes or removes
   `/run/devbox-autostop/stop-when-idle` with `sudo` (the box's user is in
   `wheel` with passwordless sudo, which the CLI already relies on), then runs
@@ -295,34 +290,28 @@ ssh path:
 
 `devbox stop --when-idle` uses row 10.
 
-### 2.7 Resume on boot
+### 2.7 Interrupted turns on boot
 
-When the gateway is enabled, the lifecycle module sets, with `mkDefault`:
-
-```nix
-services.ahp-gateway.settings.resume = { onStart = "continue"; maxAttemptsPerTurn = 1; };
-```
-
-It does not set `AHP_GATEWAY_RESUME` in the unit, so a persisted
-`devbox agents resume off` still wins over this install default. A build that
-does not know `resume` ignores the key; whether resume is really available is
-read from `/status`, never from the config being accepted. The gateway module
-is not changed.
+D24: after a restart the gateway restores every chat and ends each
+interrupted turn as `host_restarted` with a notice; it never starts or
+prompts an agent by itself, and has no resume setting (design C3). The
+module therefore sets nothing in the gateway's `resume` settings. Since
+nothing is going to start, there is nothing to wait for.
 
 The boot notification (`devbox-slack-notify.service`) gains one line from
 `resume-summary.sh`. It already runs once per boot after the network; it now
 also runs after `ahp-gateway.service` (which, with the readiness check in the
-gateway module's open change, means after the gateway is ready or has
-failed) and waits up to 180 s for `/status` to report no pending
-continuations. Its post goes through `notify.sh`, so the user's secrets file
+gateway module, means after the gateway is ready or has failed) and asks
+`/status` once. Its post goes through `notify.sh`, so the user's secrets file
 is read for the one address it needs instead of being run as a shell script
 by root. The unit gets `restartIfChanged = false`, so deploying this change
 does not send a spurious "booted" post. It reports:
 
 | `/status` | Line |
 |---|---|
-| `resume` present | `auto-resume: <policy> (<source>): continued N, failed F, skipped S` (`, still pending P` when the wait ran out) |
-| answered, no `resume` | `auto-resume: not reported by this gateway build` |
+| `resume.interrupted` is N > 0 | `interrupted turns: N, waiting for Try Again or a new message` |
+| `resume.interrupted` is 0 | `interrupted turns: none` |
+| answered, no `resume.interrupted` | `interrupted turns: not reported by this gateway build` |
 | unreachable | `gateway: not answering (<reason>)` |
 | no gateway | no line |
 
@@ -337,7 +326,9 @@ does not send a spurious "booted" post. It reports:
 | `autostop.defaultBusyCap` | `"12h"` | Used when the cap file is absent |
 | `spotWatch.enable` | `true` | The watcher |
 | `spotWatch.pollSeconds` | `5` | |
-| `resumeOnBoot` | `true` | The settings in 2.7 |
+
+`resumeOnBoot` was removed with D24; a config that still sets it fails
+evaluation with the reason.
 
 There is no `user` option and no sudo rule of the module's own: `devbox-agents
 stop-when-idle` uses `sudo`, which on this box's user is passwordless through
@@ -358,19 +349,18 @@ boot notification already reads.
 | Watcher | Rely on the OS shutdown at the end of the notice | EC2 does not document one |
 | Watcher | EventBridge rule outside the instance | Creates AWS resources and needs a path back into the box |
 | Stop order | Stop the instance and let systemd stop the gateway | The OS shutdown's time is not documented |
-| Resume toggle | Set `AHP_GATEWAY_RESUME=continue` in the unit | Would override the user's persisted `off` |
+| Interrupted turns | Have the module make the gateway continue them at start (revisions 1 to 4) | D24: the host never continues a turn by itself |
 | `--when-idle` | Wait on the laptop until idle, then stop | The laptop has to stay up and connected |
 
 ## 4. Effect on the gateway contracts
 
 None changed. The design reads the busy definition of the status endpoint
-exactly as the gateway defines it, sets only the install default of the
-resume switch, and calls the gateway's own `resume` command. It needs, from
-the gateway: the status endpoint with `turns` and `resume`; a clean stop on
-SIGTERM within its stop bound; the `resume` command offered through the
-module's wrapper (`managementCommands`). Until a build has them, auto-stop
-behaves as today plus logging, the watcher still stops the gateway in time,
-and the boot line says the build does not report resume.
+exactly as the gateway defines it (C2), and the `resume.interrupted` count.
+It needs, from the gateway: the status endpoint with `turns` and
+`resume.interrupted`; a clean stop on SIGTERM within its stop bound. It sets
+no gateway settings and runs no gateway command. Until a build has the
+count, auto-stop behaves as today plus logging, the watcher still stops the
+gateway in time, and the boot line says the build does not report it.
 
 ## 5. Migration and rollback
 
@@ -393,20 +383,21 @@ approval per run) is the only place the real EC2 timings can be seen.
 | Row 10: a requested stop does not happen on quick repeated unreachable polls, nor before 30 min unreachable after an answer, and does at 30 min; an attached client does not hold off the cap | Same harness | shell |
 | Watcher: no notice; stop notice (gateway stopped once, notice posted once, not repeated after a watcher restart, redone when the watcher died before `stopped` was written); rebalance (notice, no stop); a notice dated before boot or more than 2 min in the past (no stop); metadata unreachable (logged once) and recovering; token renewal on 401; still running 5 min after the action time, with the notice still shown, starts the gateway once | Go test runs `spot-watch.sh --once` repeatedly, and once in its loop, against a fake metadata server, with boot time and clock from fakes | shell |
 | CLI guard on `down`, `restart`, `reboot`, `terminate`, `resize`: refuses busy and unreadable, `--force` goes on, `--hard` skips ssh, a failed dry run stops before the gateway is touched, a failed EC2 call starts the gateway again, several ids are all checked first | Go tests with the ssh call and EC2 faked | Go |
-| Resume summary: each row of 2.7, and the wait ending while still pending | Go test with the HTTP server | shell |
-| `devbox-agents resume` never runs the bare gateway command | Go test with a fake wrapper that refuses | shell |
-| Module evaluates; the units and timers have the intended settings; `resume.onStart` reaches the gateway's config and a user value wins; the 60 s assertion fires | `nix-instantiate` and assertions on the evaluated config | evaluation |
+| Boot line: each row of 2.7, asked once with no wait | Go test with the HTTP server | shell |
+| No resume command: `devbox-agents resume` is a usage error and runs nothing; `devbox agents resume` prints why and contacts nothing | Go tests | shell, Go |
+| Module evaluates; the units and timers have the intended settings; no `resume` settings are set; `resumeOnBoot` fails with the reason; the 60 s assertion fires | `nix-instantiate` and assertions on the evaluated config | evaluation |
 | The gateway unit is ordered against `/home` | Assertion on the evaluated unit | evaluation |
 | Scripts pass shellcheck | `scripts/check.sh shell` | static |
 | The system builds | `nixos-rebuild build`, no switch | by hand |
 
 **Needs a VM or a real instance; unverified here** (this machine has no KVM):
 a busy turn keeps a booted system up past a short idle window; a fake metadata
-notice stops the gateway before the unit's timeout; a reboot continues an
-interrupted turn exactly once; shutdown stops the gateway before `/home` is
-unmounted. These are written as NixOS VM tests with a stub gateway, evaluated
-locally, and run on a machine with KVM; continuing a real turn exactly once
-needs the gateway build that implements resume.
+notice stops the gateway before the unit's timeout; after a reboot an
+interrupted turn is reported as waiting and nothing is continued; shutdown
+stops the gateway before `/home` is unmounted. These are written as NixOS VM
+tests with a stub gateway, evaluated locally, and run on a machine with KVM.
+That a real turn is restored with its notice and continues on Try Again is
+the rehearsal's (INS-128) and the gateway's own test.
 
 ## 7. Open points
 

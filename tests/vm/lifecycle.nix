@@ -3,12 +3,13 @@
 #   1. a busy agent keeps the box up past the idle window; once idle it stops
 #   2. a spot interruption notice from a fake metadata service stops the
 #      gateway cleanly, well inside the unit's stop timeout
-#   3. after a reboot the interrupted turn is continued once, and a second
-#      reboot with nothing interrupted continues nothing
+#   3. after a reboot the interrupted turn is reported as waiting for a
+#      person and nothing is continued (D24); a second reboot with nothing
+#      interrupted reports none
 #
 # The gateway is a stub (stub-gateway.js) that speaks only the status
-# endpoint and records clean stops and continuations; whether the real
-# gateway continues a turn exactly once is the gateway's own test. Needs a
+# endpoint and records clean stops; that the real gateway restores and
+# notifies is the gateway's own test. Needs a
 # machine with KVM:
 #
 #   nix-build tests/vm/lifecycle.nix
@@ -129,23 +130,25 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl start ahp-gateway.service")
         machine.wait_for_unit("ahp-gateway.service")
 
-    with subtest("after a reboot the interrupted turn is continued once"):
+    with subtest("after a reboot the interrupted turn waits for a person"):
         machine.succeed(f"rm -f {state}/continued")
         turns(1)
         machine.shutdown()
         machine.start()
         machine.wait_for_unit("ahp-gateway.service")
         machine.wait_until_succeeds("curl -sf http://127.0.0.1:8765/healthz")
-        continued = machine.succeed(f"cat {state}/continued | wc -l").strip()
-        assert continued == "1", f"continued {continued} turns, want 1"
-        machine.succeed("grep -q '\"onStart\": *\"continue\"' /run/ahp-gateway/config.json")
+        status = json.loads(machine.succeed("devbox-agents status --json"))
+        assert status["interrupted"] == 1 and status["running"] == 0, f"after an interrupted reboot: {status}"
+        machine.fail(f"test -s {state}/continued")
+        machine.fail("grep -q onStart /run/ahp-gateway/config.json")
 
-        # Nothing interrupted this time: nothing continued.
+        # Nothing interrupted this time: none reported.
         turns(0)
         machine.shutdown()
         machine.start()
         machine.wait_for_unit("ahp-gateway.service")
-        continued = machine.succeed(f"cat {state}/continued | wc -l").strip()
-        assert continued == "1", f"continued {continued} turns after a clean idle reboot, want still 1"
+        machine.wait_until_succeeds("curl -sf http://127.0.0.1:8765/healthz")
+        status = json.loads(machine.succeed("devbox-agents status --json"))
+        assert status["interrupted"] == 0, f"after a clean idle reboot: {status}"
   '';
 }

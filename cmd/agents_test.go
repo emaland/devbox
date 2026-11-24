@@ -449,3 +449,24 @@ func TestAgentStatusString(t *testing.T) {
 		}
 	}
 }
+
+// D24: the gateway has no resume switch. `devbox agents resume` says so and
+// contacts nothing, rather than taking "resume" for an instance id.
+func TestAgentsResumeSaysThereIsNoSwitch(t *testing.T) {
+	for _, args := range [][]string{{"resume"}, {"resume", "on"}, {"resume", "off", "i-x"}} {
+		f := newFakeRemote(t)
+		agents := newAgentsCmd()
+		var out bytes.Buffer
+		agents.SetOut(&out)
+		agents.SetArgs(args)
+		if err := agents.Execute(); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if !strings.Contains(out.String(), "Try Again") {
+			t.Fatalf("%v: output %q", args, out.String())
+		}
+		if len(f.events) != 0 {
+			t.Fatalf("%v: contacted the box: %v", args, f.events)
+		}
+	}
+}

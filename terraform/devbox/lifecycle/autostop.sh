@@ -203,7 +203,7 @@ if [ "$gateway_state" = busy ]; then
   busy_for=$((now - busy_since))
   if [ "$cap" != off ] && [ "$busy_for" -ge "$cap" ]; then
     stop_box "busy ${busy_for}s >= cap ${cap}s" \
-      "agents busy for ${busy_for}s, past the ${cap}s cap ($(turns "$gateway_json")); stopping anyway. Interrupted turns continue at the next start if auto-resume is on."
+      "agents busy for ${busy_for}s, past the ${cap}s cap ($(turns "$gateway_json")); stopping anyway. Interrupted turns wait for Try Again at the next start."
   fi
   decide "active (agent busy)"
   exit 0

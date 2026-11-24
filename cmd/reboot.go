@@ -16,8 +16,8 @@ func newRebootCmd() *cobra.Command {
 		Use:   "reboot [instance-id...]",
 		Short: "Reboot instances (in-place, same host)",
 		Long: `Reboot instances in place. Refused while an agent is working; the
-gateway is stopped cleanly first, and auto-resume continues interrupted turns
-after the boot.`,
+gateway is stopped cleanly first; each interrupted turn then waits for Try
+Again (or a new message) after the boot.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

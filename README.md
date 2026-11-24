@@ -357,17 +357,17 @@ A rebalance recommendation (an early warning that may never be followed by an in
 
 The data volume survives. A persistent spot request starts the instance again when capacity returns. An auto-stopped box stays stopped until `devbox up`.
 
-### Auto-resume after a stop
+### Interrupted turns after a stop
 
-When the box comes back, the gateway continues, **once**, each turn that was interrupted by the stop. The agent is told the host restarted and to check whether its last command or edit finished. The boot notification says how many turns were continued. A turn that was waiting for your permission asks again.
+When the box comes back, the gateway restores every chat with its history. A turn that a stop interrupted is marked as interrupted, with the time it stopped. The gateway never continues it by itself, and there is no setting to make it do so.
+
+To continue the turn, press **Try Again** in the editor, or send a new message. The agent is then told that the host restarted, and asked to check whether its last command or edit finished. A turn that was waiting for your permission asks again.
+
+The boot notification says how many turns are waiting. So does `devbox agents`:
 
 ```bash
-devbox agents resume status     # on or off, and where the setting comes from
-devbox agents resume off        # stop continuing turns; also cancels any not yet started
-devbox agents resume on
+devbox agents     # ...; 2 interrupted, waiting for Try Again
 ```
-
-Auto-resume is on by default on the devbox. The setting is kept on the box and survives reboots and config pushes. To make "off" the box's default instead, set `services.devbox-lifecycle.resumeOnBoot = false;` in your `local.nix`. `devbox agents resume` needs a gateway build that offers the `resume` command (listed in `services.ahp-gateway.managementCommands`). Otherwise it says the build does not offer it.
 
 ### VS Code and Zed against the devbox
 

@@ -19,6 +19,8 @@ func (b *lifecycleBox) fakeProgram(name, body string) {
 	}
 }
 
+// D24: the gateway never continues a turn by itself. The boot line says how
+// many turns were interrupted and wait for a person.
 func TestResumeSummary(t *testing.T) {
 	statusWith := func(resume string) string {
 		return `{"ok": true, "sessions": {"total": 2}, "turns": {"active": 0, "waitingForUser": 0}` + resume + `}`
@@ -29,23 +31,19 @@ func TestResumeSummary(t *testing.T) {
 		want  string
 	}{
 		{
-			name: "resume reported",
-			setup: func(b *lifecycleBox) {
-				b.gateway.set(200, statusWith(`, "resume": {"policy": "continue", "source": "config", "pending": 0, "resumedSinceStart": 2, "failed": 1, "skipped": 0}`))
-			},
-			want: "auto-resume: continue (config): continued 2, failed 1, skipped 0\n",
+			name:  "interrupted turns",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWithInterrupted(2)) },
+			want:  "interrupted turns: 2, waiting for Try Again or a new message\n",
 		},
 		{
-			name: "still pending when the wait runs out",
-			setup: func(b *lifecycleBox) {
-				b.gateway.set(200, statusWith(`, "resume": {"policy": "continue", "source": "state", "pending": 1, "resumedSinceStart": 0, "failed": 0, "skipped": 0}`))
-			},
-			want: "auto-resume: continue (state): continued 0, failed 0, skipped 0, still pending 1\n",
+			name:  "none interrupted",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWithInterrupted(0)) },
+			want:  "interrupted turns: none\n",
 		},
 		{
-			name:  "build without resume",
+			name:  "build without the count",
 			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith("")) },
-			want:  "auto-resume: not reported by this gateway build\n",
+			want:  "interrupted turns: not reported by this gateway build\n",
 		},
 		{
 			name:  "gateway not answering",
@@ -61,7 +59,6 @@ func TestResumeSummary(t *testing.T) {
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
 			b := newLifecycleBox(t)
-			b.env = append(b.env, "DEVBOX_RESUME_WAIT=2", "DEVBOX_RESUME_POLL=1")
 			r.setup(b)
 			out, status := b.run("resume-summary.sh")
 			if status != 0 || out != r.want {
@@ -72,18 +69,18 @@ func TestResumeSummary(t *testing.T) {
 	}
 }
 
-// The summary waits until nothing is pending, then reports.
-func TestResumeSummaryWaitsForPendingContinuations(t *testing.T) {
+// Nothing is going to start, so the boot line asks once and does not wait.
+func TestResumeSummaryAsksOnce(t *testing.T) {
 	b := newLifecycleBox(t)
-	b.env = append(b.env, "DEVBOX_RESUME_WAIT=30", "DEVBOX_RESUME_POLL=1")
-	// Pending for two requests, then the continuation has started.
-	done := strings.Replace(statusJSON(1, 0, 0), `"resumedSinceStart": 0`, `"resumedSinceStart": 1`, 1)
-	b.gateway.mu.Lock()
-	b.gateway.sequence = []string{statusJSON(0, 0, 1), statusJSON(0, 0, 1), done}
-	b.gateway.mu.Unlock()
-	out, status := b.run("resume-summary.sh")
-	if status != 0 || out != "auto-resume: continue (config): continued 1, failed 0, skipped 0\n" {
+	b.gateway.set(200, statusJSON(0, 0, 1))
+	if out, status := b.run("resume-summary.sh"); status != 0 || out != "interrupted turns: none\n" {
 		t.Fatalf("exit %d, output %q", status, out)
+	}
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if requests != 1 {
+		t.Fatalf("%d status requests, want 1", requests)
 	}
 }
 
@@ -107,6 +104,20 @@ func TestDevboxAgentsStatus(t *testing.T) {
 	}
 	b.noTokenLeak(out)
 
+	b.gateway.set(200, statusWithInterrupted(2))
+	out, _ = b.run("devbox-agents.sh", "status")
+	if out != "agents: idle; 3 sessions, 0 turns running, 0 waiting for a person; 2 interrupted, waiting for Try Again\n" {
+		t.Fatalf("text status with interrupted turns: %q", out)
+	}
+	out, _ = b.run("devbox-agents.sh", "status", "--json")
+	got = nil
+	if err := json.Unmarshal([]byte(out), &got); err != nil || got["interrupted"] != 2.0 {
+		t.Fatalf("interrupted in JSON: %q", out)
+	}
+	if _, has := got["resume"]; has {
+		t.Fatalf("JSON still carries the deprecated resume object: %q", out)
+	}
+
 	b.gateway.set(401, "")
 	out, status = b.run("devbox-agents.sh", "status", "--json")
 	if status != 2 || !strings.Contains(out, `"state":"unreachable"`) || !strings.Contains(out, "HTTP 401") {
@@ -120,90 +131,15 @@ func TestDevboxAgentsStatus(t *testing.T) {
 	}
 }
 
-func TestDevboxAgentsResumeStatusReadsTheRunningGateway(t *testing.T) {
+// D24: there is no resume switch, so devbox-agents offers no resume
+// command and runs nothing for one.
+func TestDevboxAgentsHasNoResumeCommand(t *testing.T) {
 	b := newLifecycleBox(t)
-	b.fakeProgram("ahp-acp-gateway", `record ahp-acp-gateway "$@"; echo "auto-resume: off (default)"`)
-	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1")
-	b.gateway.set(200, statusJSON(0, 0, 0))
-	out, status := b.run("devbox-agents.sh", "resume", "status")
-	if status != 0 || !strings.HasPrefix(out, "auto-resume: continue (config); pending 0") {
-		t.Fatalf("exit %d %q", status, out)
-	}
-	if len(b.calls()) != 0 {
-		t.Fatalf("asked the gateway command: %v", b.calls())
-	}
-
-	b.gateway.set(200, `{"ok": true, "turns": {"active": 0, "waitingForUser": 0}}`)
-	out, status = b.run("devbox-agents.sh", "resume", "status")
-	if status != 4 || !strings.Contains(out, "not reported") {
-		t.Fatalf("build without resume: exit %d %q", status, out)
-	}
-}
-
-// wrapperAt writes a fake of the module's wrapper outside PATH and returns
-// its absolute path.
-func (b *lifecycleBox) wrapperAt(name string) string {
-	b.t.Helper()
-	dir := filepath.Join(b.root, "store", name, "bin")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		b.t.Fatal(err)
-	}
-	path := filepath.Join(dir, "ahp-acp-gateway")
-	script := "#!/bin/sh\n" + fakePrograms + `record ` + name + ` "$@"` + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		b.t.Fatal(err)
-	}
-	return path
-}
-
-func TestDevboxAgentsResumeOnOff(t *testing.T) {
-	b := newLifecycleBox(t)
-	wrapper := b.wrapperAt("module-wrapper")
-	b.env = append(b.env, "DEVBOX_GATEWAY_COMMAND="+wrapper)
-	for _, value := range []string{"on", "off"} {
-		// Without the module saying the wrapper offers resume, the command
-		// is never run.
-		out, status := b.run("devbox-agents.sh", "resume", value)
-		if status != 4 || len(b.calls()) != 0 {
-			t.Fatalf("resume %s without the command: exit %d %q calls %v", value, status, out, b.calls())
-		}
-	}
-	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1")
-	for _, value := range []string{"on", "off"} {
-		b.clearCalls()
-		out, status := b.run("devbox-agents.sh", "resume", value)
-		if status != 0 || strings.Join(b.calls(), "\n") != "module-wrapper resume "+value {
+	b.fakeProgram("ahp-acp-gateway", `record ahp-acp-gateway "$@"`)
+	for _, value := range []string{"status", "on", "off"} {
+		if out, status := b.run("devbox-agents.sh", "resume", value); status != 64 || len(b.calls()) != 0 {
 			t.Fatalf("resume %s: exit %d %q calls %v", value, status, out, b.calls())
 		}
-	}
-	if _, status := b.run("devbox-agents.sh", "resume", "maybe"); status != 64 {
-		t.Fatalf("bad value: exit %d", status)
-	}
-}
-
-// Review finding: a copy of the gateway earlier on the user's PATH (a build
-// without subcommands would start a second server) is never run.
-func TestDevboxAgentsResumeIgnoresAGatewayOnPath(t *testing.T) {
-	b := newLifecycleBox(t)
-	b.fakeProgram("ahp-acp-gateway", `record shadow "$@"`)
-	wrapper := b.wrapperAt("module-wrapper")
-	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1", "DEVBOX_GATEWAY_COMMAND="+wrapper)
-	if out, status := b.run("devbox-agents.sh", "resume", "on"); status != 0 || strings.Join(b.calls(), "\n") != "module-wrapper resume on" {
-		t.Fatalf("exit %d %q calls %v", status, out, b.calls())
-	}
-	// A bare name is refused even though one is on PATH.
-	b.clearCalls()
-	b.env = append(b.env, "DEVBOX_GATEWAY_COMMAND=ahp-acp-gateway")
-	if out, status := b.run("devbox-agents.sh", "resume", "on"); status != 4 || len(b.calls()) != 0 {
-		t.Fatalf("bare name: exit %d %q calls %v", status, out, b.calls())
-	}
-}
-
-func TestDevboxAgentsResumeWithoutTheCommand(t *testing.T) {
-	b := newLifecycleBox(t)
-	b.env = append(b.env, "DEVBOX_GATEWAY_HAS_RESUME=1", "DEVBOX_GATEWAY_COMMAND="+filepath.Join(b.root, "no-such-gateway-command"))
-	if out, status := b.run("devbox-agents.sh", "resume", "on"); status != 4 {
-		t.Fatalf("exit %d %q", status, out)
 	}
 }
 

@@ -18,8 +18,8 @@ func newRestartCmd() *cobra.Command {
 		Use:   "restart [instance-id...]",
 		Short: "Stop then start instances (new host)",
 		Long: `Stop then start instances (new host). Refused while an agent is working;
-the gateway is stopped cleanly first, and auto-resume continues interrupted
-turns after the start.
+the gateway is stopped cleanly first; each interrupted turn then waits for
+Try Again (or a new message) after the start.
 
   devbox restart [id...]          Stop then start, unless an agent is working
   devbox restart --force [id...]  Even if an agent is working (still cleanly)
