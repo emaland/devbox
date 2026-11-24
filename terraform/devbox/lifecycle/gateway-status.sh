@@ -36,14 +36,16 @@ esac
 # another file, a FIFO or a device), with no group or other permission bits,
 # as the gateway itself requires.
 [ -n "$token_file" ] && [ -f "$token_file" ] && [ ! -L "$token_file" ] || unreachable "token file unusable"
-mode="$(stat -c %a "$token_file" 2>/dev/null)"
+# Mode and owner from one stat, so both describe the same file.
+mode_owner="$(stat -c '%a %u' "$token_file" 2>/dev/null)" || unreachable "token file unusable"
+mode="${mode_owner% *}"
+owner="${mode_owner#* }"
+case "$owner" in "" | *[!0-9]*) unreachable "token file unusable" ;; esac
 case "$mode" in
   *[!0-7]* | "") unreachable "token file unusable" ;;
   *00) ;;
   *) unreachable "token file unusable (open to group or others)" ;;
 esac
-owner="$(stat -c %u "$token_file" 2>/dev/null)" || unreachable "token file unusable"
-group="$(stat -c %g "$token_file" 2>/dev/null)" || unreachable "token file unusable"
 # As the gateway reads it: one whole CRLF or LF line end is dropped, and what
 # is left must be printable ASCII without space (0x21 to 0x7e). A quote or a
 # backslash is refused as well, though the gateway takes them: either would
@@ -52,11 +54,20 @@ group="$(stat -c %g "$token_file" 2>/dev/null)" || unreachable "token file unusa
 #
 # Run as root, the file is read with its owner's rights only: the checks above
 # are by path, and the owner could swap in a link to a file only root may
-# read between them and the read. The time limit covers a FIFO swapped in.
+# read between them and the read. The owner's rights are the owner's account
+# (uid and its primary gid), never the file's group, which need not be one
+# the owner is in. The reader gets no environment, no standard input and no
+# standard error, only the pipe back. The time limit, for a FIFO swapped in,
+# is root's and outside the drop, so the owner cannot stop it.
 if [ "$(id -u)" = 0 ]; then
-  read_token() { setpriv --reuid="$owner" --regid="$group" --clear-groups timeout 3 head -c 4096 "$token_file"; }
+  owner_gid="$(id -g -- "$owner" 2>/dev/null)" || unreachable "token file unusable (owner has no account)"
+  case "$owner_gid" in "" | *[!0-9]*) unreachable "token file unusable (owner has no account)" ;; esac
+  read_token() {
+    timeout -k 1 3 setpriv --reuid="$owner" --regid="$owner_gid" --clear-groups \
+      env -i head -c 4096 -- "$token_file" </dev/null 2>/dev/null
+  }
 else
-  read_token() { timeout 3 head -c 4096 "$token_file"; }
+  read_token() { timeout -k 1 3 head -c 4096 -- "$token_file" </dev/null 2>/dev/null; }
 fi
 raw="$(read_token && printf x)" || unreachable "token file unusable"
 raw="${raw%x}"

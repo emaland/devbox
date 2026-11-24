@@ -118,8 +118,10 @@ the caller treats that as "not installed" and logs nothing.
 - **Read as its owner.** The checks above are by path, so the owner could
   swap the file for a link to something only root may read between the
   checks and the read. Run as root, the file is therefore read with
-  `setpriv` under the owner's uid and gid, with a 3 s limit in case a FIFO
-  is swapped in. curl is started with `-q` and `--noproxy '*'`, so root's
+  `setpriv` under the owner's account (uid and its primary gid, never the
+  file's group), with no environment, standard input or standard error, and
+  under a 3 s limit held by root outside the drop, in case a FIFO is swapped
+  in. curl is started with `-q` and `--noproxy '*'`, so root's
   curl config and proxy settings cannot send the header elsewhere.
 - **Known limit.** The gateway could stop, and another user bind the port,
   in the moment between the listener check and curl's connect. Closing that

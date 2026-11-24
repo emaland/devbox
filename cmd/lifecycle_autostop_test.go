@@ -930,7 +930,23 @@ func TestGatewayStatusPlaceholderIsNotAPattern(t *testing.T) {
 // link to a file only root can read) is not read by root.
 func TestGatewayStatusReadsTheTokenAsItsOwner(t *testing.T) {
 	b := newLifecycleBox(t)
-	b.fakeProgram("id", `[ "$1" = -u ] && { echo 0; exit 0; }; exit 1`)
+	realID, err := exec.LookPath("id")
+	if err != nil {
+		t.Skip("id not on PATH")
+	}
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Skip("stat not on PATH")
+	}
+	realTimeout, err := exec.LookPath("timeout")
+	if err != nil {
+		t.Skip("timeout not on PATH")
+	}
+	// The script believes it is root; any other question goes to the real id.
+	b.fakeProgram("id", fmt.Sprintf(`[ "$*" = -u ] && { echo 0; exit 0; }; exec %s "$@"`, realID))
+	// Round 3: the file's own group is not the owner's; it must not be used.
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%g*) echo 4242 ;; *) exec %s "$@" ;; esac`, realStat))
+	b.fakeProgram("timeout", fmt.Sprintf(`record timeout "$@"; exec %s "$@"`, realTimeout))
 	b.fakeProgram("setpriv", `record setpriv "$@"
 while [ $# -gt 0 ]; do case "$1" in --*) shift ;; *) break ;; esac; done
 exec "$@"`)
@@ -940,10 +956,25 @@ exec "$@"`)
 	if status != 0 {
 		t.Fatalf("exit %d output %q", status, out)
 	}
-	want := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", os.Getuid(), os.Getgid())
-	calls := strings.Join(b.calls(), "\n")
-	if !strings.Contains(calls, want) || !strings.Contains(calls, filepath.Join(b.root, "token")) {
-		t.Fatalf("the token was not read as its owner; calls:\n%s", calls)
+	primary, err := exec.Command(realID, "-g", fmt.Sprint(os.Getuid())).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := b.calls()
+	var timeoutAt, setprivAt = -1, -1
+	for n, call := range calls {
+		if timeoutAt < 0 && strings.HasPrefix(call, "timeout ") && strings.Contains(call, " setpriv ") {
+			timeoutAt = n
+		}
+		if setprivAt < 0 && strings.HasPrefix(call, "setpriv ") {
+			setprivAt = n
+		}
+	}
+	want := fmt.Sprintf("setpriv --reuid=%d --regid=%s --clear-groups env -i head -c 4096 -- %s",
+		os.Getuid(), strings.TrimSpace(string(primary)), filepath.Join(b.root, "token"))
+	// The limit is root's, outside the drop, so the owner cannot stop it.
+	if timeoutAt < 0 || setprivAt < 0 || timeoutAt > setprivAt || calls[setprivAt] != want {
+		t.Fatalf("the token was not read as its owner, under root's time limit; calls:\n%s\nwant %q", strings.Join(calls, "\n"), want)
 	}
 }
 
