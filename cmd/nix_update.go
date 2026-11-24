@@ -53,11 +53,11 @@ func nixUpdate(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client
 	// Check everything the push needs from this machine (template, extra keys
 	// file, hosted zone id) before touching the box, so a local problem is
 	// reported once and is not mistaken for an ssh failure below.
-	dcfg, err := dnsConfigFor(ctx, client, instanceID, dcfg)
+	dcfg, err := preflightNixConfig(ctx, dcfg, nixFile, findHostedZoneID)
 	if err != nil {
 		return err
 	}
-	dcfg, err = preflightNixConfig(ctx, dcfg, nixFile, findHostedZoneID)
+	dcfg, err = dnsConfigFor(ctx, client, instanceID, dcfg)
 	if err != nil {
 		return err
 	}

@@ -202,3 +202,28 @@ func decodeOrRaw(s string) string {
 	}
 	return s
 }
+
+// R-CODE on PR 19: the tag reaches the launch, and a resize carries it to
+// the replacement, so the clone stays a no-DNS box.
+func TestNoDNSTagIsLaunchedAndCarried(t *testing.T) {
+	_, dnsTags := spawnDNS(config.DevboxConfig{}, true)
+	launched := launchTags("clone", dnsTags)
+	if !dnsOff(launched) {
+		t.Fatalf("launched without the tag: %v", launched)
+	}
+	if dnsOff(launchTags("primary", nil)) {
+		t.Fatal("an ordinary spawn is tagged")
+	}
+	withPlan := append(launched,
+		types.Tag{Key: aws.String("aws:ec2spot:fleet-request-id"), Value: aws.String("x")},
+		types.Tag{Key: aws.String(resizeStateTag), Value: aws.String("launched")})
+	carried := carriedTags(withPlan)
+	if !dnsOff(carried) {
+		t.Fatalf("resize drops the tag: %v", carried)
+	}
+	for _, tag := range carried {
+		if k := aws.ToString(tag.Key); strings.HasPrefix(k, "aws:") || k == resizeStateTag {
+			t.Errorf("resize carries %s", k)
+		}
+	}
+}

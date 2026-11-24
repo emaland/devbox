@@ -42,7 +42,10 @@ primary.
 
 Limits: the clone has the primary's instance profile, whose role may change
 records in the hosted zone, so a program on the clone could still do so
-itself. It also joins the tailnet with the primary's host name.`,
+itself (your local.nix is pushed to it unchanged). With --volume and a copy
+of the primary's data volume, the primary's saved config is restored on it
+until the first push succeeds. Removing the devbox-dns tag makes it an
+ordinary box again. It also joins the tailnet with the primary's host name.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID, noDNS)
 		},
@@ -83,6 +86,14 @@ func spawnDNS(dcfg config.DevboxConfig, noDNS bool) (config.DevboxConfig, []type
 		return dcfg, nil
 	}
 	return withoutDNS(dcfg), []types.Tag{{Key: aws.String(dnsTag), Value: aws.String("off")}}
+}
+
+// launchTags are the tags spawn launches an instance with.
+func launchTags(name string, dnsTags []types.Tag) []types.Tag {
+	return append([]types.Tag{
+		{Key: aws.String("Name"), Value: aws.String(name)},
+		{Key: aws.String("devbox-managed"), Value: aws.String("true")},
+	}, dnsTags...)
 }
 
 // dnsOff reports whether an instance's tags mark it as spawned with --no-dns.
@@ -224,10 +235,7 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		TagSpecifications: []types.TagSpecification{
 			{
 				ResourceType: types.ResourceTypeInstance,
-				Tags: append([]types.Tag{
-					{Key: aws.String("Name"), Value: aws.String(name)},
-					{Key: aws.String("devbox-managed"), Value: aws.String("true")},
-				}, dnsTags...),
+				Tags:         launchTags(name, dnsTags),
 			},
 		},
 	}
