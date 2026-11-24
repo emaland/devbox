@@ -154,8 +154,35 @@ func chooseUserData(ctx context.Context, src userDataSource, from string, noDNS 
 	return src.fetch(ctx, sourceID)
 }
 
-func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string, noDNS bool) error {
-	dcfg, dnsTags := spawnDNS(dcfg, noDNS)
+// spawnRequest is what the spawn command asks for; empty fields take the
+// config's defaults.
+type spawnRequest struct {
+	instanceType, az, name, maxPrice, from string
+	noDNS                                  bool
+}
+
+// spawnLookups are the reads planSpawn makes. spawnInstance gives the real
+// ones; tests give fakes.
+type spawnLookups struct {
+	preflight     func(context.Context, config.DevboxConfig) (config.DevboxConfig, error)
+	ami           func(context.Context, config.DevboxConfig) (string, error)
+	securityGroup func(context.Context, config.DevboxConfig) (string, error)
+	subnet        func(ctx context.Context, az string) (string, error)
+	userData      userDataSource
+}
+
+// spawnPlan is everything spawnInstance decides before it launches: the
+// config the rest of the spawn uses (DNS cleared for --no-dns, checked by
+// preflight) and the launch request itself, with its user data and tags.
+type spawnPlan struct {
+	dcfg             config.DevboxConfig
+	instanceType, az string
+	runInput         *ec2.RunInstancesInput
+}
+
+func planSpawn(ctx context.Context, dcfg config.DevboxConfig, req spawnRequest, look spawnLookups) (spawnPlan, error) {
+	dcfg, dnsTags := spawnDNS(dcfg, req.noDNS)
+	instanceType, az, name, maxPrice := req.instanceType, req.az, req.name, req.maxPrice
 	// Apply config defaults for empty flags
 	if instanceType == "" {
 		instanceType = dcfg.DefaultType
@@ -172,63 +199,57 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 
 	// Fail on a local config problem before launching anything: the config
 	// push at the end needs the template, the keys file and the zone id.
-	dcfg, err := preflightNixConfig(ctx, dcfg, defaultNixFile(), findHostedZoneID)
+	dcfg, err := look.preflight(ctx, dcfg)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 
 	// Discover infrastructure
 	fmt.Println("Looking up infrastructure...")
 
-	amiID, err := lookupAMI(ctx, dcfg, client)
+	amiID, err := look.ami(ctx, dcfg)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 	fmt.Printf("  AMI: %s\n", amiID)
 
-	sgID, err := lookupSecurityGroup(ctx, dcfg, client)
+	sgID, err := look.securityGroup(ctx, dcfg)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 	fmt.Printf("  Security Group: %s\n", sgID)
 
-	subnetID, err := lookupSubnet(ctx, client, az)
+	subnetID, err := look.subnet(ctx, az)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 	fmt.Printf("  Subnet: %s\n", subnetID)
 
-	userData, err := chooseUserData(ctx, userDataSource{
-		fetch:  func(ctx context.Context, id string) (string, error) { return awsutil.FetchUserData(ctx, client, id) },
-		detect: func(ctx context.Context) (string, error) { return autoDetectSourceInstance(ctx, client) },
-	}, from, noDNS)
+	userData, err := chooseUserData(ctx, look.userData, req.from, req.noDNS)
 	if err != nil {
-		return err
+		return spawnPlan{}, err
 	}
 
-	// Launch the instance
-	fmt.Printf("Launching %s spot instance in %s...\n", instanceType, az)
-
 	runInput := &ec2.RunInstancesInput{
-		ImageId:      aws.String(amiID),
-		InstanceType: types.InstanceType(instanceType),
-		MinCount:     aws.Int32(1),
-		MaxCount:     aws.Int32(1),
-		KeyName:      aws.String(dcfg.SSHKeyName),
-		SubnetId:     aws.String(subnetID),
+		ImageId:          aws.String(amiID),
+		InstanceType:     types.InstanceType(instanceType),
+		MinCount:         aws.Int32(1),
+		MaxCount:         aws.Int32(1),
+		KeyName:          aws.String(dcfg.SSHKeyName),
+		SubnetId:         aws.String(subnetID),
 		SecurityGroupIds: []string{sgID},
 		IamInstanceProfile: &types.IamInstanceProfileSpecification{
 			Name: aws.String(dcfg.IAMProfile),
 		},
-		UserData:                            aws.String(userData),
-		InstanceInitiatedShutdownBehavior:   types.ShutdownBehaviorStop,
+		UserData:                          aws.String(userData),
+		InstanceInitiatedShutdownBehavior: types.ShutdownBehaviorStop,
 		BlockDeviceMappings: []types.BlockDeviceMapping{
 			{
 				DeviceName: aws.String("/dev/xvda"),
 				Ebs: &types.EbsBlockDevice{
-					VolumeSize:           aws.Int32(75),
-					VolumeType:           types.VolumeTypeGp3,
-					DeleteOnTermination:  aws.Bool(false),
+					VolumeSize:          aws.Int32(75),
+					VolumeType:          types.VolumeTypeGp3,
+					DeleteOnTermination: aws.Bool(false),
 				},
 			},
 		},
@@ -249,8 +270,36 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 			},
 		}
 	}
+	return spawnPlan{dcfg: dcfg, instanceType: instanceType, az: az, runInput: runInput}, nil
+}
 
-	result, err := client.RunInstances(ctx, runInput)
+func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string, noDNS bool) error {
+	plan, err := planSpawn(ctx, dcfg, spawnRequest{
+		instanceType: instanceType, az: az, name: name, maxPrice: maxPrice, from: from, noDNS: noDNS,
+	}, spawnLookups{
+		preflight: func(ctx context.Context, d config.DevboxConfig) (config.DevboxConfig, error) {
+			return preflightNixConfig(ctx, d, defaultNixFile(), findHostedZoneID)
+		},
+		ami: func(ctx context.Context, d config.DevboxConfig) (string, error) { return lookupAMI(ctx, d, client) },
+		securityGroup: func(ctx context.Context, d config.DevboxConfig) (string, error) {
+			return lookupSecurityGroup(ctx, d, client)
+		},
+		subnet: func(ctx context.Context, az string) (string, error) { return lookupSubnet(ctx, client, az) },
+		userData: userDataSource{
+			fetch:  func(ctx context.Context, id string) (string, error) { return awsutil.FetchUserData(ctx, client, id) },
+			detect: func(ctx context.Context) (string, error) { return autoDetectSourceInstance(ctx, client) },
+		},
+	})
+	if err != nil {
+		return err
+	}
+	// The rest of the spawn, the config push included, uses the planned config.
+	dcfg, instanceType, az = plan.dcfg, plan.instanceType, plan.az
+
+	// Launch the instance
+	fmt.Printf("Launching %s spot instance in %s...\n", instanceType, az)
+
+	result, err := client.RunInstances(ctx, plan.runInput)
 	if err != nil {
 		return fmt.Errorf("launching instance: %w", err)
 	}

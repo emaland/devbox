@@ -175,10 +175,14 @@ func TestLaterCommandsWriteNoDNSForANoDNSClone(t *testing.T) {
 		}
 	}
 
-	// `nix-update <clone>` and any later push render without DNS.
-	pushed, err := dnsConfigFor(ctx, testEC2Client, id, cfg)
+	// `nix-update <clone>`, the push after spawn and the one after resize
+	// all get their address from pushTarget, and render without DNS.
+	pushed, ip, err := pushTarget(ctx, testEC2Client, id, cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if ip == "" {
+		t.Error("no address for the push")
 	}
 	if pushed.DNSName != "" || pushed.DNSZone != "" || pushed.DNSZoneID != "" {
 		t.Errorf("a push to the --no-dns clone would carry DNS: %+v", pushed)
@@ -191,8 +195,59 @@ func TestLaterCommandsWriteNoDNSForANoDNSClone(t *testing.T) {
 
 	// An untagged instance is unchanged.
 	other := createTestInstance(t, ctx)
-	if pushed, err := dnsConfigFor(ctx, testEC2Client, other, cfg); err != nil || pushed.DNSName != cfg.DNSName {
+	if pushed, _, err := pushTarget(ctx, testEC2Client, other, cfg); err != nil || pushed.DNSName != cfg.DNSName {
 		t.Errorf("an ordinary instance lost its DNS: %+v, %v", pushed, err)
+	}
+}
+
+// R-TEST on PR 19: what spawn launches. The config it checks and pushes has
+// no DNS, the instance boots the stub, and it carries the tag; an ordinary
+// spawn keeps all three as they were.
+func TestPlanSpawnNoDNS(t *testing.T) {
+	cfg := config.DevboxConfig{DNSName: "dev", DNSZone: "example.test", DNSZoneID: "Z1", SpawnName: "spawned", DefaultType: "t3.micro", DefaultAZ: "zone-a"}
+	plan := func(noDNS bool) (spawnPlan, config.DevboxConfig) {
+		t.Helper()
+		var checked config.DevboxConfig
+		got, err := planSpawn(context.Background(), cfg, spawnRequest{noDNS: noDNS}, spawnLookups{
+			preflight: func(_ context.Context, d config.DevboxConfig) (config.DevboxConfig, error) {
+				checked = d
+				return d, nil
+			},
+			ami:           func(context.Context, config.DevboxConfig) (string, error) { return "ami-x", nil },
+			securityGroup: func(context.Context, config.DevboxConfig) (string, error) { return "sg-x", nil },
+			subnet:        func(context.Context, string) (string, error) { return "subnet-x", nil },
+			userData: userDataSource{
+				fetch:  func(_ context.Context, id string) (string, error) { return "user-data-of-" + id, nil },
+				detect: func(context.Context) (string, error) { return "primary", nil },
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got, checked
+	}
+	tags := func(p spawnPlan) []types.Tag { return p.runInput.TagSpecifications[0].Tags }
+
+	clone, checked := plan(true)
+	if checked.DNSName != "" || clone.dcfg.DNSName != "" || clone.dcfg.DNSZoneID != "" {
+		t.Errorf("--no-dns: preflight saw %+v, the push would use %+v", checked, clone.dcfg)
+	}
+	if got := aws.ToString(clone.runInput.UserData); got != stubUserData() {
+		t.Errorf("--no-dns boots %q, want the stub", decodeOrRaw(got))
+	}
+	if !dnsOff(tags(clone)) {
+		t.Errorf("--no-dns launched without the tag: %v", tags(clone))
+	}
+
+	ordinary, checked := plan(false)
+	if checked.DNSName != "dev" || ordinary.dcfg.DNSName != "dev" {
+		t.Errorf("ordinary spawn lost its DNS: %+v", ordinary.dcfg)
+	}
+	if got := aws.ToString(ordinary.runInput.UserData); got != "user-data-of-primary" {
+		t.Errorf("ordinary spawn boots %q", decodeOrRaw(got))
+	}
+	if dnsOff(tags(ordinary)) {
+		t.Errorf("ordinary spawn is tagged: %v", tags(ordinary))
 	}
 }
 
