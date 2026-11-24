@@ -115,6 +115,15 @@ the caller treats that as "not installed" and logs nothing.
   checks run (after a spot stop, at boot, during a restart), another local
   user could otherwise bind the port and collect the token. Otherwise the
   result is "unreachable" with the reason.
+- **Read as its owner.** The checks above are by path, so the owner could
+  swap the file for a link to something only root may read between the
+  checks and the read. Run as root, the file is therefore read with
+  `setpriv` under the owner's uid and gid, with a 3 s limit in case a FIFO
+  is swapped in. curl is started with `-q` and `--noproxy '*'`, so root's
+  curl config and proxy settings cannot send the header elsewhere.
+- **Known limit.** The gateway could stop, and another user bind the port,
+  in the moment between the listener check and curl's connect. Closing that
+  needs a peer-credential check, which TCP on loopback does not give.
 - Text from the answer never reaches a log line or a notice as it is: counts
   must be numbers, and words are reduced to letters.
 - Results: `ok` with the JSON on standard output; `unreachable` with a reason

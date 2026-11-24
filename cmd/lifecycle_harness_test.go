@@ -214,6 +214,7 @@ type lifecycleBox struct {
 	bin     string
 	state   string
 	logFile string
+	workdir string // the scripts' working directory; empty means the test's
 	gateway *fakeGateway
 	imds    *fakeIMDS
 	hook    *fakeWebhook
@@ -380,6 +381,7 @@ func (b *lifecycleBox) run(script string, args ...string) (string, int) {
 	b.t.Helper()
 	command := exec.Command("sh", append([]string{lifecycleScript(b.t, script)}, args...)...)
 	command.Env = b.env
+	command.Dir = b.workdir
 	out, err := command.CombinedOutput()
 	if err == nil {
 		return string(out), 0

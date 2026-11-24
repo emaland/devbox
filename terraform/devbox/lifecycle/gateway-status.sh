@@ -43,12 +43,22 @@ case "$mode" in
   *) unreachable "token file unusable (open to group or others)" ;;
 esac
 owner="$(stat -c %u "$token_file" 2>/dev/null)" || unreachable "token file unusable"
+group="$(stat -c %g "$token_file" 2>/dev/null)" || unreachable "token file unusable"
 # As the gateway reads it: one whole CRLF or LF line end is dropped, and what
 # is left must be printable ASCII without space (0x21 to 0x7e). A quote or a
 # backslash is refused as well, though the gateway takes them: either would
 # change the curl config.
 # The x keeps a trailing newline through the command substitution.
-raw="$(head -c 4096 "$token_file" && printf x)" || unreachable "token file unusable"
+#
+# Run as root, the file is read with its owner's rights only: the checks above
+# are by path, and the owner could swap in a link to a file only root may
+# read between them and the read. The time limit covers a FIFO swapped in.
+if [ "$(id -u)" = 0 ]; then
+  read_token() { setpriv --reuid="$owner" --regid="$group" --clear-groups timeout 3 head -c 4096 "$token_file"; }
+else
+  read_token() { timeout 3 head -c 4096 "$token_file"; }
+fi
+raw="$(read_token && printf x)" || unreachable "token file unusable"
 raw="${raw%x}"
 cr="$(printf '\r')"
 nl="
@@ -71,30 +81,36 @@ esac
 # at the end is chosen by the socket's owner and may hold spaces. Every
 # listener on the port must be on 127.0.0.1 and show its owner in column 6:
 # uid:N, or ino: straight away, which is how ss shows uid 0. Anything else is
-# "?", which matches no owner.
+# "none", which matches no owner. (A word, not "?": the loop below splits the
+# list, and file name patterns are off for it.)
 listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null |
-  while read -r _state _recv _send local _peer sixth _rest; do
-    if [ "$local" != "127.0.0.1:$port" ]; then
-      echo "?"
+  while read -r _state _recv _send laddr _peer sixth _rest; do
+    if [ "$laddr" != "127.0.0.1:$port" ]; then
+      echo none
       continue
     fi
     case "$sixth" in
-      uid:*[!0-9]* | uid:) echo "?" ;;
+      uid:*[!0-9]* | uid:) echo none ;;
       uid:*) echo "${sixth#uid:}" ;;
       ino:*) echo 0 ;;
-      *) echo "?" ;;
+      *) echo none ;;
     esac
   done)"
 [ -n "$listeners" ] || unreachable "nothing listening on 127.0.0.1:$port"
+set -f
 for uid in $listeners; do
   [ "$uid" = "$owner" ] || unreachable "the listener on port $port is not the gateway's user"
 done
+set +f
+# Known limit: the gateway could stop, and another user bind the port, in the
+# moment between this check and curl's connect. Closing that needs a peer
+# credential check, which TCP on loopback does not give.
 
 body="$(mktemp)" || unreachable "no temporary file"
 trap 'rm -f "$body"' EXIT
 
 code="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
-  curl -s --max-time 3 -o "$body" -w '%{http_code}' -K - "http://127.0.0.1:$port/status")"
+  curl -q -s --noproxy '*' --max-time 3 -o "$body" -w '%{http_code}' -K - "http://127.0.0.1:$port/status")"
 status=$?
 token=""
 [ "$status" -eq 0 ] || unreachable "no answer (curl exit $status)"

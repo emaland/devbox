@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -837,6 +838,7 @@ func TestAutostopSpotNoticeEndsAfterItsActionTime(t *testing.T) {
 		started int
 	}{
 		"within 5 min": {time: fmt.Sprintf("%d\n", fakeStart+4*hour-299), started: 0},
+		"at 5 min":     {time: fmt.Sprintf("%d\n", fakeStart+4*hour-300), started: 1},
 		"after 5 min":  {time: fmt.Sprintf("%d\n", fakeStart+4*hour-301), started: 1},
 		// No usable time: still an interruption under way.
 		"time not a number": {time: "soon\n", started: 0},
@@ -894,5 +896,68 @@ func TestGatewayStatusReadsTheListenerByColumn(t *testing.T) {
 	b.write("listener-lines", fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x uid:%d <->\n", owner, other))
 	if out, status := b.run("gateway-status.sh"); status != 0 {
 		t.Fatalf("the gateway's own listener was refused: exit %d output %q", status, out)
+	}
+}
+
+// R-SEC on PR 17, second round: the "?" placeholder for a listener that
+// matches no owner was expanded as a file name pattern, so a one-character
+// file in the working directory could turn it into the owner's uid. Seen
+// with a root-owned token file (owner 0) and a file named 0.
+func TestGatewayStatusPlaceholderIsNotAPattern(t *testing.T) {
+	b := newLifecycleBox(t)
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Skip("stat not on PATH")
+	}
+	// The token file looks root's.
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) echo 0 ;; *) exec %s "$@" ;; esac`, realStat))
+	b.workdir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(b.workdir, "0"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b.write("listener-lines", "LISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:1234 ino:1 sk:1 cgroup:/x <->\n")
+	out, status := b.run("gateway-status.sh")
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if status != 2 || requests != 0 {
+		t.Fatalf("exit %d, %d requests, output %q", status, requests, out)
+	}
+}
+
+// R-SEC on PR 17, second round: run as root, the token file is read with
+// the file owner's own rights, so a file swapped in after the checks (a
+// link to a file only root can read) is not read by root.
+func TestGatewayStatusReadsTheTokenAsItsOwner(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.fakeProgram("id", `[ "$1" = -u ] && { echo 0; exit 0; }; exit 1`)
+	b.fakeProgram("setpriv", `record setpriv "$@"
+while [ $# -gt 0 ]; do case "$1" in --*) shift ;; *) break ;; esac; done
+exec "$@"`)
+	b.write("listener-uid", fmt.Sprintf("%d\n", os.Getuid()))
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	out, status := b.run("gateway-status.sh")
+	if status != 0 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+	want := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", os.Getuid(), os.Getgid())
+	calls := strings.Join(b.calls(), "\n")
+	if !strings.Contains(calls, want) || !strings.Contains(calls, filepath.Join(b.root, "token")) {
+		t.Fatalf("the token was not read as its owner; calls:\n%s", calls)
+	}
+}
+
+// R-SEC on PR 17, second round: root's curl ignores ~/.curlrc and any
+// proxy, so the Authorization header goes only to the loopback port.
+func TestGatewayStatusCurlIgnoresConfigAndProxies(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.env = append(b.env, "http_proxy=http://127.0.0.1:9", "HTTP_PROXY=http://127.0.0.1:9", "ALL_PROXY=http://127.0.0.1:9")
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	if out, status := b.run("gateway-status.sh"); status != 0 {
+		t.Fatalf("a proxy in the environment was used: exit %d output %q", status, out)
+	}
+	argv := b.read(filepath.Join(b.root, "curl-argv"))
+	if !strings.HasPrefix(argv, "-q ") {
+		t.Fatalf("curl not started with -q: %q", argv)
 	}
 }
