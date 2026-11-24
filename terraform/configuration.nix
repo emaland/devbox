@@ -11,6 +11,7 @@
   imports = [
     "${modulesPath}/virtualisation/amazon-image.nix"
     ./devbox/modules/ahp-gateway.nix
+    ./devbox/modules/devbox-lifecycle.nix
   ] ++ lib.optional (builtins.pathExists ./local.nix) ./local.nix;
 
   networking.hostName = "dev-workstation";
@@ -459,16 +460,20 @@
   };
 
   # ── Slack boot notification ─────────────────────────────────────
-  # On every boot, posts the instance type / AZ / IP and current spot
-  # price to Slack. The webhook URL is read from /home/emaland/.secrets
-  # (export SLACK_WEBHOOK_URL=...) so it never lives in this repo; if it
-  # is unset the service logs and no-ops. Needs ec2:DescribeSpotPriceHistory
-  # on the instance role (granted by the ec2-selfmanage policy).
+  # On every boot, posts the instance type / AZ / IP, current spot price and
+  # what auto-resume did to Slack. The webhook URL is read (never run) from
+  # /home/emaland/.secrets (SLACK_WEBHOOK_URL=...) by the lifecycle module's
+  # notify script, so it never lives in this repo; if it is unset nothing is
+  # posted. Needs ec2:DescribeSpotPriceHistory on the instance role (granted
+  # by the ec2-selfmanage policy).
   systemd.services.devbox-slack-notify = {
-    description = "Notify Slack that the devbox booted (with cost)";
-    after       = [ "network-online.target" "update-route53.service" ];
+    description = "Notify Slack that the devbox booted (with cost and resumed turns)";
+    # After the gateway, so the resume line can report what it continued.
+    after       = [ "network-online.target" "update-route53.service" "ahp-gateway.service" ];
     wants       = [ "network-online.target" ];
     wantedBy    = [ "multi-user.target" ];
+    # Changing this unit must not post a spurious "booted" at deploy time.
+    restartIfChanged = false;
     serviceConfig = {
       Type      = "oneshot";
       # Stay "active (exited)" after running so nixos-rebuild switch does not
@@ -477,13 +482,6 @@
       # spurious "devbox booted" Slack alert.
       RemainAfterExit = true;
       ExecStart = toString (pkgs.writeShellScript "devbox-slack-notify" ''
-        SECRETS=/home/emaland/.secrets
-        [ -f "$SECRETS" ] && . "$SECRETS"
-        if [ -z "''${SLACK_WEBHOOK_URL:-}" ]; then
-          echo "SLACK_WEBHOOK_URL not set in $SECRETS; skipping Slack notify"
-          exit 0
-        fi
-
         TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
           "http://169.254.169.254/latest/api/token" \
           -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
@@ -511,15 +509,17 @@
           COST=" (spot price unavailable)"
         fi
 
-        MSG=":computer: *devbox booted* — \`$(${pkgs.nettools}/bin/hostname)\`
+        # Waits, bounded, for the gateway's continuations to start.
+        RESUME=$(${config.services.devbox-lifecycle.generated.resumeSummary})
+
+        MSG=":computer: booted
 • type: \`$ITYPE\`  ($AZ)
 • spot$COST"
+        [ -n "$RESUME" ] && MSG="$MSG
+• $RESUME"
 
-        PAYLOAD=$(${pkgs.jq}/bin/jq -n --arg t "$MSG" '{text:$t}')
-        ${pkgs.curl}/bin/curl -s -X POST -H 'Content-type: application/json' \
-          --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" >/dev/null \
-          && echo "posted boot notification to Slack" \
-          || echo "warning: Slack POST failed" >&2
+        # notify.sh prefixes the host name and posts only if a webhook is set.
+        ${config.services.devbox-lifecycle.generated.notify} "$MSG"
       '');
     };
   };
@@ -546,80 +546,18 @@
     mode = "0644";
   };
 
-  # ── Auto-stop (idle timer) ─────────────────────────────────────
-  # A true idle timer that RESETS whenever the box is in use. The
-  # devbox-autostop.timer below polls this every 10 min; each poll, if a user
-  # is active, it touches the last-active marker (resetting the countdown).
-  # The box stops only after the full idle window with no activity — default
-  # 4h, overridable via /etc/devbox/autostop-after ("off" disables).
-  systemd.services.devbox-autostop = {
-    description = "Stop this instance after it has been idle";
-    serviceConfig = {
-      Type      = "oneshot";
-      ExecStart = toString (pkgs.writeShellScript "devbox-autostop" ''
-        LOG=/var/log/boot-history
-        STATE=/run/devbox-last-active
-        stamp() { ${pkgs.coreutils}/bin/date '+%Y-%m-%d %H:%M:%S'; }
-
-        # Idle window (resettable via /etc/devbox/autostop-after; "off" disables).
-        WINDOW="4h"
-        [ -f /etc/devbox/autostop-after ] && WINDOW=$(${pkgs.coreutils}/bin/cat /etc/devbox/autostop-after)
-        [ "$WINDOW" = "off" ] && exit 0
-        num=$(printf '%s' "$WINDOW" | ${pkgs.coreutils}/bin/tr -cd '0-9'); [ -z "$num" ] && num=4
-        case "$WINDOW" in
-          *d*) SECS=$((num * 86400));;
-          *h*) SECS=$((num * 3600));;
-          *min*|*m*) SECS=$((num * 60));;
-          *s*) SECS=$num;;
-          *) SECS=$((num * 3600));;
-        esac
-
-        # First poll of the boot seeds the marker so the window counts from now.
-        [ -f "$STATE" ] || ${pkgs.coreutils}/bin/touch "$STATE"
-
-        # Active? Reset the idle countdown and stop here. "Active" = a logged-in
-        # session (who/utmp; covers SSH and Tailscale SSH) or an established
-        # inbound :22 connection.
-        if ${pkgs.coreutils}/bin/who 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q . \
-           || ${pkgs.iproute2}/bin/ss -tnH state established 2>/dev/null | ${pkgs.gnugrep}/bin/grep -qE ':22[[:space:]]'; then
-          ${pkgs.coreutils}/bin/touch "$STATE"
-          exit 0
-        fi
-
-        # Idle: stop only once the full window has elapsed since last activity.
-        NOW=$(${pkgs.coreutils}/bin/date +%s)
-        LAST=$(${pkgs.coreutils}/bin/stat -c %Y "$STATE" 2>/dev/null || echo "$NOW")
-        IDLE=$((NOW - LAST))
-        [ "$IDLE" -lt "$SECS" ] && exit 0
-
-        echo "$(stamp) | auto-stop | idle ''${IDLE}s >= ''${SECS}s, stopping" >> "$LOG"
-        TOKEN=$(${pkgs.curl}/bin/curl -sX PUT \
-          "http://169.254.169.254/latest/api/token" \
-          -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
-        IID=$(${pkgs.curl}/bin/curl -s \
-          -H "X-aws-ec2-metadata-token: $TOKEN" \
-          http://169.254.169.254/latest/meta-data/instance-id)
-        AZ=$(${pkgs.curl}/bin/curl -s \
-          -H "X-aws-ec2-metadata-token: $TOKEN" \
-          http://169.254.169.254/latest/meta-data/placement/availability-zone)
-        REGION=''${AZ%?}
-        ${pkgs.awscli2}/bin/aws ec2 stop-instances \
-          --region "$REGION" --instance-ids "$IID"
-      '');
-    };
-  };
-
-  # ── Auto-stop poll timer ───────────────────────────────────────
-  # Runs devbox-autostop every 10 min (the idle-reset granularity). The idle
-  # window itself is 4h by default — see devbox-autostop above.
-  systemd.timers.devbox-autostop = {
-    description = "Poll for idle auto-stop";
-    wantedBy    = [ "timers.target" ];
-    timerConfig = {
-      OnBootSec       = "10min";
-      OnUnitActiveSec = "10min";
-      Unit            = "devbox-autostop.service";
-    };
+  # ── Lifecycle: auto-stop, spot watcher, devbox-agents ─────────────
+  # ./devbox/modules/devbox-lifecycle.nix (design note 031). Auto-stop polls
+  # every 10 min and stops the box after the idle window with nobody logged
+  # in and no agent working: default 4h, overridable via
+  # /etc/devbox/autostop-after ("off" disables). A box busy for longer than
+  # the cap (default 12h, /etc/devbox/autostop-busy-cap) with nobody logged
+  # in is stopped anyway, with a notice. The spot watcher stops the gateway
+  # cleanly on an interruption notice. With the gateway enabled, interrupted
+  # turns are continued at boot.
+  services.devbox-lifecycle = {
+    enable      = true;
+    webhookFile = "/home/emaland/.secrets";
   };
 
   # ── home-manager switch on boot ─────────────────────────────────
