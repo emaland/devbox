@@ -75,6 +75,9 @@ type agentStatus struct {
 	Running  int    `json:"running"`
 	Waiting  int    `json:"waiting"`
 	Pending  int    `json:"pending"`
+	// Interrupted counts turns that ended host_restarted and wait for a
+	// person's Try Again or a new message (D24).
+	Interrupted int `json:"interrupted"`
 }
 
 func (s agentStatus) String() string {
@@ -91,6 +94,9 @@ func (s agentStatus) String() string {
 	text := fmt.Sprintf("%s: %s sessions, %d running, %d waiting", s.State, sessions, s.Running, s.Waiting)
 	if s.Pending > 0 {
 		text += fmt.Sprintf(", %d continuations pending", s.Pending)
+	}
+	if s.Interrupted > 0 {
+		text += fmt.Sprintf(", %d interrupted", s.Interrupted)
 	}
 	return text
 }
@@ -249,15 +255,23 @@ func dryRunAllowed(err error) error {
 	return fmt.Errorf("the EC2 call would fail, so nothing was touched: %w", err)
 }
 
+const noResumeSwitch = `There is no auto-resume to switch. After a stop the gateway restores each
+chat and marks every interrupted turn; it never continues one by itself.
+Press Try Again in the editor, or send a new message, to continue a turn.
+'devbox agents' shows how many are waiting.`
+
 func newAgentsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agents [instance-id]",
 		Short: "Show the agent sessions and turns on the devbox",
 		Long: `Show what the AHP gateway on the devbox is doing: sessions, turns
-running, turns waiting for a person, and continuations pending.
+running, turns waiting for a person, and turns interrupted by a stop.
 
-  devbox agents                          Status of the auto-detected devbox
-  devbox agents resume status|on|off     Auto-resume of interrupted turns`,
+The gateway never continues an interrupted turn by itself. After a stop it
+restores each chat and marks the turn; press Try Again in the editor, or
+send a new message, to continue it.
+
+  devbox agents                          Status of the auto-detected devbox`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := instanceArg(cmd.Context(), args)
@@ -272,30 +286,20 @@ running, turns waiting for a person, and continuations pending.
 			return remoteStatusError(id, status)
 		},
 	}
+	// D24 removed the gateway's resume switch. Without this, "resume" would
+	// be taken for an instance id.
 	cmd.AddCommand(&cobra.Command{
-		Use:   "resume status|on|off [instance-id]",
-		Short: "Show or set auto-resume of turns interrupted by a stop",
-		Long: `Auto-resume continues, once, a turn that was interrupted when the
-gateway stopped (a spot interruption, an auto-stop, 'devbox down'). It is on
-by default on the devbox. 'off' also cancels continuations not yet started.`,
-		Args:      cobra.RangeArgs(1, 2),
-		ValidArgs: []string{"status", "on", "off"},
+		Use:    "resume",
+		Short:  "Removed: the gateway never continues a turn by itself",
+		Hidden: true,
+		Args:   cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			switch args[0] {
-			case "status", "on", "off":
-			default:
-				return fmt.Errorf("unknown value %q: use status, on or off", args[0])
+			fmt.Fprintln(cmd.OutOrStdout(), noResumeSwitch)
+			// A script that asks to turn it on must not see success.
+			if len(args) > 0 && args[0] == "on" {
+				return fmt.Errorf("there is no auto-resume to turn on")
 			}
-			id, err := instanceArg(cmd.Context(), args[1:])
-			if err != nil {
-				return err
-			}
-			out, status, err := runRemote(cmd.Context(), id, "devbox-agents resume "+args[0])
-			if err != nil {
-				return err
-			}
-			fmt.Print(out)
-			return remoteStatusError(id, status)
+			return nil
 		},
 	})
 	return cmd

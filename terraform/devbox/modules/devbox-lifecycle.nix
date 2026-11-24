@@ -1,6 +1,7 @@
 # Devbox lifecycle (design note 031): auto-stop that sees agents, the spot
-# interruption watcher, the box-side `devbox-agents` command, and auto-resume
-# as the install default of the gateway.
+# interruption watcher, the box-side `devbox-agents` command, and the boot
+# notification's line about interrupted turns. Since D24 the gateway never
+# continues a turn by itself, so this module sets no resume settings.
 #
 # The scripts are in ../lifecycle and take every program from PATH, which is
 # set here to store paths; the tests run the same scripts with fakes first on
@@ -8,7 +9,7 @@
 { config, lib, pkgs, ... }:
 
 let
-  inherit (lib) mkOption mkIf mkDefault types;
+  inherit (lib) mkOption mkIf types;
   cfg = config.services.devbox-lifecycle;
   gateway = config.services.ahp-gateway;
 
@@ -20,6 +21,7 @@ let
     pkgs.curl
     pkgs.jq
     pkgs.iproute2
+    pkgs.util-linux # setpriv: the token file is read with its owner's rights
     pkgs.awscli2
     config.systemd.package
   ];
@@ -34,16 +36,10 @@ let
     DEVBOX_SPOT_STATE = "/run/devbox-spot-watch";
   };
 
-  hasResume = gateway.enable && lib.elem "resume" gateway.managementCommands;
-
   devboxAgents = pkgs.writeShellScriptBin "devbox-agents" ''
     export PATH=${lib.makeBinPath tools}:/run/wrappers/bin:$PATH
     export DEVBOX_LIFECYCLE_LIB=${scripts}
     export DEVBOX_AUTOSTOP_STATE=${environment.DEVBOX_AUTOSTOP_STATE}
-    export DEVBOX_GATEWAY_HAS_RESUME=${if hasResume then "1" else "0"}
-    # By store path: a copy of the gateway earlier on the user's PATH is
-    # never the one run.
-    export DEVBOX_GATEWAY_COMMAND=${if hasResume then "${gateway.generated.commands}/bin/ahp-acp-gateway" else ""}
     exec ${pkgs.bash}/bin/sh ${scripts}/devbox-agents.sh "$@"
   '';
 
@@ -60,6 +56,11 @@ let
   '';
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "services" "devbox-lifecycle" "resumeOnBoot" ]
+      "Since D24 the AHP gateway never continues a turn by itself and has no resume setting: each interrupted turn waits for a person's Try Again or a new message.")
+  ];
+
   options.services.devbox-lifecycle = {
     enable = mkOption {
       type = types.bool;
@@ -92,12 +93,6 @@ in
       enable = mkOption { type = types.bool; default = true; description = "Watch for spot interruption notices."; };
       pollSeconds = mkOption { type = types.ints.positive; default = 5; };
     };
-    resumeOnBoot = mkOption {
-      type = types.bool;
-      default = true;
-      description = "Make auto-resume the gateway's install default (resume.onStart = continue, one attempt per turn).";
-    };
-
     generated = mkOption {
       internal = true;
       readOnly = true;
@@ -116,16 +111,7 @@ in
       }
     ];
 
-    services.devbox-lifecycle.generated = { inherit devboxAgents resumeSummary notify scripts hasResume; };
-
-    # The install default only: a persisted `devbox agents resume off` wins,
-    # because the unit does not set AHP_GATEWAY_RESUME.
-    services.ahp-gateway.settings = mkIf (cfg.resumeOnBoot && gateway.enable) {
-      resume = {
-        onStart = mkDefault "continue";
-        maxAttemptsPerTurn = mkDefault 1;
-      };
-    };
+    services.devbox-lifecycle.generated = { inherit devboxAgents resumeSummary notify scripts; };
 
     environment.systemPackages = [ devboxAgents ];
 

@@ -137,7 +137,7 @@ on_interruption() {
   [ -f "$dir/stopped" ] && [ -f "$dir/noticed" ] && return
   sessions="$(summary)"
   if [ ! -f "$dir/noticed" ]; then
-    (sh "$lib/notify.sh" "spot interruption: $action at $at; $sessions. Stopping the gateway so its turns can be continued." &&
+    (sh "$lib/notify.sh" "spot interruption: $action at $at; $sessions. Stopping the gateway cleanly; its turns will wait for Try Again." &&
       touch "$dir/noticed") &
   fi
   if [ ! -f "$dir/stopped" ]; then

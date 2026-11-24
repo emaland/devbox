@@ -461,14 +461,14 @@
 
   # ── Slack boot notification ─────────────────────────────────────
   # On every boot, posts the instance type / AZ / IP, current spot price and
-  # what auto-resume did to Slack. The webhook URL is read (never run) from
+  # how many turns wait for Try Again to Slack. The webhook URL is read (never run) from
   # /home/emaland/.secrets (SLACK_WEBHOOK_URL=...) by the lifecycle module's
   # notify script, so it never lives in this repo; if it is unset nothing is
   # posted. Needs ec2:DescribeSpotPriceHistory on the instance role (granted
   # by the ec2-selfmanage policy).
   systemd.services.devbox-slack-notify = {
-    description = "Notify Slack that the devbox booted (with cost and resumed turns)";
-    # After the gateway, so the resume line can report what it continued.
+    description = "Notify Slack that the devbox booted (with cost and interrupted turns)";
+    # After the gateway, so the line about interrupted turns can ask it.
     after       = [ "network-online.target" "update-route53.service" "ahp-gateway.service" ];
     wants       = [ "network-online.target" ];
     wantedBy    = [ "multi-user.target" ];
@@ -509,7 +509,7 @@
           COST=" (spot price unavailable)"
         fi
 
-        # Waits, bounded, for the gateway's continuations to start.
+        # How many turns wait for Try Again; asks the gateway once.
         RESUME=$(${config.services.devbox-lifecycle.generated.resumeSummary})
 
         MSG=":computer: booted
@@ -553,8 +553,8 @@
   # /etc/devbox/autostop-after ("off" disables). A box busy for longer than
   # the cap (default 12h, /etc/devbox/autostop-busy-cap) with nobody logged
   # in is stopped anyway, with a notice. The spot watcher stops the gateway
-  # cleanly on an interruption notice. With the gateway enabled, interrupted
-  # turns are continued at boot.
+  # cleanly on an interruption notice. After a stop the gateway restores each
+  # chat; an interrupted turn waits for a person's Try Again (D24).
   services.devbox-lifecycle = {
     enable      = true;
     webhookFile = "/home/emaland/.secrets";

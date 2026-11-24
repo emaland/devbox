@@ -98,12 +98,20 @@ func (g *fakeGateway) port() int {
 	return n
 }
 
-// statusJSON is a status answer in the gateway's shape.
+// statusJSON is a status answer in the gateway's shape. Since D24 the
+// resume object is deprecated: fixed values, except pending (still in the
+// busy rule) and interrupted.
 func statusJSON(active, waiting, pending int) string {
 	return fmt.Sprintf(`{"ok": true, "version": "0.2.2-h.3", "sessions": {"total": 3},
 "turns": {"active": %d, "waitingForUser": %d, "oldestActiveStartedAt": null, "lastActivityAt": null},
-"resume": {"policy": "continue", "source": "config", "maxAttemptsPerTurn": 1, "pending": %d, "resumedSinceStart": 0, "failed": 0, "skipped": 0}}`,
+"resume": {"policy": "off", "source": "default", "maxAttemptsPerTurn": 0, "pending": %d, "resumedSinceStart": 0, "failed": 0, "skipped": 0, "interrupted": 0}}`,
 		active, waiting, pending)
+}
+
+// statusWithInterrupted is an idle answer with n interrupted turns waiting
+// for a person.
+func statusWithInterrupted(n int) string {
+	return strings.Replace(statusJSON(0, 0, 0), `"interrupted": 0`, fmt.Sprintf(`"interrupted": %d`, n), 1)
 }
 
 // fakeIMDS is an IMDSv2 service: a session token from PUT, then reads that
@@ -214,6 +222,7 @@ type lifecycleBox struct {
 	bin     string
 	state   string
 	logFile string
+	workdir string // the scripts' working directory; empty means the test's
 	gateway *fakeGateway
 	imds    *fakeIMDS
 	hook    *fakeWebhook
@@ -260,8 +269,16 @@ func newLifecycleBox(t *testing.T) *lifecycleBox {
 		// owned by $FAKE_ROOT/listener-uid or else by this user.
 		"ss": `case "$*" in
   *-Htlne*)
+    # Given lines, with PORT replaced, stand in for the whole answer.
+    if [ -f "$FAKE_ROOT/listener-lines" ]; then
+      sed "s/PORT/$FAKE_PORT/g" "$FAKE_ROOT/listener-lines"
+      exit 0
+    fi
     uid="$(cat "$FAKE_ROOT/listener-uid" 2>/dev/null || id -u)"
-    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:* uid:$uid ino:1 sk:1 cgroup:/x <->"
+    # As the real ss does, no uid: for a socket owned by root.
+    owner=" uid:$uid"
+    [ "$uid" = 0 ] && owner=""
+    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:*$owner ino:1 sk:1 cgroup:/x <->"
     exit 0 ;;
 esac
 record ss "$@"; cat "$FAKE_ROOT/ss" 2>/dev/null; exit 0`,
@@ -372,6 +389,7 @@ func (b *lifecycleBox) run(script string, args ...string) (string, int) {
 	b.t.Helper()
 	command := exec.Command("sh", append([]string{lifecycleScript(b.t, script)}, args...)...)
 	command.Env = b.env
+	command.Dir = b.workdir
 	out, err := command.CombinedOutput()
 	if err == nil {
 		return string(out), 0

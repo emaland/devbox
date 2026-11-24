@@ -3,7 +3,9 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -351,11 +353,16 @@ func TestAutostopLogsAnUnreachableGatewayOnceAndOnChange(t *testing.T) {
 
 func TestAutostopUnusableTokenFile(t *testing.T) {
 	for name, content := range map[string]string{
-		"quote":      `abc"def` + "\n",
-		"two lines":  "abcdef\nghijkl\n",
-		"empty":      "",
-		"backslash":  `abc\def`,
+		"quote":     `abc"def` + "\n",
+		"two lines": "abcdef\nghijkl\n",
+		"empty":     "",
+		"backslash": `abc\def`,
+		"tab":       "abc\tdef\n",
+		"two CRs":   "abcdef\r\r\n",
+		// The gateway refuses both (printable ASCII 0x21 to 0x7e, and only a
+		// whole CRLF or LF line end is dropped).
 		"whitespace": "abc def\n",
+		"lone CR":    "abcdef\r",
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newLifecycleBox(t)
@@ -550,7 +557,7 @@ func TestAutostopAttachedClientDoesNotHoldOffTheCap(t *testing.T) {
 }
 
 // Review finding: with stop-instances failing, every later poll stopped the
-// gateway again, using up its turns' one continuation.
+// gateway again, interrupting whatever a person had continued since.
 func TestAutostopFailedInstanceStopIsNotRetriedEveryPoll(t *testing.T) {
 	for _, row := range []string{"cap", "idle", "requested"} {
 		t.Run(row, func(t *testing.T) {
@@ -757,5 +764,315 @@ func TestNotifyWebhookFileParsing(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("the webhook file was run")
+	}
+}
+
+// Issue 14, point 1: whatever token file the gateway accepts is accepted
+// here too. Otherwise every poll is "unreachable" and a busy agent no longer
+// keeps the box up.
+func TestGatewayStatusAcceptsWhatTheGatewayAccepts(t *testing.T) {
+	cases := map[string]func(b *lifecycleBox, token string){
+		"mode 0400": func(b *lifecycleBox, token string) {
+			if err := os.Chmod(token, 0o400); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"mode 0700": func(b *lifecycleBox, token string) {
+			if err := os.Chmod(token, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a CRLF line end": func(b *lifecycleBox, token string) {
+			b.write("token", lifecycleToken+"\r\n")
+		},
+		"no line end": func(b *lifecycleBox, token string) {
+			b.write("token", lifecycleToken)
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.gateway.set(200, statusJSON(1, 0, 0))
+			setup(b, filepath.Join(b.root, "token"))
+			out, status := b.run("gateway-status.sh")
+			if status != 0 || !strings.HasPrefix(out, "busy\n") {
+				t.Fatalf("exit %d output %q", status, out)
+			}
+		})
+	}
+	b := newLifecycleBox(t)
+	if err := os.Chmod(filepath.Join(b.root, "token"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, status := b.run("gateway-status.sh"); status != 2 || !strings.Contains(out, "token file unusable") {
+		t.Fatalf("group-readable: exit %d output %q", status, out)
+	}
+}
+
+// Issue 14, point 3: ss prints no uid: for a socket owned by root. Such a
+// listener is root's, not "nothing listening", and gets no token unless the
+// token file is root's too.
+func TestGatewayStatusSeesARootListener(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("the token file would be root's")
+	}
+	b := newLifecycleBox(t)
+	b.write("listener-uid", "0\n")
+	out, status := b.run("gateway-status.sh")
+	if status != 2 || !strings.Contains(out, "not the gateway's user") {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if requests != 0 {
+		t.Fatal("the token was sent to root's listener")
+	}
+}
+
+// Issue 14, point 2: a notice that found the gateway already down is never
+// marked done. It stops counting as an interruption under way 5 min after
+// its action time, so a failed stop after that starts the gateway again.
+func TestAutostopSpotNoticeEndsAfterItsActionTime(t *testing.T) {
+	for name, tc := range map[string]struct {
+		time    string // the notice's time file, %d is the action time
+		started int
+	}{
+		"within 5 min": {time: fmt.Sprintf("%d\n", fakeStart+4*hour-299), started: 0},
+		"at 5 min":     {time: fmt.Sprintf("%d\n", fakeStart+4*hour-300), started: 1},
+		"after 5 min":  {time: fmt.Sprintf("%d\n", fakeStart+4*hour-301), started: 1},
+		// No usable time: still an interruption under way.
+		"time not a number": {time: "soon\n", started: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.write("aws-exit", "255\n")
+			b.autostopAllowFailure()
+			b.advance(4 * hour)
+			if err := os.MkdirAll(filepath.Join(b.root, "spot", "notice-stop_x"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			b.write("spot/notice-stop_x/seen", "")
+			b.write("spot/notice-stop_x/stopped", "not running\n")
+			b.write("spot/notice-stop_x/time", tc.time)
+			b.autostopAllowFailure()
+			if got := b.count(gatewayStart); got != tc.started {
+				t.Fatalf("gateway started %d times, want %d: %v", got, tc.started, b.calls())
+			}
+		})
+	}
+}
+
+// R-SEC and R-CODE on PR 17: the listener's owner comes from ss's own
+// columns, never from text later on the line. The cgroup path is printed
+// after uid: and a local user can choose it, spaces included.
+func TestGatewayStatusReadsTheListenerByColumn(t *testing.T) {
+	owner := os.Getuid()
+	other := owner + 1
+	refused := map[string]string{
+		"owner in the cgroup path":                 fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/user.slice/x uid:%d <->\n", other, owner),
+		"address and owner in the cgroup path":     fmt.Sprintf("LISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x 127.0.0.1:PORT uid:%d <->\n", other, owner),
+		"another listener on the wildcard address": fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x <->\nLISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:%d ino:2 sk:2 cgroup:/y <->\n", owner, other),
+		"no uid or ino column":                     "LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* sk:1 cgroup:/x <->\n",
+	}
+	for name, lines := range refused {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.write("listener-lines", lines)
+			out, status := b.run("gateway-status.sh")
+			if status != 2 {
+				t.Fatalf("exit %d output %q", status, out)
+			}
+			b.gateway.mu.Lock()
+			requests := len(b.gateway.requests)
+			b.gateway.mu.Unlock()
+			if requests != 0 {
+				t.Fatalf("the token was sent (%q)", out)
+			}
+		})
+	}
+	// The real owner with another uid later on the line is still the owner.
+	b := newLifecycleBox(t)
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	b.write("listener-lines", fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x uid:%d <->\n", owner, other))
+	if out, status := b.run("gateway-status.sh"); status != 0 {
+		t.Fatalf("the gateway's own listener was refused: exit %d output %q", status, out)
+	}
+}
+
+// R-SEC on PR 17, second round: the "?" placeholder for a listener that
+// matches no owner was expanded as a file name pattern, so a one-character
+// file in the working directory could turn it into the owner's uid: here
+// owner 7 and a file named 7. (R-TEST, round 5: the fake gives a usable mode
+// and owner, so the script reaches the listener loop.)
+func TestGatewayStatusPlaceholderIsNotAPattern(t *testing.T) {
+	b := newLifecycleBox(t)
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Skip("stat not on PATH")
+	}
+	// The token file looks like owner 7's.
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) echo "600 7" ;; *) exec %s "$@" ;; esac`, realStat))
+	b.workdir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(b.workdir, "7"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b.write("listener-lines", "LISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:1234 ino:1 sk:1 cgroup:/x <->\n")
+	out, status := b.run("gateway-status.sh")
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if status != 2 || requests != 0 {
+		t.Fatalf("exit %d, %d requests, output %q", status, requests, out)
+	}
+}
+
+// R-SEC on PR 17, second round: run as root, the token file is read with
+// the file owner's own rights, so a file swapped in after the checks (a
+// link to a file only root can read) is not read by root.
+func TestGatewayStatusReadsTheTokenAsItsOwner(t *testing.T) {
+	b := newLifecycleBox(t)
+	realID, err := exec.LookPath("id")
+	if err != nil {
+		t.Skip("id not on PATH")
+	}
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Skip("stat not on PATH")
+	}
+	realTimeout, err := exec.LookPath("timeout")
+	if err != nil {
+		t.Skip("timeout not on PATH")
+	}
+	// The script believes it is root; any other question goes to the real id.
+	b.fakeProgram("id", fmt.Sprintf(`[ "$*" = -u ] && { echo 0; exit 0; }; exec %s "$@"`, realID))
+	// Round 3: the file's own group is not the owner's; it must not be used.
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%g*) echo 4242 ;; *) exec %s "$@" ;; esac`, realStat))
+	b.fakeProgram("timeout", fmt.Sprintf(`record timeout "$@"; exec %s "$@"`, realTimeout))
+	b.fakeProgram("setpriv", `record setpriv "$@"
+while [ $# -gt 0 ]; do case "$1" in --*) shift ;; *) break ;; esac; done
+exec "$@"`)
+	b.write("listener-uid", fmt.Sprintf("%d\n", os.Getuid()))
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	out, status := b.run("gateway-status.sh")
+	if status != 0 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+	primary, err := exec.Command(realID, "-g", fmt.Sprint(os.Getuid())).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := b.calls()
+	var timeoutAt, setprivAt = -1, -1
+	for n, call := range calls {
+		if timeoutAt < 0 && strings.HasPrefix(call, "timeout ") && strings.Contains(call, " setpriv ") {
+			timeoutAt = n
+		}
+		if setprivAt < 0 && strings.HasPrefix(call, "setpriv ") {
+			setprivAt = n
+		}
+	}
+	want := fmt.Sprintf("setpriv --reuid=%d --regid=%s --clear-groups env -i head -c 4096 -- %s",
+		os.Getuid(), strings.TrimSpace(string(primary)), filepath.Join(b.root, "token"))
+	// The limit is root's, outside the drop, so the owner cannot stop it.
+	if timeoutAt < 0 || setprivAt < 0 || timeoutAt > setprivAt || calls[setprivAt] != want {
+		t.Fatalf("the token was not read as its owner, under root's time limit; calls:\n%s\nwant %q", strings.Join(calls, "\n"), want)
+	}
+}
+
+// R-SEC on PR 17, second round: root's curl ignores ~/.curlrc and any
+// proxy, so the Authorization header goes only to the loopback port.
+func TestGatewayStatusCurlIgnoresConfigAndProxies(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.env = append(b.env, "http_proxy=http://127.0.0.1:9", "HTTP_PROXY=http://127.0.0.1:9", "ALL_PROXY=http://127.0.0.1:9")
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	if out, status := b.run("gateway-status.sh"); status != 0 {
+		t.Fatalf("a proxy in the environment was used: exit %d output %q", status, out)
+	}
+	argv := b.read(filepath.Join(b.root, "curl-argv"))
+	if !strings.HasPrefix(argv, "-q ") {
+		t.Fatalf("curl not started with -q: %q", argv)
+	}
+}
+
+// R-SEC on PR 17, round 4: the reader runs as the token's owner, who may
+// open its output through /proc and hold it. Root must not wait on any
+// write end the owner can hold. Here a process left behind by the reader
+// keeps its output open for 20 s.
+func TestGatewayStatusDoesNotWaitOnTheReadersOutput(t *testing.T) {
+	b := newLifecycleBox(t)
+	realHead, err := exec.LookPath("head")
+	if err != nil {
+		t.Skip("head not on PATH")
+	}
+	b.fakeProgram("head", fmt.Sprintf(`case "$*" in
+  *"$FAKE_ROOT/token"*) (exec sleep 20) & echo $! >"$FAKE_ROOT/holder-pid" ;;
+esac
+exec %s "$@"`, realHead))
+	t.Cleanup(func() {
+		if pid, err := strconv.Atoi(strings.TrimSpace(b.read(filepath.Join(b.root, "holder-pid")))); err == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	started := time.Now()
+	out, status := b.run("gateway-status.sh")
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("waited %v on a write end the reader left open", elapsed.Round(time.Second))
+	}
+	if status != 0 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+}
+
+// R-SEC on PR 17, round 4: the listener's owner controls the answer. A huge
+// one is refused, not stored and parsed by root.
+// curl's --max-filesize and the script's own size check are two layers: this
+// fails only when both are gone.
+func TestGatewayStatusRefusesAHugeAnswer(t *testing.T) {
+	b := newLifecycleBox(t)
+	padding := strings.Repeat("x", 1<<20)
+	b.gateway.set(200, `{"ok": true, "turns": {"active": 0, "waitingForUser": 0}, "padding": "`+padding+`"}`)
+	out, status := b.run("gateway-status.sh")
+	if status != 2 || strings.Contains(out, "xxxx") {
+		t.Fatalf("exit %d output %.200q", status, out)
+	}
+}
+
+// R-SEC on PR 17, round 5: a token file owned by root is refused. The
+// gateway never runs as root, and reading as the owner drops nothing then.
+func TestGatewayStatusRefusesARootOwnedTokenFile(t *testing.T) {
+	b := newLifecycleBox(t)
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Skip("stat not on PATH")
+	}
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) out="$(exec %s "$@")" || exit 1; echo "${out%% *} 0" ;; *) exec %s "$@" ;; esac`, realStat, realStat))
+	b.write("listener-uid", "0\n")
+	out, status := b.run("gateway-status.sh")
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if status != 2 || requests != 0 || !strings.Contains(out, "owned by root") {
+		t.Fatalf("exit %d, %d requests, output %q", status, requests, out)
+	}
+}
+
+// R-SEC on PR 17, round 5: an answer of several JSON documents is not one
+// status.
+func TestGatewayStatusRefusesSeveralDocuments(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.gateway.set(200, `{"ok": true} {"ok": true, "turns": {"active": 0, "waitingForUser": 0}}`)
+	if out, status := b.run("gateway-status.sh"); status != 2 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+}
+
+// R-TEST on PR 17, round 5: an empty answer is not an idle gateway.
+func TestGatewayStatusRefusesAnEmptyAnswer(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.gateway.set(200, "")
+	if out, status := b.run("gateway-status.sh"); status != 2 || !strings.Contains(out, "empty answer") {
+		t.Fatalf("exit %d output %q", status, out)
 	}
 }
