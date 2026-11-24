@@ -201,24 +201,24 @@ func TestDevboxAgentsStopWhenIdle(t *testing.T) {
 // count must not reach it as a fraction, text or a huge number. Otherwise
 // every stop guard refuses until --force.
 func TestDevboxAgentsStatusJSONCountsAreWholeNumbers(t *testing.T) {
+	ordinary := struct{ sessions, turns string }{`{"total": 1}`, `{"active": 0, "waitingForUser": 0}`}
 	for name, tc := range map[string]struct {
-		resume               string
-		interrupted, pending any
+		sessions, turns             string
+		resume                      string
+		interrupted, pending        any
+		sessionsN, running, waiting any
 	}{
-		"fractions":            {`{"interrupted": 1.7, "pending": 0.5}`, 1.0, 0.0},
-		"text":                 {`{"interrupted": "3", "pending": "x"}`, nil, 0.0},
-		"resume not an object": {`"off"`, nil, 0.0},
-		"out of range":         {`{"interrupted": 1e400, "pending": -1}`, nil, 0.0},
-		// The other counts come from the gateway too.
-		"other counts": {`{"interrupted": 1}`, 1.0, 0.0},
+		"fractions":            {ordinary.sessions, ordinary.turns, `{"interrupted": 1.7, "pending": 0.5}`, 1.0, 0.0, 1.0, 0.0, 0.0},
+		"text":                 {ordinary.sessions, ordinary.turns, `{"interrupted": "3", "pending": "x"}`, nil, 0.0, 1.0, 0.0, 0.0},
+		"resume not an object": {ordinary.sessions, ordinary.turns, `"off"`, nil, 0.0, 1.0, 0.0, 0.0},
+		"out of range":         {ordinary.sessions, ordinary.turns, `{"interrupted": 1e400, "pending": -1}`, nil, 0.0, 1.0, 0.0, 0.0},
+		// The other counts come from the gateway too; running is
+		// 3.2 - 0.5 = 2.7, so each of the three needs the rule.
+		"other counts": {`{"total": 1.5}`, `{"active": 3.2, "waitingForUser": 0.5}`, `{"interrupted": 1}`, 1.0, 0.0, 1.0, 2.0, 0.0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newLifecycleBox(t)
-			sessions, turns := `{"total": 1}`, `{"active": 0, "waitingForUser": 0}`
-			if name == "other counts" {
-				sessions, turns = `{"total": 1.5}`, `{"active": 2.5, "waitingForUser": 0.5}`
-			}
-			b.gateway.set(200, `{"ok": true, "sessions": `+sessions+`, "turns": `+turns+`, "resume": `+tc.resume+`}`)
+			b.gateway.set(200, `{"ok": true, "sessions": `+tc.sessions+`, "turns": `+tc.turns+`, "resume": `+tc.resume+`}`)
 			out, status := b.run("devbox-agents.sh", "status", "--json")
 			var got map[string]any
 			if err := json.Unmarshal([]byte(out), &got); err != nil {
@@ -226,6 +226,9 @@ func TestDevboxAgentsStatusJSONCountsAreWholeNumbers(t *testing.T) {
 			}
 			if got["interrupted"] != tc.interrupted || got["pending"] != tc.pending {
 				t.Fatalf("interrupted %v pending %v, want %v %v (%q)", got["interrupted"], got["pending"], tc.interrupted, tc.pending, out)
+			}
+			if got["sessions"] != tc.sessionsN || got["running"] != tc.running || got["waiting"] != tc.waiting {
+				t.Fatalf("sessions %v running %v waiting %v, want %v %v %v (%q)", got["sessions"], got["running"], got["waiting"], tc.sessionsN, tc.running, tc.waiting, out)
 			}
 			var s agentStatus
 			if err := json.Unmarshal([]byte(out), &s); err != nil {
