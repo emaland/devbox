@@ -21,6 +21,7 @@ let
     pkgs.curl
     pkgs.jq
     pkgs.iproute2
+    pkgs.util-linux # setpriv: the token file is read with its owner's rights
     pkgs.awscli2
     config.systemd.package
   ];

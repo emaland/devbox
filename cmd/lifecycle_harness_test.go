@@ -222,6 +222,7 @@ type lifecycleBox struct {
 	bin     string
 	state   string
 	logFile string
+	workdir string // the scripts' working directory; empty means the test's
 	gateway *fakeGateway
 	imds    *fakeIMDS
 	hook    *fakeWebhook
@@ -268,8 +269,16 @@ func newLifecycleBox(t *testing.T) *lifecycleBox {
 		// owned by $FAKE_ROOT/listener-uid or else by this user.
 		"ss": `case "$*" in
   *-Htlne*)
+    # Given lines, with PORT replaced, stand in for the whole answer.
+    if [ -f "$FAKE_ROOT/listener-lines" ]; then
+      sed "s/PORT/$FAKE_PORT/g" "$FAKE_ROOT/listener-lines"
+      exit 0
+    fi
     uid="$(cat "$FAKE_ROOT/listener-uid" 2>/dev/null || id -u)"
-    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:* uid:$uid ino:1 sk:1 cgroup:/x <->"
+    # As the real ss does, no uid: for a socket owned by root.
+    owner=" uid:$uid"
+    [ "$uid" = 0 ] && owner=""
+    [ -f "$FAKE_ROOT/no-listener" ] || echo "LISTEN 0 4096 127.0.0.1:$FAKE_PORT 0.0.0.0:*$owner ino:1 sk:1 cgroup:/x <->"
     exit 0 ;;
 esac
 record ss "$@"; cat "$FAKE_ROOT/ss" 2>/dev/null; exit 0`,
@@ -380,6 +389,7 @@ func (b *lifecycleBox) run(script string, args ...string) (string, int) {
 	b.t.Helper()
 	command := exec.Command("sh", append([]string{lifecycleScript(b.t, script)}, args...)...)
 	command.Env = b.env
+	command.Dir = b.workdir
 	out, err := command.CombinedOutput()
 	if err == nil {
 		return string(out), 0
