@@ -325,6 +325,8 @@ esac`,
 		"DEVBOX_IMDS="+b.imds.server.URL,
 		"DEVBOX_SPOT_STATE="+filepath.Join(root, "spot"),
 		"DEVBOX_PROC_STAT="+filepath.Join(root, "proc-stat"),
+		// The scripts' mktemp files stay inside the test's own directory.
+		"TMPDIR="+root,
 	)
 	// Booted ten minutes before the fake clock's start.
 	b.write("proc-stat", "cpu  1 2 3\nbtime 1699999400\nprocesses 10\n")
