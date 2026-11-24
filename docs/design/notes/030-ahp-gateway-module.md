@@ -232,7 +232,9 @@ NixOS options on the unit: `restartIfChanged = false`.
 
      A backup is a copy of the database file and its `-wal` and `-shm`
      companions to a temporary directory, renamed to
-     `<stateDir>/backups/devbox-<time>-<old version>/` when complete. Only
+     `<stateDir>/backups/devbox/<time>-<old version>/` when complete (in a
+     directory of its own: the gateway's tools treat the files in
+     `backups/` as theirs). Only
      complete directories with that prefix are pruned, to the newest five, and
      never the one just made. The record is written after the backup and
      before the build starts, so a build that fails its first start is still
@@ -427,7 +429,11 @@ locally.
 2. A lock in the gateway on its state dir is the only complete answer to a
    second gateway on the same database.
 3. The stop and ready timeouts should follow the bounds of the build in use.
-4. Backups are pruned only by this module, and only its own directories. If a
-   build's tooling keeps backups in the same directory they must not share the
-   `devbox-` prefix.
+4. Backups. devbox's own backups are directories in `backups/devbox/`, kept to
+   the newest five. The gateway's own backups are files in `backups/`, named
+   `ahp-acp-gateway-<UTC time>-v<version>.db`; the gateway never prunes them
+   and `upgrade` is refused on the devbox, so prepare owns their retention
+   (the gateway's note 021, section 2.5 step 11): the five newest by name and
+   the one written last are kept, and `failed-*`, `.partial`, links and other
+   names are never touched.
 5. Which agent adapter build the box runs is set outside this repository.

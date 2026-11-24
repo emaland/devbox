@@ -189,9 +189,11 @@ What it does: listens on `127.0.0.1` only, always with a token
 (`<state dir>/token`, made on first start), with browser origins refused unless
 listed in `allowedOrigins`. Agents must be programs in the Nix store; every
 built-in launcher that downloads code is disabled. Before a different build
-first opens the database it is backed up to `<state dir>/backups/`, and an
-older build is refused. A config switch never restarts a running gateway; the
-new build takes effect at the next restart or boot.
+first opens the database it is backed up to `<state dir>/backups/devbox/`, and an
+older build is refused. The gateway's own backups in `<state dir>/backups/` are
+kept to the newest five at each start; `failed-*` copies are never removed. A
+config switch never restarts a running gateway; the new build takes effect at
+the next restart or boot.
 
 The unit counts as started only when the gateway answers, owns its port, listens
 on loopback only and refuses a connection without a token. If it fails, if it
