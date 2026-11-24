@@ -17,7 +17,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push replaces an older run only on a pull request; every commit
+  # on main is checked.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -34,7 +36,10 @@ jobs:
           go-version-file: go.mod
       # scripts/check.sh needs Nix with a nixpkgs channel: the template is
       # evaluated against it, and gitleaks, jq and shellcheck come from it.
-      # The same release as the devbox runs.
+      # The same release as the devbox runs. v32.1.0 verifies the installer's
+      # checksum. The action always gives Nix the job's token for GitHub
+      # downloads; it cannot be turned off, it is read-only here
+      # (contents: read), masked in logs, and ends with the job.
       - uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
         with:
           nix_path: nixpkgs=channel:nixos-26.05
