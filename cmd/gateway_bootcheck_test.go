@@ -74,14 +74,13 @@ func (b bootBox) waitListening() {
 func (b bootBox) systemctl(overrides map[string]string) {
 	b.t.Helper()
 	properties := map[string]string{
-		"ahp-gateway.service ActiveState":                            "active",
-		"ahp-gateway.service NRestarts":                              "0",
-		"ahp-gateway.service MainPID":                                strconv.Itoa(b.pid),
-		"ahp-gateway.service ActiveEnterTimestampMonotonic":          "20000000",
-		"home.mount ActiveEnterTimestampMonotonic":                   "10000000",
-		"ahp-gateway-check.timer ActiveState":                        "active",
-		"ahp-gateway-failed.service ActiveState":                     "inactive",
-		"ahp-gateway-failed.service ExecMainStartTimestampMonotonic": "0",
+		"ahp-gateway.service ActiveState":                   "active",
+		"ahp-gateway.service NRestarts":                     "0",
+		"ahp-gateway.service MainPID":                       strconv.Itoa(b.pid),
+		"ahp-gateway.service ActiveEnterTimestampMonotonic": "20000000",
+		"home.mount ActiveEnterTimestampMonotonic":          "10000000",
+		"ahp-gateway-check.timer ActiveState":               "active",
+		"ahp-gateway.service User":                          currentUser(b.t),
 	}
 	for key, value := range overrides {
 		properties[key] = value
@@ -119,6 +118,30 @@ func (b bootBox) run() (string, int) {
 	return "", -1
 }
 
+func currentUser(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("id", "-un").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// strayLines are the lines of the check's output other than its PASS and
+// FAIL lines and its closing note.
+func strayLines(out string) []string {
+	var stray []string
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case line == "", strings.HasPrefix(line, "PASS  "), strings.HasPrefix(line, "FAIL  "),
+			strings.HasPrefix(line, "MainPID "), strings.HasPrefix(line, "to confirm that"):
+		default:
+			stray = append(stray, line)
+		}
+	}
+	return stray
+}
+
 func failLines(out string) []string {
 	var lines []string
 	for _, line := range strings.Split(out, "\n") {
@@ -135,13 +158,16 @@ func TestBootCheckPassesOnAGoodBox(t *testing.T) {
 	if status != 0 || len(failLines(out)) != 0 {
 		t.Fatalf("exit %d:\n%s", status, out)
 	}
-	for _, want := range []string{"unit active", "after /home", "no restarts", "state dir", "token", "answers", "loopback", "without a token", "timer"} {
+	for _, want := range []string{"unit active", "after /home", "no restarts since it was started", "state dir", "token", "answers", "loopback", "without a token", "timer"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("no line about %q:\n%s", want, out)
 		}
 	}
 	if strings.Contains(out, strings.Repeat("A", 43)) {
 		t.Error("the check printed the token")
+	}
+	if stray := strayLines(out); len(stray) > 0 {
+		t.Errorf("lines that are not PASS or FAIL: %q", stray)
 	}
 }
 
@@ -168,6 +194,12 @@ func TestBootCheckFindsEachProblem(t *testing.T) {
 		}, "token"},
 		{"open to connections without a token", func(b *bootBox) { b.replaceGateway("open") }, "without a token"},
 		{"not loopback only", func(b *bootBox) { b.replaceGateway("all") }, "loopback"},
+		{"no /home mount time", func(b *bootBox) {
+			b.systemctl(map[string]string{"home.mount ActiveEnterTimestampMonotonic": ""})
+		}, "after /home"},
+		{"token owned by another user", func(b *bootBox) {
+			b.systemctl(map[string]string{"ahp-gateway.service User": "someone-else"})
+		}, "token"},
 		{"timer off", func(b *bootBox) { b.systemctl(map[string]string{"ahp-gateway-check.timer ActiveState": "inactive"}) }, "timer"},
 	}
 	for _, tc := range cases {
@@ -177,6 +209,12 @@ func TestBootCheckFindsEachProblem(t *testing.T) {
 			out, status := b.run()
 			if status == 0 {
 				t.Fatalf("passed:\n%s", out)
+			}
+			if strings.Contains(out, strings.Repeat("A", 43)) {
+				t.Error("the check printed the token")
+			}
+			if stray := strayLines(out); len(stray) > 0 {
+				t.Errorf("lines that are not PASS or FAIL (a shell error?): %q", stray)
 			}
 			failed := strings.Join(failLines(out), "\n")
 			if !strings.Contains(failed, tc.want) {

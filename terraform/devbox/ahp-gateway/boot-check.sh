@@ -2,7 +2,8 @@
 # The boot checklist for the AHP gateway service, run by hand on a real box
 # after a reboot: what only a real boot can show. It only reads. Each promise
 # gets one PASS or FAIL line; the exit status is 1 if any line is FAIL. It
-# never prints the token.
+# never prints the token. Run it as the gateway's user: another user cannot
+# see into its home directory.
 #
 #   sh /etc/nixos/current/devbox/ahp-gateway/boot-check.sh
 #
@@ -40,7 +41,8 @@ if [ "$active" = active ]; then pass "unit active ($unit)"; else fail "unit acti
 
 started="$(property "$unit" ActiveEnterTimestampMonotonic)"
 home="$(property home.mount ActiveEnterTimestampMonotonic)"
-case "$started$home" in *[!0-9]* | "") started=0 home=0 ;; esac
+case "$started" in "" | *[!0-9]*) started=0 ;; esac
+case "$home" in "" | *[!0-9]*) home=0 ;; esac
 if [ "$home" -gt 0 ] && [ "$started" -gt "$home" ]; then
   pass "started after /home was mounted"
 else
@@ -48,7 +50,9 @@ else
 fi
 
 restarts="$(property "$unit" NRestarts)"
-if [ "${restarts:-0}" = 0 ]; then pass "no restarts since boot"; else fail "no restarts since boot ($restarts; see journalctl -u ${unit%.service})"; fi
+# NRestarts counts the restarts since the unit was last started by hand or at
+# boot.
+if [ "${restarts:-0}" = 0 ]; then pass "no restarts since it was started"; else fail "no restarts since it was started ($restarts; see journalctl -u ${unit%.service})"; fi
 
 # The files.
 if [ -d "$state_dir" ] && [ "$(stat -c %a "$state_dir")" = 700 ]; then
@@ -56,11 +60,12 @@ if [ -d "$state_dir" ] && [ "$(stat -c %a "$state_dir")" = 700 ]; then
 else
   fail "state dir is private (0700): $state_dir is $(stat -c %a "$state_dir" 2>/dev/null || echo missing)"
 fi
+user="$(property "$unit" User)"
 if [ -f "$token_file" ] && [ "$(stat -c %a "$token_file")" = 600 ] &&
-  [ "$(stat -c %U "$token_file")" = "$(stat -c %U "$state_dir")" ]; then
+  [ -n "$user" ] && [ "$(stat -c %U "$token_file")" = "$user" ]; then
   pass "token is 0600 and owned by the gateway's user"
 else
-  fail "token is 0600 and owned by the gateway's user: $token_file is $(stat -c '%a %U' "$token_file" 2>/dev/null || echo missing)"
+  fail "token is 0600 and owned by the gateway's user (${user:-unknown}): $token_file is $(stat -c '%a %U' "$token_file" 2>/dev/null || echo missing)"
 fi
 
 # The listener.
