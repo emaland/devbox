@@ -441,11 +441,51 @@ func TestAgentStatusString(t *testing.T) {
 	for s, want := range map[agentStatus]string{
 		{State: "busy", Sessions: &three, Running: 2, Waiting: 1}: "busy: 3 sessions, 2 running, 1 waiting",
 		{State: "idle", Pending: 1}:                               "idle: ? sessions, 0 running, 0 waiting, 1 continuations pending",
+		{State: "idle", Interrupted: 2}:                           "idle: ? sessions, 0 running, 0 waiting, 2 interrupted",
 		{State: "unreachable", Reason: "HTTP 401"}:                "gateway not answering (HTTP 401)",
 		{State: "none"}: "no gateway",
 	} {
 		if got := s.String(); got != want {
 			t.Errorf("%+v: %q, want %q", s, got, want)
 		}
+	}
+}
+
+// D24: the gateway has no resume switch. `devbox agents resume` says so and
+// contacts nothing, rather than taking "resume" for an instance id.
+func TestAgentsResumeSaysThereIsNoSwitch(t *testing.T) {
+	for _, args := range [][]string{{"resume"}, {"resume", "on"}, {"resume", "off", "i-x"}, {"resume", "status"}} {
+		f := newFakeRemote(t)
+		agents := newAgentsCmd()
+		var out bytes.Buffer
+		agents.SetOut(&out)
+		agents.SetErr(&out)
+		agents.SetArgs(args)
+		agents.SilenceUsage = true
+		err := agents.Execute()
+		// Asking to turn on what cannot happen fails, so a script notices.
+		if wantErr := len(args) > 1 && args[1] == "on"; (err != nil) != wantErr {
+			t.Fatalf("%v: error %v, want an error: %v", args, err, wantErr)
+		}
+		if !strings.Contains(out.String(), "Try Again") {
+			t.Fatalf("%v: output %q", args, out.String())
+		}
+		if len(f.events) != 0 {
+			t.Fatalf("%v: contacted the box: %v", args, f.events)
+		}
+	}
+}
+
+// R-TEST on PR 18: the laptop reads the box's interrupted count by its JSON
+// name.
+func TestReadAgentsReadsInterrupted(t *testing.T) {
+	f := newFakeRemote(t)
+	f.status("i-1", `{"state":"idle","sessions":2,"running":0,"waiting":0,"pending":0,"interrupted":2}`, 0)
+	s, err := readAgents(context.Background(), "i-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Interrupted != 2 || !strings.Contains(s.String(), "2 interrupted") {
+		t.Fatalf("read %+v, shown %q", s, s.String())
 	}
 }

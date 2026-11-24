@@ -6,8 +6,15 @@
 //
 //   <stateDir>/turns.json    {"active": n, "waitingForUser": m}, set by the test
 //   <stateDir>/clean-stops   one line per clean stop
-//   <stateDir>/interrupted   turns active at the last clean stop
-//   <stateDir>/continued     one line per continuation, written at start
+//   <stateDir>/interrupted   chats whose latest turn a clean stop interrupted
+//                            (C2's resume.interrupted). The stub has one chat
+//                            and no Try Again: a stop with any active turn,
+//                            waiting for a person or not, makes it 1, and a
+//                            stop with none leaves it as it was. A new turn
+//                            between stops, which C2 says clears it, is not
+//                            modelled
+//   <stateDir>/continued     one line per turn continued at start; since D24
+//                            the gateway never does that, so this stays empty
 "use strict";
 const fs = require("fs");
 const http = require("http");
@@ -22,15 +29,12 @@ const read = (name, fallback) => {
 };
 const turns = () => JSON.parse(read("turns.json", '{"active": 0, "waitingForUser": 0}'));
 
-const policy = (config.resume && config.resume.onStart) || "off";
-let resumedSinceStart = 0;
+// D24: interrupted turns are restored and wait for a person. None is
+// continued, whatever the config says.
 const interrupted = Number(read("interrupted", "0"));
-if (interrupted > 0 && policy === "continue") {
-  for (let i = 0; i < interrupted; i++) fs.appendFileSync(file("continued"), "turn\n");
-  resumedSinceStart = interrupted;
-  fs.writeFileSync(file("turns.json"), JSON.stringify({ active: interrupted, waitingForUser: 0 }));
+if (config.resume && config.resume.onStart === "continue") {
+  fs.appendFileSync(file("continued"), "config asked for continuation\n");
 }
-fs.writeFileSync(file("interrupted"), "0");
 
 const server = http.createServer((request, response) => {
   if (request.url === "/healthz") {
@@ -56,14 +60,15 @@ const server = http.createServer((request, response) => {
   response.end(JSON.stringify({
     ok: true, version: "0.0.0-stub", sessions: { total: 1 }, clients: 0,
     turns: turns(),
-    resume: { policy, source: "config", maxAttemptsPerTurn: 1, pending: 0, resumedSinceStart, failed: 0, skipped: 0 },
+    resume: { policy: "off", source: "default", maxAttemptsPerTurn: 0, pending: 0, resumedSinceStart: 0, failed: 0, skipped: 0, interrupted },
   }));
 });
 server.listen(config.listener.port, "127.0.0.1");
 
 process.on("SIGTERM", () => {
   fs.appendFileSync(file("clean-stops"), `${new Date().toISOString()}\n`);
-  fs.writeFileSync(file("interrupted"), String(turns().active - turns().waitingForUser));
+  // C3 ends every active turn host_restarted, one waiting for a person too.
+  if (turns().active > 0) fs.writeFileSync(file("interrupted"), "1");
   fs.writeFileSync(file("turns.json"), '{"active": 0, "waitingForUser": 0}');
   server.close(() => process.exit(0));
 });

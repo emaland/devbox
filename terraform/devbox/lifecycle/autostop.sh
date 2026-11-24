@@ -135,8 +135,8 @@ stop_box() {
     aws ec2 stop-instances --region "${zone%?}" --instance-ids "$instance" >/dev/null && exit 0
 
   # The next try is one full window (or cap) from now, not the next poll:
-  # every try stops the gateway, and each stop uses up the interrupted turns'
-  # one continuation. A requested stop is dropped; ask again.
+  # every try stops the gateway, and each stop interrupts whatever a person
+  # has continued since. A requested stop is dropped; ask again.
   echo "$now" >"$state/last-active"
   [ -f "$state/busy-since" ] && echo "$now" >"$state/busy-since"
   rm -f "$state/stop-when-idle"
@@ -212,7 +212,7 @@ if [ "$gateway_state" = busy ]; then
   busy_for=$((now - busy_since))
   if [ "$cap" != off ] && [ "$busy_for" -ge "$cap" ]; then
     stop_box "busy ${busy_for}s >= cap ${cap}s" \
-      "agents busy for ${busy_for}s, past the ${cap}s cap ($(turns "$gateway_json")); stopping anyway. Interrupted turns continue at the next start if auto-resume is on."
+      "agents busy for ${busy_for}s, past the ${cap}s cap ($(turns "$gateway_json")); stopping anyway. Interrupted turns wait for Try Again at the next start."
   fi
   decide "active (agent busy)"
   exit 0

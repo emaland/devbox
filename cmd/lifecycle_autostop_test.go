@@ -557,7 +557,7 @@ func TestAutostopAttachedClientDoesNotHoldOffTheCap(t *testing.T) {
 }
 
 // Review finding: with stop-instances failing, every later poll stopped the
-// gateway again, using up its turns' one continuation.
+// gateway again, interrupting whatever a person had continued since.
 func TestAutostopFailedInstanceStopIsNotRetriedEveryPoll(t *testing.T) {
 	for _, row := range []string{"cap", "idle", "requested"} {
 		t.Run(row, func(t *testing.T) {

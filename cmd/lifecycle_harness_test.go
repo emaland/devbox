@@ -98,12 +98,20 @@ func (g *fakeGateway) port() int {
 	return n
 }
 
-// statusJSON is a status answer in the gateway's shape.
+// statusJSON is a status answer in the gateway's shape. Since D24 the
+// resume object is deprecated: fixed values, except pending (still in the
+// busy rule) and interrupted.
 func statusJSON(active, waiting, pending int) string {
 	return fmt.Sprintf(`{"ok": true, "version": "0.2.2-h.3", "sessions": {"total": 3},
 "turns": {"active": %d, "waitingForUser": %d, "oldestActiveStartedAt": null, "lastActivityAt": null},
-"resume": {"policy": "continue", "source": "config", "maxAttemptsPerTurn": 1, "pending": %d, "resumedSinceStart": 0, "failed": 0, "skipped": 0}}`,
+"resume": {"policy": "off", "source": "default", "maxAttemptsPerTurn": 0, "pending": %d, "resumedSinceStart": 0, "failed": 0, "skipped": 0, "interrupted": 0}}`,
 		active, waiting, pending)
+}
+
+// statusWithInterrupted is an idle answer with n interrupted turns waiting
+// for a person.
+func statusWithInterrupted(n int) string {
+	return strings.Replace(statusJSON(0, 0, 0), `"interrupted": 0`, fmt.Sprintf(`"interrupted": %d`, n), 1)
 }
 
 // fakeIMDS is an IMDSv2 service: a session token from PUT, then reads that

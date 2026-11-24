@@ -60,13 +60,13 @@ in import <nixpkgs/nixos> {
 func TestLifecycleModuleUnits(t *testing.T) {
 	needNix(t)
 	var got struct {
-		Autostop  gatewayUnit       `json:"autostop"`
-		Timer     map[string]string `json:"timer"`
-		Spot      gatewayUnit       `json:"spot"`
-		Gateway   gatewayUnit       `json:"gateway"`
-		Packages  []string          `json:"packages"`
-		Settings  map[string]any    `json:"settings"`
-		HasResume bool              `json:"hasResume"`
+		Autostop gatewayUnit       `json:"autostop"`
+		Timer    map[string]string `json:"timer"`
+		Spot     gatewayUnit       `json:"spot"`
+		Gateway  gatewayUnit       `json:"gateway"`
+		Packages []string          `json:"packages"`
+		Settings map[string]any    `json:"settings"`
+		Agents   string            `json:"agents"`
 	}
 	evalJSON(t, "let s = "+lifecycleSystem(t, "{}", "{}")+`; c = s.config; in {
   autostop = { inherit (c.systemd.services.devbox-autostop) description wantedBy wants after restartIfChanged environment unitConfig serviceConfig; };
@@ -75,7 +75,7 @@ func TestLifecycleModuleUnits(t *testing.T) {
   gateway = { inherit (c.systemd.services.ahp-gateway) description wantedBy wants after restartIfChanged environment unitConfig serviceConfig; };
   packages = map (p: p.name) c.environment.systemPackages;
   settings = c.services.ahp-gateway.settings;
-  hasResume = c.services.devbox-lifecycle.generated.hasResume;
+  agents = c.services.devbox-lifecycle.generated.devboxAgents.text;
 }`, "", &got)
 
 	if got.Timer["OnUnitActiveSec"] != "10min" || got.Timer["Unit"] != "devbox-autostop.service" {
@@ -109,14 +109,9 @@ func TestLifecycleModuleUnits(t *testing.T) {
 	if got.Gateway.ServiceConfig["TimeoutStopSec"] != 45.0 {
 		t.Errorf("gateway TimeoutStopSec %v", got.Gateway.ServiceConfig["TimeoutStopSec"])
 	}
-	// The resume default is config only; the unit must not override a
-	// persisted off.
-	if _, set := got.Gateway.Environment["AHP_GATEWAY_RESUME"]; set {
-		t.Error("the unit sets AHP_GATEWAY_RESUME, which would override the persisted switch")
-	}
-
-	resume, _ := got.Settings["resume"].(map[string]any)
-	if resume["onStart"] != "continue" || resume["maxAttemptsPerTurn"] != 1.0 {
+	// D24: the host never continues a turn by itself, so the module sets
+	// no resume settings.
+	if _, set := got.Settings["resume"]; set {
 		t.Errorf("resume settings: %v", got.Settings)
 	}
 	found := false
@@ -128,8 +123,8 @@ func TestLifecycleModuleUnits(t *testing.T) {
 	if !found {
 		t.Errorf("devbox-agents not installed: %v", got.Packages)
 	}
-	if got.HasResume {
-		t.Error("the public build offers no resume command, so devbox-agents must not run one")
+	if strings.Contains(got.Agents, "DEVBOX_GATEWAY_COMMAND") || strings.Contains(got.Agents, "HAS_RESUME") {
+		t.Errorf("devbox-agents is still given a gateway command to run:\n%s", got.Agents)
 	}
 }
 
@@ -212,65 +207,14 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-func TestLifecycleModuleResumeFlagFollowsTheWrapper(t *testing.T) {
+// D24: resumeOnBoot is gone. A config that still sets it gets a message
+// saying why, not a silent no-op.
+func TestLifecycleModuleResumeOnBootIsRemoved(t *testing.T) {
 	needNix(t)
-	var has bool
-	evalJSON(t, "("+lifecycleSystem(t, `{ managementCommands = [ "status" "resume" ]; }`, "{}")+
-		").config.services.devbox-lifecycle.generated.hasResume", "", &has)
-	if !has {
-		t.Fatal("resume offered by the wrapper but not by devbox-agents")
-	}
-}
-
-func TestLifecycleModuleResumeDefaults(t *testing.T) {
-	needNix(t)
-	rows := []struct {
-		name, gateway, lifecycle string
-		want                     any
-	}{
-		{"a user value wins", `{ settings.resume.onStart = "off"; }`, "{}", "off"},
-		{"resumeOnBoot off sets nothing", "{}", "{ resumeOnBoot = false; }", nil},
-	}
-	for _, r := range rows {
-		t.Run(r.name, func(t *testing.T) {
-			var settings map[string]any
-			evalJSON(t, "("+lifecycleSystem(t, r.gateway, r.lifecycle)+").config.services.ahp-gateway.settings", "", &settings)
-			resume, _ := settings["resume"].(map[string]any)
-			var got any
-			if resume != nil {
-				got = resume["onStart"]
-			}
-			if got != r.want {
-				t.Fatalf("resume.onStart = %v, want %v (settings %v)", got, r.want, settings)
-			}
-		})
-	}
-}
-
-// The setting reaches the file the gateway starts from.
-func TestLifecycleModuleResumeReachesTheGatewayConfig(t *testing.T) {
-	needNix(t)
-	out, err := exec.Command("nix-build", "--no-out-link", "-E",
-		"("+lifecycleSystem(t, "{}", "{}")+").config.services.ahp-gateway.generated.baseConfig").Output()
-	if err != nil {
-		var stderr string
-		if exit, ok := err.(*exec.ExitError); ok {
-			stderr = string(exit.Stderr)
-		}
-		t.Fatalf("building the base config: %v\n%s", err, lastLines(stderr, 15))
-	}
-	data, err := os.ReadFile(strings.TrimSpace(string(out)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var config struct {
-		Resume map[string]any `json:"resume"`
-	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		t.Fatal(err)
-	}
-	if config.Resume["onStart"] != "continue" || config.Resume["maxAttemptsPerTurn"] != 1.0 {
-		t.Fatalf("base config resume: %v", config.Resume)
+	expression := "(" + lifecycleSystem(t, "{}", "{ resumeOnBoot = true; }") + ").config.system.build.toplevel.drvPath"
+	out, err := exec.Command("nix-instantiate", "--eval", "-E", expression).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "resumeOnBoot") || !strings.Contains(string(out), "Try Again") {
+		t.Fatalf("resumeOnBoot accepted, or refused without the reason:\n%s", lastLines(string(out), 10))
 	}
 }
 
