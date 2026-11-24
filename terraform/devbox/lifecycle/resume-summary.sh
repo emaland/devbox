@@ -18,13 +18,14 @@ case $? in
   3) ;;
   2) printf 'gateway: not answering (%s)\n' "$out" ;;
   0)
-    # A number only: this line goes to the notification as it is.
-    printf '%s\n' "$out" | sed -n 2p | jq -r '
-      if (.resume | type) != "object" or (.resume.interrupted | type) != "number"
-      then "interrupted turns: not reported by this gateway build"
-      elif .resume.interrupted == 0 then "interrupted turns: none"
-      else "interrupted turns: \(.resume.interrupted | floor), waiting for Try Again or a new message"
-      end'
+    # A whole number in range only: this line goes to the notification as
+    # it is.
+    printf '%s\n' "$out" | sed -n 2p | jq -r 'def count: if type == "number" and . >= 0 and . < 1e9 then floor else null end;
+      ((.resume | objects | .interrupted | count) // null)
+      | if . == null then "interrupted turns: not reported by this gateway build"
+        elif . == 0 then "interrupted turns: none"
+        else "interrupted turns: \(.), waiting for Try Again or a new message"
+        end'
     ;;
 esac
 exit 0

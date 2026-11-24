@@ -363,7 +363,7 @@ When the box comes back, the gateway restores every chat with its history. A tur
 
 To continue the turn, press **Try Again** in the editor, or send a new message. The agent is then told that the host restarted, and asked to check whether its last command or edit finished. A turn that was waiting for your permission asks again.
 
-The boot notification says how many turns are waiting. So does `devbox agents`:
+The boot notification says how many turns are waiting. So does `devbox agents`. If your `local.nix` sets `services.devbox-lifecycle.resumeOnBoot`, remove it: the option is gone, and a config that sets it no longer builds.
 
 ```bash
 devbox agents     # ...; 2 interrupted, waiting for Try Again

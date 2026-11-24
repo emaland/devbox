@@ -27,7 +27,7 @@ is preserved; bring the box back with 'devbox up'.
 
 Before stopping, the agents on the box are checked: if one is working, the
 stop is refused and what is running is shown. The gateway is then stopped
-cleanly, so interrupted turns can be continued at the next start.
+cleanly; at the next start each interrupted turn waits for Try Again.
 
   devbox down [id...]               Stop, unless an agent is working
   devbox down --force [id...]       Stop even if an agent is working (still cleanly)

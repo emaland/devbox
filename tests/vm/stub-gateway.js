@@ -6,7 +6,9 @@
 //
 //   <stateDir>/turns.json    {"active": n, "waitingForUser": m}, set by the test
 //   <stateDir>/clean-stops   one line per clean stop
-//   <stateDir>/interrupted   turns active at the last clean stop
+//   <stateDir>/interrupted   turns interrupted by clean stops and not yet
+//                            continued (C2's resume.interrupted); the stub has
+//                            no Try Again, so it only grows
 //   <stateDir>/continued     one line per turn continued at start; since D24
 //                            the gateway never does that, so this stays empty
 "use strict";
@@ -61,7 +63,8 @@ server.listen(config.listener.port, "127.0.0.1");
 
 process.on("SIGTERM", () => {
   fs.appendFileSync(file("clean-stops"), `${new Date().toISOString()}\n`);
-  fs.writeFileSync(file("interrupted"), String(turns().active - turns().waitingForUser));
+  const now = turns().active - turns().waitingForUser;
+  fs.writeFileSync(file("interrupted"), String(Number(read("interrupted", "0")) + now));
   fs.writeFileSync(file("turns.json"), '{"active": 0, "waitingForUser": 0}');
   server.close(() => process.exit(0));
 });

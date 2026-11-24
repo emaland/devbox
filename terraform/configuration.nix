@@ -461,7 +461,7 @@
 
   # ── Slack boot notification ─────────────────────────────────────
   # On every boot, posts the instance type / AZ / IP, current spot price and
-  # how many turns the stop interrupted to Slack. The webhook URL is read (never run) from
+  # how many turns wait for Try Again to Slack. The webhook URL is read (never run) from
   # /home/emaland/.secrets (SLACK_WEBHOOK_URL=...) by the lifecycle module's
   # notify script, so it never lives in this repo; if it is unset nothing is
   # posted. Needs ec2:DescribeSpotPriceHistory on the instance role (granted

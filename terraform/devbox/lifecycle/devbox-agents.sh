@@ -45,14 +45,19 @@ status() {
   code=$?
   if [ "${1:-}" = --json ]; then
     case "$code" in
-      0) printf '%s' "$json" | jq -c --arg state "$state" '{state: $state, sessions: (.sessions.total // null), running: (.turns.active - .turns.waitingForUser), waiting: .turns.waitingForUser, pending: (.resume.pending // 0), interrupted: ((.resume | objects | .interrupted | numbers) // null)}' ;;
+      # Counts are whole numbers in range or absent: the laptop reads them
+      # into ints, and one it cannot read makes every stop guard refuse.
+      0) printf '%s' "$json" | jq -c --arg state "$state" 'def count: if type == "number" and . >= 0 and . < 1e9 then floor else null end;
+           {state: $state, sessions: (.sessions.total // null), running: (.turns.active - .turns.waitingForUser), waiting: .turns.waitingForUser,
+            pending: ((.resume | objects | .pending | count) // 0), interrupted: ((.resume | objects | .interrupted | count) // null)}' ;;
       2) jq -n -c --arg reason "$reason" '{state: "unreachable", reason: $reason}' ;;
       *) jq -n -c '{state: "none"}' ;;
     esac
   else
     case "$code" in
-      0) printf '%s' "$json" | jq -r --arg state "$state" '"agents: \($state); \(.sessions.total // "?") sessions, \(.turns.active - .turns.waitingForUser) turns running, \(.turns.waitingForUser) waiting for a person"
-           + ((.resume | objects | .interrupted | numbers) // 0 | floor
+      0) printf '%s' "$json" | jq -r --arg state "$state" 'def count: if type == "number" and . >= 0 and . < 1e9 then floor else null end;
+           "agents: \($state); \(.sessions.total | count // "?") sessions, \(.turns.active - .turns.waitingForUser) turns running, \(.turns.waitingForUser) waiting for a person"
+           + ((.resume | objects | .interrupted | count) // 0
               | if . > 0 then "; \(.) interrupted, waiting for Try Again" else "" end)' ;;
       2) echo "agents: the gateway is not answering ($reason)" ;;
       *) echo "agents: no gateway on this box" ;;

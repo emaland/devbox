@@ -4,8 +4,8 @@
 #   2. a spot interruption notice from a fake metadata service stops the
 #      gateway cleanly, well inside the unit's stop timeout
 #   3. after a reboot the interrupted turn is reported as waiting for a
-#      person and nothing is continued (D24); a second reboot with nothing
-#      interrupted reports none
+#      person and nothing is continued (D24); it is still reported after a
+#      second, idle reboot, since nobody continued it
 #
 # The gateway is a stub (stub-gateway.js) that speaks only the status
 # endpoint and records clean stops; that the real gateway restores and
@@ -142,13 +142,14 @@ pkgs.testers.runNixOSTest {
         machine.fail(f"test -s {state}/continued")
         machine.fail("grep -q onStart /run/ahp-gateway/config.json")
 
-        # Nothing interrupted this time: none reported.
+        # Nothing new interrupted, and nobody pressed Try Again: still 1.
         turns(0)
         machine.shutdown()
         machine.start()
         machine.wait_for_unit("ahp-gateway.service")
         machine.wait_until_succeeds("curl -sf http://127.0.0.1:8765/healthz")
         status = json.loads(machine.succeed("devbox-agents status --json"))
-        assert status["interrupted"] == 0, f"after a clean idle reboot: {status}"
+        assert status["interrupted"] == 1, f"after a clean idle reboot: {status}"
+        machine.fail(f"test -s {state}/continued")
   '';
 }

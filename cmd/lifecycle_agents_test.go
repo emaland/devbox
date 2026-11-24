@@ -40,6 +40,39 @@ func TestResumeSummary(t *testing.T) {
 			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWithInterrupted(0)) },
 			want:  "interrupted turns: none\n",
 		},
+		// R-SEC on PR 18: only a number may reach the webhook.
+		{
+			name: "count is text with markup",
+			setup: func(b *lifecycleBox) {
+				b.gateway.set(200, statusWith(`, "resume": {"interrupted": "<!channel> <https://x.invalid|click>"}`))
+			},
+			want: "interrupted turns: not reported by this gateway build\n",
+		},
+		{
+			name:  "resume is text",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith(`, "resume": "<!channel>"`)) },
+			want:  "interrupted turns: not reported by this gateway build\n",
+		},
+		{
+			name:  "count is a fraction",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith(`, "resume": {"interrupted": 2.7}`)) },
+			want:  "interrupted turns: 2, waiting for Try Again or a new message\n",
+		},
+		{
+			name:  "count below one",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith(`, "resume": {"interrupted": 0.4}`)) },
+			want:  "interrupted turns: none\n",
+		},
+		{
+			name:  "count negative",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith(`, "resume": {"interrupted": -2}`)) },
+			want:  "interrupted turns: not reported by this gateway build\n",
+		},
+		{
+			name:  "count out of range",
+			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith(`, "resume": {"interrupted": 1e400}`)) },
+			want:  "interrupted turns: not reported by this gateway build\n",
+		},
 		{
 			name:  "build without the count",
 			setup: func(b *lifecycleBox) { b.gateway.set(200, statusWith("")) },
@@ -161,5 +194,37 @@ func TestDevboxAgentsStopWhenIdle(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(b.state, "stop-when-idle")); !os.IsNotExist(err) {
 		t.Fatal("marker not removed")
+	}
+}
+
+// R-CODE on PR 18: the laptop reads the JSON counts into ints, so an odd
+// count must not reach it as a fraction, text or a huge number. Otherwise
+// every stop guard refuses until --force.
+func TestDevboxAgentsStatusJSONCountsAreWholeNumbers(t *testing.T) {
+	for name, tc := range map[string]struct {
+		resume               string
+		interrupted, pending any
+	}{
+		"fractions":            {`{"interrupted": 1.7, "pending": 0.5}`, 1.0, 0.0},
+		"text":                 {`{"interrupted": "3", "pending": "x"}`, nil, 0.0},
+		"resume not an object": {`"off"`, nil, 0.0},
+		"out of range":         {`{"interrupted": 1e400, "pending": -1}`, nil, 0.0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.gateway.set(200, `{"ok": true, "sessions": {"total": 1}, "turns": {"active": 0, "waitingForUser": 0}, "resume": `+tc.resume+`}`)
+			out, status := b.run("devbox-agents.sh", "status", "--json")
+			var got map[string]any
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("exit %d, not JSON: %q", status, out)
+			}
+			if got["interrupted"] != tc.interrupted || got["pending"] != tc.pending {
+				t.Fatalf("interrupted %v pending %v, want %v %v (%q)", got["interrupted"], got["pending"], tc.interrupted, tc.pending, out)
+			}
+			var s agentStatus
+			if err := json.Unmarshal([]byte(out), &s); err != nil {
+				t.Fatalf("the laptop cannot read it: %v (%q)", err, out)
+			}
+		})
 	}
 }

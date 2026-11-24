@@ -124,7 +124,9 @@ Classification, computed from the JSON:
 | waiting | `turns.active > 0` and not busy: every active turn waits for a person |
 | idle | `turns.active == 0` and nothing pending |
 
-`resume` missing counts as nothing pending.
+`resume` missing counts as nothing pending. Since D24 the gateway reports
+`resume.pending` as 0 always (C2 keeps it in the rule); nothing is ever about
+to continue by itself.
 
 ### 2.3 Auto-stop (`autostop.sh`)
 
@@ -146,10 +148,12 @@ cap (`/etc/devbox/autostop-busy-cap`, default 12 h, `off` disables it),
 | 9 | 5 to 7, window not elapsed | nothing | |
 | 10 | `stop-when-idle` requested (2.6), and the gateway answered idle or waiting, or no gateway is installed, or it has been unreachable without a break for 30 min | **stop** (requested), logins ignored | `unreachable-since` |
 
-Row 10 never stops on an unreachable answer alone: right after boot, during
-start-up repair or a restart after a crash, the gateway cannot yet report its
-turns. Thirty minutes unreachable is "the
-gateway is not coming back", and the box is not kept up for it. The rule is
+Row 10 never stops on an unreachable answer alone, because unreachable does
+not prove idle: a busy gateway can miss the 3 s limit, and a token file or
+listener check can fail while an agent works. Right after boot, during
+start-up repair or a restart after a crash, it is also simply not answering
+yet. Thirty minutes unreachable is "the gateway is not coming back", and the
+box is not kept up for it. The rule is
 in time, not polls, because each request also runs a poll at once.
 
 "Continuously busy" means busy at every poll: one poll that is not busy
@@ -213,9 +217,12 @@ notice stops it.
 
 **Stale notices.** EC2 says notices are best effort and documents at least
 one metadata item that stays after the event with a time in the past. A
-notice that outlives its event must not stop the gateway at the next boot,
-which would interrupt turns a person had just continued. Hence the two time
-checks above; boot time is read from `/proc/stat` (`btime`).
+notice that outlives its event must not stop the gateway at the next boot:
+the chats would be out of reach, so nobody could press Try Again, until the
+5-minute rule starts the gateway again; a false interruption notice would be
+posted; and a notice found late on a running box (after a watcher restart)
+would interrupt a turn a person really did start. Hence the two time checks
+above; boot time is read from `/proc/stat` (`btime`).
 
 **State.** Per key, in `/run/devbox-spot-watch/` (0700, root): `seen`
 (logged), `stopping` (written before `systemctl stop`), `stopped` (written
@@ -368,7 +375,11 @@ The module is enabled in `configuration.nix` and replaces the inline
 auto-stop. The markers move from `/run/devbox-last-active` to
 `/run/devbox-autostop/`; both are under `/run`, so the first poll after a
 switch starts a fresh countdown, the same as after a boot. Rollback is the
-previous generation; the window file is unchanged.
+previous generation; the window file is unchanged. Rolling back to a
+generation from before revision 5 brings back `resume.onStart = "continue"`
+in the gateway's settings; a gateway build from after D24 ignores it, but a
+build from before D24 would continue turns again. D24 is enforced by the
+gateway build, not by this module.
 
 The rehearsal on a spawned spot clone (separate issue, with the user's
 approval per run) is the only place the real EC2 timings can be seen.

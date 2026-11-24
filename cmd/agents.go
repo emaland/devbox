@@ -293,8 +293,12 @@ send a new message, to continue it.
 		Short:  "Removed: the gateway never continues a turn by itself",
 		Hidden: true,
 		Args:   cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Fprintln(cmd.OutOrStdout(), noResumeSwitch)
+			// A script that asks to turn it on must not see success.
+			if len(args) > 0 && args[0] == "on" {
+				return fmt.Errorf("there is no auto-resume to turn on")
+			}
 			return nil
 		},
 	})
