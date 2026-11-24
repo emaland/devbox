@@ -24,13 +24,21 @@ func newSpawnCmd() *cobra.Command {
 		maxPrice     string
 		from         string
 		volumeID     string
+		noDNS        bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "spawn",
 		Short: "Spin up a new spot instance cloned from the primary",
+		Long: `Spin up a new spot instance cloned from the primary: it boots the
+primary's user_data, then gets the NixOS config pushed, DNS record included.
+
+With --no-dns the clone never touches the primary's DNS name. It boots the
+minimal stub instead of the primary's user_data, and its pushed config names
+no DNS record or zone, so its boot-time Route 53 update is skipped. Use it for
+a short-lived second box next to the primary.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID)
+			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID, noDNS)
 		},
 	}
 
@@ -40,11 +48,57 @@ func newSpawnCmd() *cobra.Command {
 	cmd.Flags().StringVar(&maxPrice, "max-price", "", "Spot max price $/hr (default from config)")
 	cmd.Flags().StringVar(&from, "from", "", "Instance ID to clone user_data from")
 	cmd.Flags().StringVar(&volumeID, "volume", "", "EBS data volume ID to attach as /dev/xvdf")
+	cmd.Flags().BoolVar(&noDNS, "no-dns", false, "Never take over the primary's DNS name: boot the stub user_data and push a config without a DNS record")
+	// --from clones a source's user_data, which can carry its DNS record.
+	cmd.MarkFlagsMutuallyExclusive("no-dns", "from")
 
 	return cmd
 }
 
-func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string) error {
+// withoutDNS is the config a --no-dns clone is pushed with: no record name
+// and no zone, so the box's Route 53 update finds its markers unrendered and
+// skips, and no hosted zone is looked up.
+func withoutDNS(dcfg config.DevboxConfig) config.DevboxConfig {
+	dcfg.DNSName = ""
+	dcfg.DNSZone = ""
+	dcfg.DNSZoneID = ""
+	return dcfg
+}
+
+// userDataSource is how spawn reads another instance's user_data.
+type userDataSource struct {
+	fetch  func(ctx context.Context, instanceID string) (string, error)
+	detect func(ctx context.Context) (string, error)
+}
+
+// chooseUserData picks what the new instance boots: the stub for --no-dns,
+// else the user_data of --from, of the one devbox instance found, or the stub
+// when there is none.
+func chooseUserData(ctx context.Context, src userDataSource, from string, noDNS bool) (string, error) {
+	if noDNS {
+		fmt.Println("  --no-dns: booting the minimal stub; full config pushed after launch")
+		return stubUserData(), nil
+	}
+	if from != "" {
+		fmt.Printf("  Cloning user_data from: %s\n", from)
+		return src.fetch(ctx, from)
+	}
+	sourceID, err := src.detect(ctx)
+	if err != nil {
+		// No source instance — boot a minimal stub (the full configuration.nix
+		// exceeds EC2's 16 KB user_data limit). The real config is pushed via
+		// SSH after launch (pushNixConfig).
+		fmt.Println("  No source instance — booting minimal stub; full config pushed after launch")
+		return stubUserData(), nil
+	}
+	fmt.Printf("  Cloning user_data from: %s\n", sourceID)
+	return src.fetch(ctx, sourceID)
+}
+
+func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string, noDNS bool) error {
+	if noDNS {
+		dcfg = withoutDNS(dcfg)
+	}
 	// Apply config defaults for empty flags
 	if instanceType == "" {
 		instanceType = dcfg.DefaultType
@@ -87,29 +141,12 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 	}
 	fmt.Printf("  Subnet: %s\n", subnetID)
 
-	// Get user_data: clone from a source instance, or fall back to local configuration.nix
-	var userData string
-	if from != "" {
-		fmt.Printf("  Cloning user_data from: %s\n", from)
-		userData, err = awsutil.FetchUserData(ctx, client, from)
-		if err != nil {
-			return err
-		}
-	} else {
-		sourceID, detectErr := autoDetectSourceInstance(ctx, client)
-		if detectErr == nil {
-			fmt.Printf("  Cloning user_data from: %s\n", sourceID)
-			userData, err = awsutil.FetchUserData(ctx, client, sourceID)
-			if err != nil {
-				return err
-			}
-		} else {
-			// No source instance — boot a minimal stub (the full configuration.nix
-			// exceeds EC2's 16 KB user_data limit). The real config is pushed via
-			// SSH after launch (pushNixConfig below).
-			userData = stubUserData()
-			fmt.Println("  No source instance — booting minimal stub; full config pushed after launch")
-		}
+	userData, err := chooseUserData(ctx, userDataSource{
+		fetch:  func(ctx context.Context, id string) (string, error) { return awsutil.FetchUserData(ctx, client, id) },
+		detect: func(ctx context.Context) (string, error) { return autoDetectSourceInstance(ctx, client) },
+	}, from, noDNS)
+	if err != nil {
+		return err
 	}
 
 	// Launch the instance

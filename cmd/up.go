@@ -103,7 +103,7 @@ func upDevbox(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client,
 	if err != nil {
 		return err
 	}
-	return spawnInstance(ctx, dcfg, client, instanceType, az, name, maxPrice, "", volID)
+	return spawnInstance(ctx, dcfg, client, instanceType, az, name, maxPrice, "", volID, false)
 }
 
 // finishUp waits for the instance to be running, refreshes DNS, and prints
