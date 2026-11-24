@@ -131,7 +131,8 @@ pkgs.testers.runNixOSTest {
         machine.wait_for_unit("ahp-gateway.service")
 
     with subtest("after a reboot the interrupted turn waits for a person"):
-        machine.succeed(f"rm -f {state}/continued")
+        # Earlier subtests' stops already set the count; start from none.
+        machine.succeed(f"rm -f {state}/continued {state}/interrupted")
         turns(1)
         machine.shutdown()
         machine.start()

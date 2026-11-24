@@ -10,7 +10,9 @@
 //                            (C2's resume.interrupted). The stub has one chat
 //                            and no Try Again: a stop with any active turn,
 //                            waiting for a person or not, makes it 1, and a
-//                            stop with none leaves it as it was
+//                            stop with none leaves it as it was. A new turn
+//                            between stops, which C2 says clears it, is not
+//                            modelled
 //   <stateDir>/continued     one line per turn continued at start; since D24
 //                            the gateway never does that, so this stays empty
 "use strict";

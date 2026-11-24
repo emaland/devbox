@@ -209,10 +209,16 @@ func TestDevboxAgentsStatusJSONCountsAreWholeNumbers(t *testing.T) {
 		"text":                 {`{"interrupted": "3", "pending": "x"}`, nil, 0.0},
 		"resume not an object": {`"off"`, nil, 0.0},
 		"out of range":         {`{"interrupted": 1e400, "pending": -1}`, nil, 0.0},
+		// The other counts come from the gateway too.
+		"other counts": {`{"interrupted": 1}`, 1.0, 0.0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newLifecycleBox(t)
-			b.gateway.set(200, `{"ok": true, "sessions": {"total": 1}, "turns": {"active": 0, "waitingForUser": 0}, "resume": `+tc.resume+`}`)
+			sessions, turns := `{"total": 1}`, `{"active": 0, "waitingForUser": 0}`
+			if name == "other counts" {
+				sessions, turns = `{"total": 1.5}`, `{"active": 2.5, "waitingForUser": 0.5}`
+			}
+			b.gateway.set(200, `{"ok": true, "sessions": `+sessions+`, "turns": `+turns+`, "resume": `+tc.resume+`}`)
 			out, status := b.run("devbox-agents.sh", "status", "--json")
 			var got map[string]any
 			if err := json.Unmarshal([]byte(out), &got); err != nil {

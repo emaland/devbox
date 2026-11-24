@@ -48,7 +48,7 @@ status() {
       # Counts are whole numbers in range or absent: the laptop reads them
       # into ints, and one it cannot read makes every stop guard refuse.
       0) printf '%s' "$json" | jq -c --arg state "$state" 'def count: if type == "number" and . >= 0 and . < 1e9 then floor else null end;
-           {state: $state, sessions: (.sessions.total // null), running: (.turns.active - .turns.waitingForUser), waiting: .turns.waitingForUser,
+           {state: $state, sessions: (.sessions.total | count), running: ((.turns.active - .turns.waitingForUser) | count // 0), waiting: (.turns.waitingForUser | count // 0),
             pending: ((.resume | objects | .pending | count) // 0), interrupted: ((.resume | objects | .interrupted | count) // null)}' ;;
       2) jq -n -c --arg reason "$reason" '{state: "unreachable", reason: $reason}' ;;
       *) jq -n -c '{state: "none"}' ;;
