@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -302,12 +303,37 @@ func TestSpotWatchLoop(t *testing.T) {
 	b := newLifecycleBox(t)
 	command := exec.Command("sh", lifecycleScript(t, "spot-watch.sh"))
 	command.Env = append(b.env, "DEVBOX_SPOT_POLL_SECONDS=1")
+	// Its own process group, so the loop and everything it starts can be
+	// found and stopped together.
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		command.Process.Kill()
+	pgid := command.Process.Pid
+	done := make(chan struct{})
+	go func() {
 		command.Wait()
+		close(done)
+	}()
+	// stop ends the loop and everything it started, and returns only when
+	// all of them are gone, so nothing writes into the temporary directory
+	// while it is removed.
+	stop := func() {
+		syscall.Kill(-pgid, syscall.SIGKILL)
+		<-done
+		deadline := time.Now().Add(10 * time.Second)
+		for processGroupAlive(pgid) && time.Now().Before(deadline) {
+			syscall.Kill(-pgid, syscall.SIGKILL)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	t.Cleanup(func() {
+		stop()
+		// Nothing the loop started may outlive the test: a child still
+		// writing into the temporary directory breaks its removal.
+		if processGroupAlive(pgid) {
+			t.Errorf("a process the watch loop started is still running after the test")
+		}
 	})
 	b.imds.setNotices(fmt.Sprintf(`{"action": "stop", "time": %q}`, isoTime(fakeStart+120)), "")
 	deadline := time.Now().Add(20 * time.Second)
@@ -320,6 +346,11 @@ func TestSpotWatchLoop(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(b.root, "spot")); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// processGroupAlive reports whether any process in the group exists.
+func processGroupAlive(pgid int) bool {
+	return syscall.Kill(-pgid, 0) == nil
 }
 
 // Review finding: a watcher that died after stopping the gateway, before
