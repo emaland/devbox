@@ -7,8 +7,8 @@ first review (every CLI stop path, stale spot notices, a requested stop while
 the gateway restarts, where `resume status` reads its source); revision 3
 takes the diff check's two remaining points (the unreachable rule in time,
 and no cap exemption for attached clients). After revision 4, issue 14
-widened the token file check to the gateway's own rule and ended a spot
-notice 5 min after its action time (sections 2.2 and 2.3). Builds on note 030 (the gateway as a
+widened the token file check to the gateway's own rule, read `ss` by column
+and ended a spot notice 5 min after its action time (sections 2.2 and 2.3). Builds on note 030 (the gateway as a
 system unit). Covers auto-stop, the spot interruption watcher, the stop paths
 and resume on boot. The CLI commands that sit on top (`devbox agents`,
 `devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
@@ -92,22 +92,29 @@ the caller treats that as "not installed" and logs nothing.
 
 - One `GET http://127.0.0.1:<port>/status`, 3 s limit.
 - **The token** is read from the token file by root (auto-stop, watcher,
-  boot notification) or by the user (`devbox-agents`). It must be one line of
-  printable ASCII with no quote or backslash; one trailing CRLF or LF is
-  dropped, as the gateway drops it. Otherwise the request is not
-  made and the result is "unreachable: token file unusable". It is given to
-  curl as a config file on standard input (`-K -`), so it never appears on a
-  command line, in the environment or in a log.
+  boot notification) or by the user (`devbox-agents`). As the gateway reads
+  it, one whole CRLF or LF line end is dropped and what is left must be
+  printable ASCII without space (0x21 to 0x7e). A quote or a backslash is
+  refused too, though the gateway accepts them, because either would change
+  the curl config; this is the one way the check is narrower than the
+  gateway's. Otherwise the request is not made and the result is
+  "unreachable: token file unusable". It is given to curl as a config file
+  on standard input (`-K -`), so it never appears on a command line, in the
+  environment or in a log.
 - **Only to the gateway.** The token file must be a regular file, not a
   link, with no group or other permission bits (0600 and 0400 both do), as
   the gateway itself requires; it is read with a size bound, so root cannot
   be pointed at another file, a FIFO or a device. The token is sent only
-  when the process listening on `127.0.0.1:<port>` (`ss -tlne`) belongs to
-  the token file's owner. `ss` prints no `uid:` for a socket owned by root,
-  so such a listener counts as uid 0, not as nothing listening. While the gateway is down,
-  which is exactly when these checks run (after a spot stop, at boot, during
-  a restart), another local user could otherwise bind the port and collect
-  the token. Otherwise the result is "unreachable" with the reason.
+  when every listener on the port (`ss -Htlne`) is on `127.0.0.1` and
+  belongs to the token file's owner. `ss` is read by column, never by
+  matching text anywhere on the line: the cgroup path at the end of each
+  line is chosen by the socket's owner and may contain spaces, so a match
+  anywhere could be given a false address or owner. Column 6 is `uid:N`, or
+  `ino:` for a socket owned by root, which counts as uid 0; anything else
+  matches no owner. While the gateway is down, which is exactly when these
+  checks run (after a spot stop, at boot, during a restart), another local
+  user could otherwise bind the port and collect the token. Otherwise the
+  result is "unreachable" with the reason.
 - Text from the answer never reaches a log line or a notice as it is: counts
   must be numbers, and words are reduced to letters.
 - Results: `ok` with the JSON on standard output; `unreachable` with a reason

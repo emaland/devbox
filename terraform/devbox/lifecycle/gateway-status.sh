@@ -40,30 +40,51 @@ mode="$(stat -c %a "$token_file" 2>/dev/null)"
 case "$mode" in
   *[!0-7]* | "") unreachable "token file unusable" ;;
   *00) ;;
-  *) unreachable "token file unusable (readable by group or others)" ;;
+  *) unreachable "token file unusable (open to group or others)" ;;
 esac
 owner="$(stat -c %u "$token_file" 2>/dev/null)" || unreachable "token file unusable"
-# One line, with one CRLF or LF line end, as the gateway reads it. Then
-# printable ASCII only, and no quote or backslash, which would change the
-# curl config.
-[ "$(head -c 4096 "$token_file" | wc -l)" -le 1 ] || unreachable "token file unusable"
-token="$(head -c 4096 "$token_file")" || unreachable "token file unusable"
+# As the gateway reads it: one whole CRLF or LF line end is dropped, and what
+# is left must be printable ASCII without space (0x21 to 0x7e). A quote or a
+# backslash is refused as well, though the gateway takes them: either would
+# change the curl config.
+# The x keeps a trailing newline through the command substitution.
+raw="$(head -c 4096 "$token_file" && printf x)" || unreachable "token file unusable"
+raw="${raw%x}"
 cr="$(printf '\r')"
-token="${token%"$cr"}"
+nl="
+"
+case "$raw" in
+  *"$cr$nl") token="${raw%"$cr$nl"}" ;;
+  *"$nl") token="${raw%"$nl"}" ;;
+  *) token="$raw" ;;
+esac
+raw=""
 case "$token" in
-  "" | *[!\ -~]* | *\"* | *\\*) unreachable "token file unusable" ;;
+  "" | *[!!-~]* | *\"* | *\\*) unreachable "token file unusable" ;;
 esac
 
 # Send the token only to the gateway: the process listening on the port must
 # belong to the token file's owner. While the gateway is down, another local
 # user could otherwise bind the port and collect the token.
-# ss prints no uid: for a socket owned by root, so such a line is uid 0.
-listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null | sed -n "
-/[[:space:]]127\.0\.0\.1:${port}[[:space:]]/ {
-  s/.*[[:space:]]uid:\([0-9][0-9]*\).*/\1/p
-  t
-  s/.*/0/p
-}")"
+#
+# Read by column, never by matching text anywhere on the line: the cgroup path
+# at the end is chosen by the socket's owner and may hold spaces. Every
+# listener on the port must be on 127.0.0.1 and show its owner in column 6:
+# uid:N, or ino: straight away, which is how ss shows uid 0. Anything else is
+# "?", which matches no owner.
+listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null |
+  while read -r _state _recv _send local _peer sixth _rest; do
+    if [ "$local" != "127.0.0.1:$port" ]; then
+      echo "?"
+      continue
+    fi
+    case "$sixth" in
+      uid:*[!0-9]* | uid:) echo "?" ;;
+      uid:*) echo "${sixth#uid:}" ;;
+      ino:*) echo 0 ;;
+      *) echo "?" ;;
+    esac
+  done)"
 [ -n "$listeners" ] || unreachable "nothing listening on 127.0.0.1:$port"
 for uid in $listeners; do
   [ "$uid" = "$owner" ] || unreachable "the listener on port $port is not the gateway's user"

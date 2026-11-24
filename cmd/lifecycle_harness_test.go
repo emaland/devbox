@@ -260,6 +260,11 @@ func newLifecycleBox(t *testing.T) *lifecycleBox {
 		// owned by $FAKE_ROOT/listener-uid or else by this user.
 		"ss": `case "$*" in
   *-Htlne*)
+    # Given lines, with PORT replaced, stand in for the whole answer.
+    if [ -f "$FAKE_ROOT/listener-lines" ]; then
+      sed "s/PORT/$FAKE_PORT/g" "$FAKE_ROOT/listener-lines"
+      exit 0
+    fi
     uid="$(cat "$FAKE_ROOT/listener-uid" 2>/dev/null || id -u)"
     # As the real ss does, no uid: for a socket owned by root.
     owner=" uid:$uid"

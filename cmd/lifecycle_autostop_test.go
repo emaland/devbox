@@ -351,12 +351,16 @@ func TestAutostopLogsAnUnreachableGatewayOnceAndOnChange(t *testing.T) {
 
 func TestAutostopUnusableTokenFile(t *testing.T) {
 	for name, content := range map[string]string{
-		"quote":      `abc"def` + "\n",
-		"two lines":  "abcdef\nghijkl\n",
-		"empty":      "",
-		"backslash":  `abc\def`,
-		"tab":        "abc\tdef\n",
-		"two CRs":    "abcdef\r\r\n",
+		"quote":     `abc"def` + "\n",
+		"two lines": "abcdef\nghijkl\n",
+		"empty":     "",
+		"backslash": `abc\def`,
+		"tab":       "abc\tdef\n",
+		"two CRs":   "abcdef\r\r\n",
+		// The gateway refuses both (printable ASCII 0x21 to 0x7e, and only a
+		// whole CRLF or LF line end is dropped).
+		"whitespace": "abc def\n",
+		"lone CR":    "abcdef\r",
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newLifecycleBox(t)
@@ -829,11 +833,13 @@ func TestGatewayStatusSeesARootListener(t *testing.T) {
 // its action time, so a failed stop after that starts the gateway again.
 func TestAutostopSpotNoticeEndsAfterItsActionTime(t *testing.T) {
 	for name, tc := range map[string]struct {
-		after   int64 // seconds from the action time to this poll
+		time    string // the notice's time file, %d is the action time
 		started int
 	}{
-		"within 5 min": {after: 299, started: 0},
-		"after 5 min":  {after: 301, started: 1},
+		"within 5 min": {time: fmt.Sprintf("%d\n", fakeStart+4*hour-299), started: 0},
+		"after 5 min":  {time: fmt.Sprintf("%d\n", fakeStart+4*hour-301), started: 1},
+		// No usable time: still an interruption under way.
+		"time not a number": {time: "soon\n", started: 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			b := newLifecycleBox(t)
@@ -845,11 +851,48 @@ func TestAutostopSpotNoticeEndsAfterItsActionTime(t *testing.T) {
 			}
 			b.write("spot/notice-stop_x/seen", "")
 			b.write("spot/notice-stop_x/stopped", "not running\n")
-			b.write("spot/notice-stop_x/time", fmt.Sprintf("%d\n", fakeStart+4*hour-tc.after))
+			b.write("spot/notice-stop_x/time", tc.time)
 			b.autostopAllowFailure()
 			if got := b.count(gatewayStart); got != tc.started {
 				t.Fatalf("gateway started %d times, want %d: %v", got, tc.started, b.calls())
 			}
 		})
+	}
+}
+
+// R-SEC and R-CODE on PR 17: the listener's owner comes from ss's own
+// columns, never from text later on the line. The cgroup path is printed
+// after uid: and a local user can choose it, spaces included.
+func TestGatewayStatusReadsTheListenerByColumn(t *testing.T) {
+	owner := os.Getuid()
+	other := owner + 1
+	refused := map[string]string{
+		"owner in the cgroup path":                 fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/user.slice/x uid:%d <->\n", other, owner),
+		"address and owner in the cgroup path":     fmt.Sprintf("LISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x 127.0.0.1:PORT uid:%d <->\n", other, owner),
+		"another listener on the wildcard address": fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x <->\nLISTEN 0 4096 0.0.0.0:PORT 0.0.0.0:* uid:%d ino:2 sk:2 cgroup:/y <->\n", owner, other),
+		"no uid or ino column":                     "LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* sk:1 cgroup:/x <->\n",
+	}
+	for name, lines := range refused {
+		t.Run(name, func(t *testing.T) {
+			b := newLifecycleBox(t)
+			b.write("listener-lines", lines)
+			out, status := b.run("gateway-status.sh")
+			if status != 2 {
+				t.Fatalf("exit %d output %q", status, out)
+			}
+			b.gateway.mu.Lock()
+			requests := len(b.gateway.requests)
+			b.gateway.mu.Unlock()
+			if requests != 0 {
+				t.Fatalf("the token was sent (%q)", out)
+			}
+		})
+	}
+	// The real owner with another uid later on the line is still the owner.
+	b := newLifecycleBox(t)
+	b.gateway.set(200, statusJSON(0, 0, 0))
+	b.write("listener-lines", fmt.Sprintf("LISTEN 0 4096 127.0.0.1:PORT 0.0.0.0:* uid:%d ino:1 sk:1 cgroup:/x uid:%d <->\n", owner, other))
+	if out, status := b.run("gateway-status.sh"); status != 0 {
+		t.Fatalf("the gateway's own listener was refused: exit %d output %q", status, out)
 	}
 }
