@@ -475,3 +475,17 @@ func TestAgentsResumeSaysThereIsNoSwitch(t *testing.T) {
 		}
 	}
 }
+
+// R-TEST on PR 18: the laptop reads the box's interrupted count by its JSON
+// name.
+func TestReadAgentsReadsInterrupted(t *testing.T) {
+	f := newFakeRemote(t)
+	f.status("i-1", `{"state":"idle","sessions":2,"running":0,"waiting":0,"pending":0,"interrupted":2}`, 0)
+	s, err := readAgents(context.Background(), "i-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Interrupted != 2 || !strings.Contains(s.String(), "2 interrupted") {
+		t.Fatalf("read %+v, shown %q", s, s.String())
+	}
+}
