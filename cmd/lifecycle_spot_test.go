@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -315,9 +316,9 @@ func TestSpotWatchLoop(t *testing.T) {
 		command.Wait()
 		close(done)
 	}()
-	// stop ends the loop and everything it started, and returns only when
-	// all of them are gone, so nothing writes into the temporary directory
-	// while it is removed.
+	// stop ends the loop and everything still in its process group, and
+	// returns only when they are gone. (timeout(1) leaves the group; the
+	// test waits for the stop it runs to finish before it returns.)
 	stop := func() {
 		syscall.Kill(-pgid, syscall.SIGKILL)
 		<-done
@@ -330,18 +331,26 @@ func TestSpotWatchLoop(t *testing.T) {
 	t.Cleanup(func() {
 		stop()
 		// Nothing the loop started may outlive the test: a child still
-		// writing into the temporary directory breaks its removal.
-		if processGroupAlive(pgid) {
-			t.Errorf("a process the watch loop started is still running after the test")
+		// writing into the temporary directory breaks its removal. Found by
+		// what it runs, not by group, because timeout(1) moves itself and
+		// its command into a group of their own.
+		if left := liveProcessesUsing(b.root); len(left) > 0 {
+			t.Errorf("processes the watch loop started are still running after the test: %q", left)
 		}
 	})
 	b.imds.setNotices(fmt.Sprintf(`{"action": "stop", "time": %q}`, isoTime(fakeStart+120)), "")
+	// Wait for the stop to have finished, not just started: the script logs
+	// it only after timeout(1) and the systemctl under it have exited, and
+	// those are outside the loop's process group.
 	deadline := time.Now().Add(20 * time.Second)
-	for b.count(gatewayStop) == 0 {
+	for b.logCount("gateway stopped in") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("the loop did not stop the gateway; log:\n%s", b.read(b.logFile))
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if b.count(gatewayStop) != 1 {
+		t.Fatalf("gateway stops: %d", b.count(gatewayStop))
 	}
 	if _, err := os.Stat(filepath.Join(b.root, "spot")); err != nil {
 		t.Fatal(err)
@@ -351,6 +360,39 @@ func TestSpotWatchLoop(t *testing.T) {
 // processGroupAlive reports whether any process in the group exists.
 func processGroupAlive(pgid int) bool {
 	return syscall.Kill(-pgid, 0) == nil
+}
+
+// liveProcessesUsing lists the command lines of running processes (zombies
+// excluded) that name a path under dir. Linux only: it reads /proc.
+func liveProcessesUsing(dir string) []string {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var found []string
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// The state follows the parenthesised command name.
+		if i := strings.LastIndexByte(string(stat), ')'); i < 0 || i+2 >= len(stat) || stat[i+2] == 'Z' {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		line := strings.ReplaceAll(strings.TrimRight(string(cmdline), "\x00"), "\x00", " ")
+		if strings.Contains(line, dir) {
+			found = append(found, line)
+		}
+	}
+	return found
 }
 
 // Review finding: a watcher that died after stopping the gateway, before
