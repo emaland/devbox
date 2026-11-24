@@ -33,10 +33,16 @@ func newSpawnCmd() *cobra.Command {
 		Long: `Spin up a new spot instance cloned from the primary: it boots the
 primary's user_data, then gets the NixOS config pushed, DNS record included.
 
-With --no-dns the clone never touches the primary's DNS name. It boots the
-minimal stub instead of the primary's user_data, and its pushed config names
-no DNS record or zone, so its boot-time Route 53 update is skipped. Use it for
-a short-lived second box next to the primary.`,
+With --no-dns the clone does not point the primary's DNS name at itself. It
+boots the minimal stub instead of the primary's user_data, its pushed config
+names no DNS record or zone, so its boot-time Route 53 update is skipped, and
+it is tagged devbox-dns=off, so dns, up, resize, nix-update and setup-dns
+write no DNS for it later. Use it for a short-lived second box next to the
+primary.
+
+Limits: the clone has the primary's instance profile, whose role may change
+records in the hosted zone, so a program on the clone could still do so
+itself. It also joins the tailnet with the primary's host name.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return spawnInstance(cmd.Context(), dcfg, ec2Client, instanceType, az, name, maxPrice, from, volumeID, noDNS)
 		},
@@ -63,6 +69,48 @@ func withoutDNS(dcfg config.DevboxConfig) config.DevboxConfig {
 	dcfg.DNSZone = ""
 	dcfg.DNSZoneID = ""
 	return dcfg
+}
+
+// dnsTag marks an instance spawned with --no-dns, so every later command that
+// would write DNS for it (dns, up, resize, nix-update, setup-dns) does not.
+// resize carries it to the new instance with the other tags.
+const dnsTag = "devbox-dns"
+
+// spawnDNS is what --no-dns changes in a launch: the config pushed to the
+// clone, and the tags it is launched with.
+func spawnDNS(dcfg config.DevboxConfig, noDNS bool) (config.DevboxConfig, []types.Tag) {
+	if !noDNS {
+		return dcfg, nil
+	}
+	return withoutDNS(dcfg), []types.Tag{{Key: aws.String(dnsTag), Value: aws.String("off")}}
+}
+
+// dnsOff reports whether an instance's tags mark it as spawned with --no-dns.
+func dnsOff(tags []types.Tag) bool {
+	for _, t := range tags {
+		if aws.ToString(t.Key) == dnsTag && aws.ToString(t.Value) == "off" {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsConfigFor is the config to push to an instance: without DNS for one
+// spawned with --no-dns. An instance that cannot be described is an error,
+// not a guess.
+func dnsConfigFor(ctx context.Context, client *ec2.Client, instanceID string, dcfg config.DevboxConfig) (config.DevboxConfig, error) {
+	desc, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}})
+	if err != nil {
+		return dcfg, fmt.Errorf("describing instance %s: %w", instanceID, err)
+	}
+	if len(desc.Reservations) == 0 || len(desc.Reservations[0].Instances) == 0 {
+		return dcfg, fmt.Errorf("instance %s not found", instanceID)
+	}
+	if dnsOff(desc.Reservations[0].Instances[0].Tags) {
+		fmt.Printf("  %s was spawned with --no-dns: pushing a config without a DNS record\n", instanceID)
+		return withoutDNS(dcfg), nil
+	}
+	return dcfg, nil
 }
 
 // userDataSource is how spawn reads another instance's user_data.
@@ -96,9 +144,7 @@ func chooseUserData(ctx context.Context, src userDataSource, from string, noDNS 
 }
 
 func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Client, instanceType, az, name, maxPrice, from, volumeID string, noDNS bool) error {
-	if noDNS {
-		dcfg = withoutDNS(dcfg)
-	}
+	dcfg, dnsTags := spawnDNS(dcfg, noDNS)
 	// Apply config defaults for empty flags
 	if instanceType == "" {
 		instanceType = dcfg.DefaultType
@@ -178,10 +224,10 @@ func spawnInstance(ctx context.Context, dcfg config.DevboxConfig, client *ec2.Cl
 		TagSpecifications: []types.TagSpecification{
 			{
 				ResourceType: types.ResourceTypeInstance,
-				Tags: []types.Tag{
+				Tags: append([]types.Tag{
 					{Key: aws.String("Name"), Value: aws.String(name)},
 					{Key: aws.String("devbox-managed"), Value: aws.String("true")},
-				},
+				}, dnsTags...),
 			},
 		},
 	}
