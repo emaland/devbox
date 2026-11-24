@@ -6,7 +6,11 @@ the code reviews of the implementation changed (sections 2.2, 2.3, 2.4, 2.6,
 first review (every CLI stop path, stale spot notices, a requested stop while
 the gateway restarts, where `resume status` reads its source); revision 3
 takes the diff check's two remaining points (the unreachable rule in time,
-and no cap exemption for attached clients). Builds on note 030 (the gateway as a
+and no cap exemption for attached clients). After revision 4, issue 14
+widened the token file check to the gateway's own rule, read `ss` by column,
+read the token as its owner, refused a root-owned token file and any answer
+that is not exactly one JSON document of at most 64 KiB, and ended a spot
+notice 5 min after its action time (sections 2.2 and 2.3). Builds on note 030 (the gateway as a
 system unit). Covers auto-stop, the spot interruption watcher, the stop paths
 and resume on boot. The CLI commands that sit on top (`devbox agents`,
 `devbox stop` refusing while busy, `devbox tunnel`) are listed in section 2.6
@@ -90,19 +94,46 @@ the caller treats that as "not installed" and logs nothing.
 
 - One `GET http://127.0.0.1:<port>/status`, 3 s limit.
 - **The token** is read from the token file by root (auto-stop, watcher,
-  boot notification) or by the user (`devbox-agents`). It must be one line of
-  printable ASCII with no quote or backslash; otherwise the request is not
-  made and the result is "unreachable: token file unusable". It is given to
-  curl as a config file on standard input (`-K -`), so it never appears on a
-  command line, in the environment or in a log.
+  boot notification) or by the user (`devbox-agents`). As the gateway reads
+  it, one whole CRLF or LF line end is dropped and what is left must be
+  printable ASCII without space (0x21 to 0x7e). A quote or a backslash is
+  refused too, though the gateway accepts them, because either would change
+  the curl config; this is the one way the check is narrower than the
+  gateway's. Otherwise the request is not made and the result is
+  "unreachable: token file unusable". It is given to curl as a config file
+  on standard input (`-K -`), so it never appears on a command line, in the
+  environment or in a log.
 - **Only to the gateway.** The token file must be a regular file, not a
-  link, mode 0600, as the gateway itself requires; it is read with a size
-  bound, so root cannot be pointed at another file, a FIFO or a device. The
-  token is sent only when the process listening on `127.0.0.1:<port>`
-  (`ss -tlne`) belongs to the token file's owner. While the gateway is down,
-  which is exactly when these checks run (after a spot stop, at boot, during
-  a restart), another local user could otherwise bind the port and collect
-  the token. Otherwise the result is "unreachable" with the reason.
+  link, not owned by root (the gateway never runs as root), with no group or
+  other permission bits (0600 and 0400 both do), as the gateway itself
+  requires; it is read with a size bound, so root cannot
+  be pointed at another file, a FIFO or a device. The token is sent only
+  when every listener on the port (`ss -Htlne`) is on `127.0.0.1` and
+  belongs to the token file's owner. `ss` is read by column, never by
+  matching text anywhere on the line: the cgroup path at the end of each
+  line is chosen by the socket's owner and may contain spaces, so a match
+  anywhere could be given a false address or owner. Column 6 is `uid:N`, or
+  `ino:` for a socket owned by root, which counts as uid 0 and so never
+  matches, as a root-owned token file is refused; anything else matches no
+  owner. While the gateway is down, which is exactly when these
+  checks run (after a spot stop, at boot, during a restart), another local
+  user could otherwise bind the port and collect the token. Otherwise the
+  result is "unreachable" with the reason.
+- **Read as its owner.** The checks above are by path, so the owner could
+  swap the file for a link to something only root may read between the
+  checks and the read. Run as root, the file is therefore read with
+  `setpriv` under the owner's account (uid and its primary gid, never the
+  file's group), with no environment, standard input or standard error, and
+  under a 3 s limit held by root outside the drop, in case a FIFO is swapped
+  in. Its output goes to a file root made, never to a pipe, because the
+  owner could open the reader's pipe through `/proc` and hold it, and root
+  would wait. The answer is written by the listener's owner too, so it is
+  capped at 64 KiB, parsed under a time limit, and refused unless it is
+  exactly one JSON document (an empty answer or several are "unreachable"). curl is started with `-q` and `--noproxy '*'`, so root's
+  curl config and proxy settings cannot send the header elsewhere.
+- **Known limit.** The gateway could stop, and another user bind the port,
+  in the moment between the listener check and curl's connect. Closing that
+  needs a peer-credential check, which TCP on loopback does not give.
 - Text from the answer never reaches a log line or a notice as it is: counts
   must be numbers, and words are reduced to letters.
 - Results: `ok` with the JSON on standard output; `unreachable` with a reason
@@ -178,7 +209,10 @@ starts being unreachable and again when the reason changes.
    `busy-since` restart and a requested stop is dropped. Trying again at the
    next poll would stop the gateway every 10 minutes, and each stop uses up
    the interrupted turns' one continuation. The gateway is not started again
-   while the spot watcher has a current interruption notice.
+   while the spot watcher has a current interruption notice: one that is
+   not stale, not done, and whose action time is less than 5 min ago (the
+   watcher's own limit, section 2.4). The time limit ends a notice that found
+   the gateway already down, which the watcher never marks done.
 4. The poll has a start timeout (the gateway's stop bound plus 15 s plus
    120 s), so one that hangs cannot hold off every later poll.
 

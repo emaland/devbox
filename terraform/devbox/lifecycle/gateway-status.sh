@@ -33,41 +33,118 @@ esac
 [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || unreachable "client config has no port"
 
 # A regular file, not a link (root runs this and must not be pointed at
-# another file, a FIFO or a device), private to its owner, as the gateway
-# itself requires.
+# another file, a FIFO or a device), with no group or other permission bits,
+# as the gateway itself requires.
 [ -n "$token_file" ] && [ -f "$token_file" ] && [ ! -L "$token_file" ] || unreachable "token file unusable"
-[ "$(stat -c %a "$token_file" 2>/dev/null)" = 600 ] || unreachable "token file unusable (not mode 0600)"
-owner="$(stat -c %u "$token_file" 2>/dev/null)" || unreachable "token file unusable"
-# One line, then only the characters a generated token uses. Anything else
-# (a quote or a backslash would change the curl config) is refused.
-[ "$(head -c 4096 "$token_file" | wc -l)" -le 1 ] || unreachable "token file unusable"
-token="$(head -c 4096 "$token_file")" || unreachable "token file unusable"
+# Mode and owner from one stat, so both describe the same file.
+mode_owner="$(stat -c '%a %u' "$token_file" 2>/dev/null)" || unreachable "token file unusable"
+mode="${mode_owner% *}"
+owner="${mode_owner#* }"
+case "$owner" in "" | *[!0-9]*) unreachable "token file unusable" ;; esac
+# The gateway never runs as root, and reading as the owner would drop
+# nothing for a root-owned file (a parent directory swapped for a link to a
+# root-only one would make it look so).
+[ "$owner" != 0 ] || unreachable "token file unusable (owned by root)"
+case "$mode" in
+  *[!0-7]* | "") unreachable "token file unusable" ;;
+  *00) ;;
+  *) unreachable "token file unusable (open to group or others)" ;;
+esac
+# As the gateway reads it: one whole CRLF or LF line end is dropped, and what
+# is left must be printable ASCII without space (0x21 to 0x7e). A quote or a
+# backslash is refused as well, though the gateway takes them: either would
+# change the curl config.
+# The x keeps a trailing newline through the command substitution.
+#
+# Run as root, the file is read with its owner's rights only: the checks above
+# are by path, and the owner could swap in a link to a file only root may
+# read between them and the read. The owner's rights are the owner's account
+# (uid and its primary gid), never the file's group, which need not be one
+# the owner is in ("+" makes id look the uid up as a number, never as a
+# name). The reader gets no environment, no standard input and no standard
+# error. Its output goes to a file root made, not to a pipe: the reader runs
+# as the owner, who could open a pipe of its through /proc and hold it, and
+# root would wait on it. The time limit, for a FIFO swapped in, is root's and
+# outside the drop, so the owner cannot stop it.
+if [ "$(id -u)" = 0 ]; then
+  owner_gid="$(id -g -- "+$owner" 2>/dev/null)" || unreachable "token file unusable (owner has no account)"
+  case "$owner_gid" in "" | *[!0-9]*) unreachable "token file unusable (owner has no account)" ;; esac
+  read_token() {
+    timeout -k 1 3 setpriv --reuid="$owner" --regid="$owner_gid" --clear-groups \
+      env -i head -c 4096 -- "$token_file" </dev/null 2>/dev/null
+  }
+else
+  read_token() { timeout -k 1 3 head -c 4096 -- "$token_file" </dev/null 2>/dev/null; }
+fi
+# Root's own files, 0600 from mktemp: the token copy and, later, the answer.
+copy="$(mktemp)" || unreachable "no temporary file"
+body="$(mktemp)" || { rm -f "$copy"; unreachable "no temporary file"; }
+trap 'rm -f "$copy" "$body"' EXIT
+read_token >"$copy" || unreachable "token file unusable"
+raw="$(head -c 4096 -- "$copy" && printf x)" || unreachable "token file unusable"
+rm -f "$copy"
+raw="${raw%x}"
+cr="$(printf '\r')"
+nl="
+"
+case "$raw" in
+  *"$cr$nl") token="${raw%"$cr$nl"}" ;;
+  *"$nl") token="${raw%"$nl"}" ;;
+  *) token="$raw" ;;
+esac
+raw=""
 case "$token" in
-  "" | *[!A-Za-z0-9._~+/=-]*) unreachable "token file unusable" ;;
+  "" | *[!!-~]* | *\"* | *\\*) unreachable "token file unusable" ;;
 esac
 
 # Send the token only to the gateway: the process listening on the port must
 # belong to the token file's owner. While the gateway is down, another local
 # user could otherwise bind the port and collect the token.
-listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null | sed -n "s/.*[[:space:]]127\.0\.0\.1:${port}[[:space:]].*uid:\([0-9][0-9]*\).*/\1/p")"
+#
+# Read by column, never by matching text anywhere on the line: the cgroup path
+# at the end is chosen by the socket's owner and may hold spaces. Every
+# listener on the port must be on 127.0.0.1 and show its owner in column 6:
+# uid:N, or ino: straight away, which is how ss shows uid 0 (and so never
+# matches, since a root-owned token file is refused above). Anything else is
+# "none", which matches no owner. (A word, not "?": the loop below splits the
+# list, and file name patterns are off for it.)
+listeners="$(ss -Htlne "( sport = :$port )" 2>/dev/null |
+  while read -r _state _recv _send laddr _peer sixth _rest; do
+    if [ "$laddr" != "127.0.0.1:$port" ]; then
+      echo none
+      continue
+    fi
+    case "$sixth" in
+      uid:*[!0-9]* | uid:) echo none ;;
+      uid:*) echo "${sixth#uid:}" ;;
+      ino:*) echo 0 ;;
+      *) echo none ;;
+    esac
+  done)"
 [ -n "$listeners" ] || unreachable "nothing listening on 127.0.0.1:$port"
+set -f
 for uid in $listeners; do
   [ "$uid" = "$owner" ] || unreachable "the listener on port $port is not the gateway's user"
 done
-
-body="$(mktemp)" || unreachable "no temporary file"
-trap 'rm -f "$body"' EXIT
+set +f
+# Known limit: the gateway could stop, and another user bind the port, in the
+# moment between this check and curl's connect. Closing that needs a peer
+# credential check, which TCP on loopback does not give.
 
 code="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
-  curl -s --max-time 3 -o "$body" -w '%{http_code}' -K - "http://127.0.0.1:$port/status")"
+  curl -q -s --noproxy '*' --max-time 3 --max-filesize 65536 -o "$body" -w '%{http_code}' -K - "http://127.0.0.1:$port/status")"
 status=$?
 token=""
 [ "$status" -eq 0 ] || unreachable "no answer (curl exit $status)"
 [ "$code" = 200 ] || unreachable "HTTP $code"
+# The listener's owner writes the answer: bounded in size (curl stops past
+# 64 KiB, and this checks) and in parse time.
+[ "$(wc -c <"$body")" -le 65536 ] || unreachable "answer too large"
 
 # The busy rule is the gateway's own: a turn that is working and not waiting
 # for a person, or a continuation about to start.
-state="$(jq -r '
+# shellcheck disable=SC2016 # a jq program, not shell
+state="$(timeout -k 1 5 jq -r '
   if (.turns | type) != "object"
      or (.turns.active | type) != "number"
      or (.turns.waitingForUser | type) != "number"
@@ -80,7 +157,11 @@ state="$(jq -r '
       elif .turns.active > 0 then "waiting"
       else "idle" end
   end' "$body" 2>/dev/null)" || unreachable "answer is not JSON"
+# jq reads an empty file as no documents and succeeds.
+[ -n "$state" ] || unreachable "empty answer"
 [ "$state" != malformed ] || unreachable "answer has no turn counts"
+json="$(timeout -k 1 5 jq -c . "$body" 2>/dev/null)" || unreachable "answer is not JSON"
+# One document only: several would give several states.
+case "$state$json" in *"$nl"*) unreachable "answer is not one JSON document" ;; esac
 
-printf '%s\n' "$state"
-jq -c . "$body"
+printf '%s\n' "$state" "$json"
