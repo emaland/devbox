@@ -4,7 +4,7 @@ import (
 	"embed"
 	"io/fs"
 
-	"github.com/emaland/devbox/cmd"
+	"github.com/instantcocoa/devbox/cmd"
 )
 
 //go:embed terraform/configuration.nix

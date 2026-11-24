@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
 
-	devboxconfig "github.com/emaland/devbox/internal/config"
+	devboxconfig "github.com/instantcocoa/devbox/internal/config"
 )
 
 var (

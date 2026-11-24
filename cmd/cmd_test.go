@@ -22,8 +22,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/localstack"
 
-	"github.com/emaland/devbox/internal/awsutil"
-	"github.com/emaland/devbox/internal/config"
+	"github.com/instantcocoa/devbox/internal/awsutil"
+	"github.com/instantcocoa/devbox/internal/config"
 )
 
 // Shared test state — initialised once by TestMain.

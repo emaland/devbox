@@ -18,7 +18,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/spf13/cobra"
 
-	"github.com/emaland/devbox/internal/config"
+	"github.com/instantcocoa/devbox/internal/config"
 )
 
 // Agents on the box, and the guard every stop path goes through (design

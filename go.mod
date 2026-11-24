@@ -1,4 +1,4 @@
-module github.com/emaland/devbox
+module github.com/instantcocoa/devbox
 
 go 1.25.7
 

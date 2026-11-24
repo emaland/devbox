@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emaland/devbox/internal/config"
+	"github.com/instantcocoa/devbox/internal/config"
 )
 
 // No test in this package may reach Route 53 for a zone id by accident: the

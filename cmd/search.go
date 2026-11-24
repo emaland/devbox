@@ -11,7 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/spf13/cobra"
 
-	"github.com/emaland/devbox/internal/awsutil"
+	"github.com/instantcocoa/devbox/internal/awsutil"
 )
 
 func newSearchCmd() *cobra.Command {
