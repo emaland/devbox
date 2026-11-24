@@ -685,11 +685,23 @@ func TestUnitBehaviour(t *testing.T) {
 		properties := waitFor(t, name, 60*time.Second, func(p map[string]string) bool {
 			return p["ActiveState"] == "failed"
 		})
-		if properties["Result"] != "start-limit-hit" {
-			t.Errorf("want result start-limit-hit, got %v", properties)
+		// What the unit promises: it is retried, then stops restarting and
+		// stays failed. Which Result string systemd records for that differs
+		// between versions (start-limit-hit on one, exit-code on another), so
+		// it is not checked.
+		restarts, _ := strconv.Atoi(properties["NRestarts"])
+		if restarts < 2 {
+			t.Errorf("want retries before giving up, got %v", properties)
 		}
-		if n, _ := strconv.Atoi(properties["NRestarts"]); n < 2 {
-			t.Errorf("want retries up to the limit, got %v", properties)
+		// With a 100 ms restart delay, another restart would show at once.
+		// Watch for a few seconds that none comes and the unit stays failed.
+		end := time.Now().Add(3 * time.Second)
+		for time.Now().Before(end) {
+			now := unitProperties(t, name)
+			if now["ActiveState"] != "failed" || now["NRestarts"] != properties["NRestarts"] {
+				t.Fatalf("the unit kept restarting after it had failed: %v, then %v", properties, now)
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
 	})
 }
