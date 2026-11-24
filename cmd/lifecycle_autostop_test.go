@@ -1035,3 +1035,32 @@ func TestGatewayStatusRefusesAHugeAnswer(t *testing.T) {
 		t.Fatalf("exit %d output %.200q", status, out)
 	}
 }
+
+// R-SEC on PR 17, round 5: a token file owned by root is refused. The
+// gateway never runs as root, and reading as the owner drops nothing then.
+func TestGatewayStatusRefusesARootOwnedTokenFile(t *testing.T) {
+	b := newLifecycleBox(t)
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Skip("stat not on PATH")
+	}
+	b.fakeProgram("stat", fmt.Sprintf(`case "$*" in *%%u*) set -- "$@"; out="$(exec %s "$@")" || exit 1; echo "${out%% *} 0" ;; *) exec %s "$@" ;; esac`, realStat, realStat))
+	b.write("listener-uid", "0\n")
+	out, status := b.run("gateway-status.sh")
+	b.gateway.mu.Lock()
+	requests := len(b.gateway.requests)
+	b.gateway.mu.Unlock()
+	if status != 2 || requests != 0 || !strings.Contains(out, "token file unusable") {
+		t.Fatalf("exit %d, %d requests, output %q", status, requests, out)
+	}
+}
+
+// R-SEC on PR 17, round 5: an answer of several JSON documents is not one
+// status.
+func TestGatewayStatusRefusesSeveralDocuments(t *testing.T) {
+	b := newLifecycleBox(t)
+	b.gateway.set(200, `{"ok": true} {"ok": true, "turns": {"active": 0, "waitingForUser": 0}}`)
+	if out, status := b.run("gateway-status.sh"); status != 2 {
+		t.Fatalf("exit %d output %q", status, out)
+	}
+}

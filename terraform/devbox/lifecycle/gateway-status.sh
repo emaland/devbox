@@ -41,6 +41,10 @@ mode_owner="$(stat -c '%a %u' "$token_file" 2>/dev/null)" || unreachable "token 
 mode="${mode_owner% *}"
 owner="${mode_owner#* }"
 case "$owner" in "" | *[!0-9]*) unreachable "token file unusable" ;; esac
+# The gateway never runs as root, and reading as the owner would drop
+# nothing for a root-owned file (a parent directory swapped for a link to a
+# root-only one would make it look so).
+[ "$owner" != 0 ] || unreachable "token file unusable (owned by root)"
 case "$mode" in
   *[!0-7]* | "") unreachable "token file unusable" ;;
   *00) ;;
@@ -153,6 +157,8 @@ state="$(timeout -k 1 5 jq -r '
       else "idle" end
   end' "$body" 2>/dev/null)" || unreachable "answer is not JSON"
 [ "$state" != malformed ] || unreachable "answer has no turn counts"
+json="$(timeout -k 1 5 jq -c . "$body" 2>/dev/null)" || unreachable "answer is not JSON"
+# One document only: several would give several states.
+case "$state$json" in *"$nl"*) unreachable "answer is not one JSON document" ;; esac
 
-printf '%s\n' "$state"
-timeout -k 1 5 jq -c . "$body"
+printf '%s\n' "$state" "$json"
